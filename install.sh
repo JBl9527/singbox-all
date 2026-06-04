@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # ==========================================
-# Sing-box 终极多协议管理脚本 (持久化状态版)
-# 特性: sba快捷菜单 / 无损更新 / 动态修参 / AnyTLS链接
+# Sing-box 终极多协议管理脚本 (动态智能菜单版)
+# 特性: 智能菜单 / 绝对静默更新 / 动态修参 / 状态持久化
 # ==========================================
 
 # ！！！非常重要：请将下面的 URL 替换为你 GitHub 仓库中该脚本的真实 Raw 链接 ！！！
@@ -31,7 +31,7 @@ get_public_ip() {
     if [ -z "$PUBLIC_IP" ]; then PUBLIC_IP="你的VPS_IP"; fi
 }
 
-# 保存配置到持久化文件
+# 保存配置
 save_config() {
     cat > "$CONF_FILE" <<EOF
 CERT_CHOICE="${CERT_CHOICE}"
@@ -53,26 +53,39 @@ REALITY_SHORT_ID="${REALITY_SHORT_ID}"
 EOF
 }
 
-# ================= 1. 核心安装与更新模块 =================
-install_or_update() {
+# 静默更新二进制核心
+silent_update_core() {
+    clear
+    echo -e "${YELLOW}正在检测并下载最新版 Sing-box 核心...${PLAIN}"
+    LATEST_VERSION=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r .tag_name | sed 's/v//')
+    ARCH=$(uname -m)
+    case "$ARCH" in
+        x86_64) DL_ARCH="amd64" ;; aarch64) DL_ARCH="arm64" ;; *) echo -e "${RED}不支持的架构${PLAIN}"; exit 1 ;;
+    esac
+    
+    wget -qO sing-box.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v${LATEST_VERSION}/sing-box-${LATEST_VERSION}-linux-${DL_ARCH}.tar.gz"
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}下载失败，请检查网络！${PLAIN}"
+        sleep 2; start_menu; return
+    fi
+    
+    systemctl stop sing-box > /dev/null 2>&1
+    tar -xzf sing-box.tar.gz
+    mv sing-box-${LATEST_VERSION}-linux-${DL_ARCH}/sing-box $SING_BOX_BIN
+    chmod +x $SING_BOX_BIN
+    rm -rf sing-box.tar.gz sing-box-${LATEST_VERSION}-linux-${DL_ARCH}
+    
+    systemctl restart sing-box
+    echo -e "${GREEN}✔ Sing-box 核心已成功无损更新至 v${LATEST_VERSION}！现有配置与链接完全保留。${PLAIN}"
+    install_sba_shortcut # 顺便更新下快捷命令
+    sleep 3
+    start_menu
+}
+
+# 全新安装流程
+fresh_install() {
     clear
     echo -e "${CYAN}==========================================${PLAIN}"
-    if [ -f "$CONF_FILE" ]; then
-        echo -e "${GREEN}检测到已有 Sing-box 配置！${PLAIN}"
-        echo "1. 仅更新 Sing-box 核心 (保留所有现有配置及节点信息)"
-        echo "2. 强制重新完整安装 (将清空并重新生成所有凭证及端口)"
-        read -p "请选择操作 [1-2]: " UP_CHOICE
-        if [ "$UP_CHOICE" == "1" ]; then
-            install_sing_box
-            systemctl restart sing-box
-            echo -e "${GREEN}核心更新完毕，服务已重启！${PLAIN}"
-            sleep 2
-            start_menu
-            return
-        fi
-    fi
-
-    # 全新安装流程
     echo -e "${CYAN}        开始全新安装 Sing-box 服务        ${PLAIN}"
     echo -e "${CYAN}==========================================${PLAIN}"
 
@@ -100,38 +113,22 @@ install_or_update() {
         PADDING_SCHEME_JSON='"stop=8", "0=30-30", "1=100-400", "2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000", "3=9-9,500-1000", "4=500-1000", "5=500-1000", "6=500-1000", "7=500-1000"'
     else PADDING_SCHEME_JSON="$CUSTOM_PADDING"; fi
     
-    install_dependencies
-    install_sing_box
-    manage_cert
-    generate_credentials
-    save_config
-    generate_config_json
-    configure_systemd
-    install_sba_shortcut
-    show_links
-}
-
-install_dependencies() {
+    echo -e "\n${GREEN}开始全自动部署...${PLAIN}\n"
     apt-get update -y > /dev/null 2>&1
     apt-get install -y curl wget jq openssl socat uuid-runtime cron iptables > /dev/null 2>&1
     mkdir -p "$CERT_DIR"
-}
 
-install_sing_box() {
-    echo -e "${GREEN}正在下载并安装 Sing-box 最新版核心...${PLAIN}"
+    # 安装核心
     LATEST_VERSION=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r .tag_name | sed 's/v//')
     ARCH=$(uname -m)
-    case "$ARCH" in
-        x86_64) DL_ARCH="amd64" ;; aarch64) DL_ARCH="arm64" ;; *) exit 1 ;;
-    esac
+    case "$ARCH" in x86_64) DL_ARCH="amd64" ;; aarch64) DL_ARCH="arm64" ;; *) exit 1 ;; esac
     wget -qO sing-box.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v${LATEST_VERSION}/sing-box-${LATEST_VERSION}-linux-${DL_ARCH}.tar.gz"
     tar -xzf sing-box.tar.gz
     mv sing-box-${LATEST_VERSION}-linux-${DL_ARCH}/sing-box $SING_BOX_BIN
     chmod +x $SING_BOX_BIN
     rm -rf sing-box.tar.gz sing-box-${LATEST_VERSION}-linux-${DL_ARCH}
-}
 
-manage_cert() {
+    # 证书
     if [ "$CERT_CHOICE" == "1" ]; then
         openssl req -x509 -nodes -days 3650 -newkey rsa:2048 -keyout "$CERT_DIR/server.key" -out "$CERT_DIR/server.crt" -subj "/C=US/ST=State/L=City/O=Organization/CN=$DOMAIN" > /dev/null 2>&1
     elif [ "$CERT_CHOICE" == "2" ]; then
@@ -140,15 +137,20 @@ manage_cert() {
         ~/.acme.sh/acme.sh --issue -d "$DOMAIN" --standalone -k ec-256
         ~/.acme.sh/acme.sh --installcert -d "$DOMAIN" --ecc --fullchain-file "$CERT_DIR/server.crt" --key-file "$CERT_DIR/server.key" --reloadcmd "systemctl restart sing-box"
     fi
-}
 
-generate_credentials() {
+    # 凭证
     UUID_REALITY=$(uuidgen); PASS_ANYTLS=$(openssl rand -base64 12)
     PASS_HY2=$(openssl rand -base64 12); UUID_TUIC=$(uuidgen); PASS_TUIC=$(openssl rand -base64 12)
     REALITY_KEYPAIR=$($SING_BOX_BIN generate reality-keypair)
     REALITY_PRIVATE=$(echo "$REALITY_KEYPAIR" | grep PrivateKey | awk '{print $2}')
     REALITY_PUBLIC=$(echo "$REALITY_KEYPAIR" | grep PublicKey | awk '{print $2}')
     REALITY_SHORT_ID=$($SING_BOX_BIN generate rand --hex 8)
+
+    save_config
+    generate_config_json
+    configure_systemd
+    install_sba_shortcut
+    show_links
 }
 
 generate_config_json() {
@@ -187,7 +189,7 @@ configure_systemd() {
     IPTABLES_START=""; IPTABLES_STOP=""
     if [ -n "$PORT_HY2_RANGE" ]; then
         IPTABLES_START="ExecStartPost=-/sbin/iptables -t nat -A PREROUTING -p udp --dport $PORT_HY2_RANGE -j REDIRECT --to-ports $PORT_HY2\nExecStartPost=-/sbin/ip6tables -t nat -A PREROUTING -p udp --dport $PORT_HY2_RANGE -j REDIRECT --to-ports $PORT_HY2"
-        IPTABLES_STOP="ExecStopPost=-/sbin/iptables -t nat -D PREROUTING -p udp --dport $PORT_HY2_RANGE -j REDIRECT --to-ports $PORT_HY2\nExecStopPost=-/sbin/ip6tables -t nat -D PREROUTING -p udp --dport $PORT_HY2_RANGE -j REDIRECT --to-ports $PORT_HY2"
+        IPTABLES_STOP="ExecStopPost=-/sbin/iptables -t nat -D PREROUTING -p udp --dport $PORT_HY2_RANGE -j REDIRECT --to-ports $PORT_HY2\nExecStopPost=-/sbin/ip6tables -t nat -D PREROUTING -p udp --dport $PORT_HY2_RANGE -j RED;RECT --to-ports $PORT_HY2"
     fi
 
     cat > /etc/systemd/system/sing-box.service <<EOF
@@ -222,11 +224,11 @@ EOF
     chmod +x /usr/bin/sba
 }
 
-# ================= 2. 动态修改参数模块 =================
+# 动态修改参数
 modify_parameters() {
     clear
     if [ ! -f "$CONF_FILE" ]; then
-        echo -e "${RED}未检测到配置文件，请先执行完整安装！${PLAIN}"
+        echo -e "${RED}未检测到配置文件，请先选择安装！${PLAIN}"
         sleep 2; start_menu; return
     fi
     source "$CONF_FILE"
@@ -258,17 +260,16 @@ modify_parameters() {
         *) echo -e "${RED}选择无效！${PLAIN}"; sleep 1; modify_parameters; return ;;
     esac
 
-    echo -e "${YELLOW}正在应用新参数并重载服务...${PLAIN}"
     systemctl stop sing-box
     save_config
     generate_config_json
     configure_systemd
-    echo -e "${GREEN}修改成功！节点已更新。${PLAIN}"
+    echo -e "${GREEN}修改成功！参数已生效。${PLAIN}"
     sleep 1
     show_links
 }
 
-# ================= 3. 链接展示模块 =================
+# 链接展示
 show_links() {
     if [ ! -f "$CONF_FILE" ]; then echo "未找到配置！"; sleep 1; return; fi
     source "$CONF_FILE"
@@ -278,32 +279,29 @@ show_links() {
     if [ "$CERT_CHOICE" == "1" ]; then INSECURE_FLAG="1"; fi
 
     VLESS_LINK="vless://${UUID_REALITY}@${PUBLIC_IP}:${PORT_REALITY}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.microsoft.com&fp=chrome&pbk=${REALITY_PUBLIC}&sid=${REALITY_SHORT_ID}&type=tcp&headerType=none#SingBox-REALITY"
-    
     HY2_PORT_DISPLAY=${PORT_HY2}
     if [ -n "$PORT_HY2_RANGE" ]; then HY2_PORT_DISPLAY=${PORT_HY2_RANGE/-/:}; fi
     HY2_LINK="hy2://${PASS_HY2}@${PUBLIC_IP}:${HY2_PORT_DISPLAY}?insecure=${INSECURE_FLAG}&sni=${DOMAIN}#SingBox-Hy2"
-    
     TUIC_LINK="tuic://${UUID_TUIC}:${PASS_TUIC}@${PUBLIC_IP}:${PORT_TUIC}?sni=${DOMAIN}&alpn=h3&allow_insecure=${INSECURE_FLAG}#SingBox-TUIC"
-
     ANYTLS_LINK="anytls://${PASS_ANYTLS}@${PUBLIC_IP}:${PORT_ANYTLS}?security=tls&sni=${DOMAIN}&fp=chrome&alpn=http%2F1.1&insecure=${INSECURE_FLAG}&allowInsecure=${INSECURE_FLAG}&type=tcp&headerType=none#SingBox-AnyTLS"
 
     clear
     echo -e "${CYAN}===========================================${PLAIN}"
     echo -e "${YELLOW}↓↓↓ 您的最新节点连接代码 ↓↓↓${PLAIN}\n"
     echo -e "${GREEN}[1] REALITY (VLESS + Vision):${PLAIN}\n${VLESS_LINK}\n"
-    echo -e "${GREEN}[2] AnyTLS (请确保客户端支持并按需补充Padding):${PLAIN}\n${ANYTLS_LINK}\n"
-    echo -e "${GREEN}[3] Hysteria2 (含端口跳跃支持):${PLAIN}\n${HY2_LINK}\n"
+    echo -e "${GREEN}[2] AnyTLS:${PLAIN}\n${ANYTLS_LINK}\n"
+    echo -e "${GREEN}[3] Hysteria2:${PLAIN}\n${HY2_LINK}\n"
     echo -e "${GREEN}[4] TUIC v5:${PLAIN}\n${TUIC_LINK}\n"
     echo -e "${CYAN}===========================================${PLAIN}"
     read -n 1 -s -r -p "按任意键返回主菜单..."
     start_menu
 }
 
-# ================= 4. 卸载模块 =================
+# 卸载
 uninstall_singbox() {
     clear
-    echo -e "${RED}警告: 即将卸载 Sing-box 及所有配置文件！${PLAIN}"
-    read -p "确认要卸载吗？[y/N]: " UNINSTALL_CONFIRM
+    echo -e "${RED}警告: 即将清除所有核心、配置、证书及状态！${PLAIN}"
+    read -p "确认要彻底卸载吗？[y/N]: " UNINSTALL_CONFIRM
     if [[ "$UNINSTALL_CONFIRM" =~ ^[Yy]$ ]]; then
         systemctl stop sing-box > /dev/null 2>&1
         systemctl disable sing-box > /dev/null 2>&1
@@ -315,8 +313,7 @@ uninstall_singbox() {
         echo -e "${GREEN}卸载完成！系统已恢复纯净状态。${PLAIN}"
         exit 0
     else
-        echo -e "${GREEN}已取消卸载。${PLAIN}"
-        sleep 1; start_menu
+        echo -e "${GREEN}已取消。${PLAIN}"; sleep 1; start_menu
     fi
 }
 
@@ -326,21 +323,41 @@ start_menu() {
     echo -e "${CYAN}==========================================${PLAIN}"
     echo -e "${CYAN}      Sing-box 终极部署及管理脚本         ${PLAIN}"
     echo -e "${CYAN}==========================================${PLAIN}"
-    echo -e "${GREEN}1.${PLAIN} 安装 / 更新核心 / 重新部署"
-    echo -e "${GREEN}2.${PLAIN} 动态修改端口或配置参数"
-    echo -e "${GREEN}3.${PLAIN} 查看当前节点分享链接"
-    echo -e "${GREEN}4.${PLAIN} 彻底卸载 Sing-box"
+    
+    # 智能状态判定
+    if [ -f "$CONF_FILE" ]; then
+        echo -e "系统状态: ${GREEN}已安装${PLAIN}"
+        echo -e "${GREEN}1.${PLAIN} ${CYAN}一键无损更新 Sing-box 核心 (直接静默升级，绝不动配置)${PLAIN}"
+        echo -e "${GREEN}2.${PLAIN} 动态修改端口或配置参数"
+        echo -e "${GREEN}3.${PLAIN} 查看当前节点分享链接"
+        echo -e "${GREEN}4.${PLAIN} 强制彻底覆盖并全新安装"
+    else
+        echo -e "系统状态: ${YELLOW}未安装${PLAIN}"
+        echo -e "${GREEN}1.${PLAIN} 全新安装 Sing-box (多协议防封锁版)"
+    fi
+    echo -e "${GREEN}5.${PLAIN} 彻底卸载 Sing-box"
     echo -e "${GREEN}0.${PLAIN} 退出脚本"
     echo -e "${CYAN}==========================================${PLAIN}"
-    read -p "请输入选项 [0-4]: " MENU_CHOICE
-    case "$MENU_CHOICE" in
-        1) install_or_update ;;
-        2) modify_parameters ;;
-        3) show_links ;;
-        4) uninstall_singbox ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}输入错误，请重新选择！${PLAIN}"; sleep 1; start_menu ;;
-    esac
+    read -p "请输入选项 [0-5]: " MENU_CHOICE
+    
+    if [ -f "$CONF_FILE" ]; then
+        case "$MENU_CHOICE" in
+            1) silent_update_core ;;
+            2) modify_parameters ;;
+            3) show_links ;;
+            4) fresh_install ;;
+            5) uninstall_singbox ;;
+            0) exit 0 ;;
+            *) echo -e "${RED}选择无效！${PLAIN}"; sleep 1; start_menu ;;
+        esac
+    else
+        case "$MENU_CHOICE" in
+            1) fresh_install ;;
+            5) uninstall_singbox ;;
+            0) exit 0 ;;
+            *) echo -e "${RED}选择无效！${PLAIN}"; sleep 1; start_menu ;;
+        esac
+    fi
 }
 
 # 脚本入口
