@@ -1,11 +1,10 @@
 #!/bin/bash
 
 # ==========================================
-# Sing-box 终极多协议管理脚本 (动态智能菜单版)
-# 特性: 智能菜单 / 绝对静默更新 / 动态修参 / 状态持久化
+# Sing-box 终极多协议管理脚本 (BBR 加速集成版)
+# 特性: 智能菜单 / 绝对静默更新 / 动态修参 / 状态持久化 / 一键BBR
 # ==========================================
 
-# ！！！非常重要：请将下面的 URL 替换为你 GitHub 仓库中该脚本的真实 Raw 链接 ！！！
 SCRIPT_URL="https://raw.githubusercontent.com/JBl9527/singbox-all/main/install.sh"
 
 RED='\033[0;31m'
@@ -29,6 +28,45 @@ fi
 get_public_ip() {
     PUBLIC_IP=$(curl -s4 ifconfig.me || curl -s4 ipv4.icanhazip.com || curl -s4 api.ipify.org)
     if [ -z "$PUBLIC_IP" ]; then PUBLIC_IP="你的VPS_IP"; fi
+}
+
+# 检测 BBR 状态
+check_bbr_status() {
+    if sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q "bbr"; then
+        echo -e "${GREEN}已开启${PLAIN}"
+    else
+        echo -e "${RED}未开启${PLAIN}"
+    fi
+}
+
+# 一键开启 BBR 加速
+enable_bbr() {
+    clear
+    echo -e "${YELLOW}正在检测当前系统 BBR 状态...${PLAIN}"
+    if sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q "bbr"; then
+        echo -e "${GREEN}您的系统已经开启了 BBR 加速，无需重复开启！${PLAIN}"
+    else
+        echo -e "${YELLOW}正在为您的 VPS 注入 BBR 加速内核参数...${PLAIN}"
+        # 清理旧的可能残留的配置
+        sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf
+        sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
+        
+        # 写入最优配置 (fq 队列 + bbr)
+        echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
+        echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
+        
+        # 刷新系统内核参数
+        sysctl -p >/dev/null 2>&1
+        
+        # 二次验证
+        if sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q "bbr"; then
+            echo -e "${GREEN}✔ BBR 加速开启成功！高丢包环境下的网络吞吐量已大幅优化。${PLAIN}"
+        else
+            echo -e "${RED}❌ BBR 开启失败！请检查 VPS 虚拟化架构（部分 OpenVZ 架构的 VPS 不支持修改内核参数）。${PLAIN}"
+        fi
+    fi
+    sleep 2
+    start_menu
 }
 
 # 保存配置
@@ -77,7 +115,7 @@ silent_update_core() {
     
     systemctl restart sing-box
     echo -e "${GREEN}✔ Sing-box 核心已成功无损更新至 v${LATEST_VERSION}！现有配置与链接完全保留。${PLAIN}"
-    install_sba_shortcut # 顺便更新下快捷命令
+    install_sba_shortcut
     sleep 3
     start_menu
 }
@@ -189,7 +227,7 @@ configure_systemd() {
     IPTABLES_START=""; IPTABLES_STOP=""
     if [ -n "$PORT_HY2_RANGE" ]; then
         IPTABLES_START="ExecStartPost=-/sbin/iptables -t nat -A PREROUTING -p udp --dport $PORT_HY2_RANGE -j REDIRECT --to-ports $PORT_HY2\nExecStartPost=-/sbin/ip6tables -t nat -A PREROUTING -p udp --dport $PORT_HY2_RANGE -j REDIRECT --to-ports $PORT_HY2"
-        IPTABLES_STOP="ExecStopPost=-/sbin/iptables -t nat -D PREROUTING -p udp --dport $PORT_HY2_RANGE -j REDIRECT --to-ports $PORT_HY2\nExecStopPost=-/sbin/ip6tables -t nat -D PREROUTING -p udp --dport $PORT_HY2_RANGE -j RED;RECT --to-ports $PORT_HY2"
+        IPTABLES_STOP="ExecStopPost=-/sbin/iptables -t nat -D PREROUTING -p udp --dport $PORT_HY2_RANGE -j REDIRECT --to-ports $PORT_HY2\nExecStopPost=-/sbin/ip6tables -t nat -D PREROUTING -p udp --dport $PORT_HY2_RANGE -j REDIRECT --to-ports $PORT_HY2"
     fi
 
     cat > /etc/systemd/system/sing-box.service <<EOF
@@ -324,21 +362,23 @@ start_menu() {
     echo -e "${CYAN}      Sing-box 终极部署及管理脚本         ${PLAIN}"
     echo -e "${CYAN}==========================================${PLAIN}"
     
-    # 智能状态判定
+    # 状态实时检测
+    BBR_TXT=$(check_bbr_status)
     if [ -f "$CONF_FILE" ]; then
-        echo -e "系统状态: ${GREEN}已安装${PLAIN}"
+        echo -e "系统状态: ${GREEN}已安装${PLAIN}   |   BBR加速状态: ${BBR_TXT}"
         echo -e "${GREEN}1.${PLAIN} ${CYAN}一键无损更新 Sing-box 核心 (直接静默升级，绝不动配置)${PLAIN}"
         echo -e "${GREEN}2.${PLAIN} 动态修改端口或配置参数"
         echo -e "${GREEN}3.${PLAIN} 查看当前节点分享链接"
         echo -e "${GREEN}4.${PLAIN} 强制彻底覆盖并全新安装"
     else
-        echo -e "系统状态: ${YELLOW}未安装${PLAIN}"
+        echo -e "系统状态: ${YELLOW}未安装${PLAIN}   |   BBR加速状态: ${BBR_TXT}"
         echo -e "${GREEN}1.${PLAIN} 全新安装 Sing-box (多协议防封锁版)"
     fi
-    echo -e "${GREEN}5.${PLAIN} 彻底卸载 Sing-box"
+    echo -e "${GREEN}5.${PLAIN} ${YELLOW}一键开启 BBR 网络加速机制${PLAIN}"
+    echo -e "${GREEN}6.${PLAIN} 彻底卸载 Sing-box"
     echo -e "${GREEN}0.${PLAIN} 退出脚本"
     echo -e "${CYAN}==========================================${PLAIN}"
-    read -p "请输入选项 [0-5]: " MENU_CHOICE
+    read -p "请输入选项 [0-6]: " MENU_CHOICE
     
     if [ -f "$CONF_FILE" ]; then
         case "$MENU_CHOICE" in
@@ -346,14 +386,16 @@ start_menu() {
             2) modify_parameters ;;
             3) show_links ;;
             4) fresh_install ;;
-            5) uninstall_singbox ;;
+            5) enable_bbr ;;
+            6) uninstall_singbox ;;
             0) exit 0 ;;
             *) echo -e "${RED}选择无效！${PLAIN}"; sleep 1; start_menu ;;
         esac
     else
         case "$MENU_CHOICE" in
             1) fresh_install ;;
-            5) uninstall_singbox ;;
+            5) enable_bbr ;;
+            6) uninstall_singbox ;;
             0) exit 0 ;;
             *) echo -e "${RED}选择无效！${PLAIN}"; sleep 1; start_menu ;;
         esac
