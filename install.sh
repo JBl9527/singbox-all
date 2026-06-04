@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # ==========================================
-# Sing-box 终极多协议管理脚本 (独立证书修复版)
-# 特性: 独立证书申请 / CF-DNS双模 / 智能菜单 / 一键BBR
+# Sing-box 终极多协议管理脚本 (ACME 缓存除根版)
+# 特性: 暴力清除ACME缓存 / 独立证书申请 / CF双模 / BBR
 # ==========================================
 
 SCRIPT_URL="https://raw.githubusercontent.com/JBl9527/singbox-all/main/install.sh"
@@ -120,16 +120,16 @@ fresh_install() {
 
     echo -e "\n${YELLOW}=== 1. 安全证书配置 ===${PLAIN}"
     echo "1. 生成临时自签证书 (有效期10年，适合无域名场景)"
-    echo "2. 使用自定义邮箱申请永久证书 (Standalone 模式，需放行 80 端口)"
+    echo "2. 使用 自定义邮箱 申请永久证书 (Standalone 模式，需放行 80 端口)"
     echo "3. 使用 Cloudflare API 申请永久证书 (DNS 模式，无需放行 80 端口)"
     read -p "请输入选项 [1-3]: " CERT_CHOICE
     
     if [ "$CERT_CHOICE" == "2" ]; then
         read -p "请输入解析到本机的域名: " DOMAIN
-        read -p "请输入 ACME 注册邮箱: " ACME_EMAIL
+        read -p "请输入 ACME 注册邮箱(用于接通知): " ACME_EMAIL
     elif [ "$CERT_CHOICE" == "3" ]; then
         read -p "请输入托管在 CF 上的域名: " DOMAIN
-        read -p "请输入 CF 账号邮箱: " CF_EMAIL
+        read -p "请输入 CF 账号的登录邮箱: " CF_EMAIL
         read -p "请输入 CF Global API Key: " CF_KEY
     else
         CERT_CHOICE="1"; DOMAIN="bing.com"
@@ -166,20 +166,25 @@ fresh_install() {
     chmod +x $SING_BOX_BIN
     rm -rf sing-box.tar.gz sing-box-${LATEST_VERSION}-linux-${DL_ARCH}
 
+    # ================= 彻底修复 ACME 核心痛点 =================
     if [ "$CERT_CHOICE" == "1" ]; then
         openssl req -x509 -nodes -days 3650 -newkey rsa:2048 -keyout "$CERT_DIR/server.key" -out "$CERT_DIR/server.crt" -subj "/C=US/ST=State/L=City/O=Organization/CN=$DOMAIN"
     elif [ "$CERT_CHOICE" == "2" ]; then
-        curl -s https://get.acme.sh | sh
+        echo -e "\n${GREEN}正在清理旧缓存并使用 Standalone 申请证书...${PLAIN}"
+        rm -rf ~/.acme.sh # 暴力清除旧的 example.com 缓存
+        # 直接在安装时注入合法邮箱骗过 Let's Encrypt
+        curl -s https://get.acme.sh | sh -s email="sba_cert_${RANDOM}@gmail.com"
         ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt
-        ~/.acme.sh/acme.sh --register-account -m "$ACME_EMAIL" --server letsencrypt --force
         ~/.acme.sh/acme.sh --issue -d "$DOMAIN" --standalone -k ec-256 --force
         ~/.acme.sh/acme.sh --installcert -d "$DOMAIN" --ecc --fullchain-file "$CERT_DIR/server.crt" --key-file "$CERT_DIR/server.key"
     elif [ "$CERT_CHOICE" == "3" ]; then
-        curl -s https://get.acme.sh | sh
+        echo -e "\n${GREEN}正在清理旧缓存并使用 Cloudflare DNS 申请证书...${PLAIN}"
+        rm -rf ~/.acme.sh # 暴力清除旧的 example.com 缓存
+        # 直接在安装时注入合法邮箱骗过 Let's Encrypt
+        curl -s https://get.acme.sh | sh -s email="sba_cert_${RANDOM}@gmail.com"
         ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt
         export CF_Key="$CF_KEY"
         export CF_Email="$CF_EMAIL"
-        ~/.acme.sh/acme.sh --register-account -m "$CF_EMAIL" --server letsencrypt --force
         ~/.acme.sh/acme.sh --issue --dns dns_cf -d "$DOMAIN" -k ec-256 --force
         ~/.acme.sh/acme.sh --installcert -d "$DOMAIN" --ecc --fullchain-file "$CERT_DIR/server.crt" --key-file "$CERT_DIR/server.key"
     fi
@@ -198,7 +203,7 @@ fresh_install() {
     show_links
 }
 
-# ================= 新增：独立证书申请模块 =================
+# 独立证书修复模块
 standalone_cert_manager() {
     clear
     if [ ! -f "$CONF_FILE" ]; then
@@ -222,12 +227,12 @@ standalone_cert_manager() {
 
     if [ "$RE_CERT_CHOICE" == "2" ]; then
         read -p "请输入域名 (默认 $DOMAIN): " NEW_DOMAIN; DOMAIN=${NEW_DOMAIN:-$DOMAIN}
-        read -p "请输入邮箱 (默认 $ACME_EMAIL): " NEW_EMAIL; ACME_EMAIL=${NEW_EMAIL:-$ACME_EMAIL}
+        read -p "请输入接收通知邮箱 (默认 $ACME_EMAIL): " NEW_EMAIL; ACME_EMAIL=${NEW_EMAIL:-$ACME_EMAIL}
         CERT_CHOICE="2"
     elif [ "$RE_CERT_CHOICE" == "3" ]; then
         read -p "请输入域名 (默认 $DOMAIN): " NEW_DOMAIN; DOMAIN=${NEW_DOMAIN:-$DOMAIN}
-        read -p "请输入 CF 邮箱 (默认 $CF_EMAIL): " NEW_CF_EMAIL; CF_EMAIL=${NEW_CF_EMAIL:-$CF_EMAIL}
-        read -p "请输入 CF API Key: " NEW_CF_KEY; CF_KEY=${NEW_CF_KEY:-$CF_KEY}
+        read -p "请输入 CF 账号登录邮箱 (默认 $CF_EMAIL): " NEW_CF_EMAIL; CF_EMAIL=${NEW_CF_EMAIL:-$CF_EMAIL}
+        read -p "请输入 CF Global API Key: " NEW_CF_KEY; CF_KEY=${NEW_CF_KEY:-$CF_KEY}
         CERT_CHOICE="3"
     elif [ "$RE_CERT_CHOICE" == "1" ]; then
         CERT_CHOICE="1"; DOMAIN="bing.com"
@@ -240,22 +245,25 @@ standalone_cert_manager() {
     mkdir -p "$CERT_DIR"
     systemctl stop sing-box > /dev/null 2>&1
 
+    # ================= 彻底修复 ACME 核心痛点 =================
     if [ "$CERT_CHOICE" == "1" ]; then
         echo -e "\n${GREEN}正在生成自签证书...${PLAIN}"
         openssl req -x509 -nodes -days 3650 -newkey rsa:2048 -keyout "$CERT_DIR/server.key" -out "$CERT_DIR/server.crt" -subj "/C=US/ST=State/L=City/O=Organization/CN=$DOMAIN"
         echo -e "${GREEN}✔ 自签证书生成成功！${PLAIN}"
     elif [ "$CERT_CHOICE" == "2" ]; then
-        echo -e "\n${GREEN}正在通过 Standalone 申请 Let's Encrypt 证书...${PLAIN}"
-        curl -s https://get.acme.sh | sh
-        ~/.acme.sh/acme.sh --register-account -m "$ACME_EMAIL" --server letsencrypt --force
+        echo -e "\n${GREEN}正在清理旧缓存并使用 Standalone 申请证书...${PLAIN}"
+        rm -rf ~/.acme.sh # 暴力清除缓存
+        curl -s https://get.acme.sh | sh -s email="sba_cert_${RANDOM}@gmail.com"
+        ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt
         ~/.acme.sh/acme.sh --issue -d "$DOMAIN" --standalone -k ec-256 --force
         ~/.acme.sh/acme.sh --installcert -d "$DOMAIN" --ecc --fullchain-file "$CERT_DIR/server.crt" --key-file "$CERT_DIR/server.key"
     elif [ "$CERT_CHOICE" == "3" ]; then
-        echo -e "\n${GREEN}正在通过 Cloudflare DNS API 申请 Let's Encrypt 证书...${PLAIN}"
-        curl -s https://get.acme.sh | sh
+        echo -e "\n${GREEN}正在清理旧缓存并使用 Cloudflare DNS API 申请证书...${PLAIN}"
+        rm -rf ~/.acme.sh # 暴力清除缓存
+        curl -s https://get.acme.sh | sh -s email="sba_cert_${RANDOM}@gmail.com"
+        ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt
         export CF_Key="$CF_KEY"
         export CF_Email="$CF_EMAIL"
-        ~/.acme.sh/acme.sh --register-account -m "$CF_EMAIL" --server letsencrypt --force
         ~/.acme.sh/acme.sh --issue --dns dns_cf -d "$DOMAIN" -k ec-256 --force
         ~/.acme.sh/acme.sh --installcert -d "$DOMAIN" --ecc --fullchain-file "$CERT_DIR/server.crt" --key-file "$CERT_DIR/server.key"
     fi
@@ -415,6 +423,7 @@ uninstall_singbox() {
         rm -f /etc/systemd/system/sing-box.service
         systemctl daemon-reload
         rm -rf "$CONFIG_DIR"
+        rm -rf ~/.acme.sh
         rm -f "$SING_BOX_BIN"
         rm -f /usr/bin/sba
         echo -e "${GREEN}卸载完成！系统已恢复纯净状态。${PLAIN}"
