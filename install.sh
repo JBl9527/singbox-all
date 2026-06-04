@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # ==========================================
-# Sing-box 终极多协议管理脚本 (无坑健壮版)
-# 特性: 智能菜单 / 绝对静默更新 / 动态修参 / 状态持久化 / 一键BBR
+# Sing-box 终极多协议管理脚本 (ACME 修复版)
+# 特性: 智能菜单 / 解决 ACME 邮箱封禁 / 动态修参 / 一键BBR
 # ==========================================
 
 SCRIPT_URL="https://raw.githubusercontent.com/JBl9527/singbox-all/main/install.sh"
@@ -39,7 +39,7 @@ check_bbr_status() {
     fi
 }
 
-# 一键开启 BBR 加加速
+# 一键开启 BBR 网络加速
 enable_bbr() {
     clear
     echo -e "${YELLOW}正在检测当前系统 BBR 状态...${PLAIN}"
@@ -150,28 +150,28 @@ fresh_install() {
     mkdir -p "$CERT_DIR"
 
     # 安装核心
-    echo -e "\n${GREEN}正在从官方源拉取最新 Sing-box 核心...${PLAIN}\n"
     LATEST_VERSION=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r .tag_name | sed 's/v//')
     ARCH=$(uname -m)
-    case "$ARCH" in x86_64) DL_ARCH="amd64" ;; aarch64) DL_ARCH="arm64" ;; *) exit 1 ;; macos) exit 1 ;; esac
+    case "$ARCH" in x86_64) DL_ARCH="amd64" ;; aarch64) DL_ARCH="arm64" ;; *) exit 1 ;; esac
     wget -qO sing-box.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v${LATEST_VERSION}/sing-box-${LATEST_VERSION}-linux-${DL_ARCH}.tar.gz"
     tar -xzf sing-box.tar.gz
     mv sing-box-${LATEST_VERSION}-linux-${DL_ARCH}/sing-box $SING_BOX_BIN
     chmod +x $SING_BOX_BIN
     rm -rf sing-box.tar.gz sing-box-${LATEST_VERSION}-linux-${DL_ARCH}
 
-    # 证书生成逻辑（取消静默，保留可见报错）
-    echo -e "\n${GREEN}正在配置安全证书加密层...${PLAIN}\n"
+    # 证书生成逻辑 (解决 example.com 封禁问题)
     if [ "$CERT_CHOICE" == "1" ]; then
         openssl req -x509 -nodes -days 3650 -newkey rsa:2048 -keyout "$CERT_DIR/server.key" -out "$CERT_DIR/server.crt" -subj "/C=US/ST=State/L=City/O=Organization/CN=$DOMAIN"
     elif [ "$CERT_CHOICE" == "2" ]; then
         curl -s https://get.acme.sh | sh
         ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt
-        ~/.acme.sh/acme.sh --issue -d "$DOMAIN" --standalone -k ec-256
+        # 【核心修复点】显式注册一个绝对不会被封禁的自定义合法邮箱
+        ~/.acme.sh/acme.sh --register-account -m sba_admin2026@gmail.com --server letsencrypt --force
+        ~/.acme.sh/acme.sh --issue -d "$DOMAIN" --standalone -k ec-256 --force
         ~/.acme.sh/acme.sh --installcert -d "$DOMAIN" --ecc --fullchain-file "$CERT_DIR/server.crt" --key-file "$CERT_DIR/server.key" --reloadcmd "systemctl restart sing-box"
     fi
 
-    # 凭证
+    # 凭证独立生成
     UUID_REALITY=$(uuidgen); PASS_ANYTLS=$(openssl rand -base64 12)
     PASS_HY2=$(openssl rand -base64 12); UUID_TUIC=$(uuidgen); PASS_TUIC=$(openssl rand -base64 12)
     REALITY_KEYPAIR=$($SING_BOX_BIN generate reality-keypair)
@@ -330,7 +330,7 @@ show_links() {
     start_menu
 }
 
-# 卸载
+# 彻底卸载
 uninstall_singbox() {
     clear
     echo -e "${RED}警告: 即将清除所有核心、配置、证书及状态！${PLAIN}"
