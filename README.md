@@ -21,7 +21,7 @@ TUIC v5 (UDP): 54434
 将本仓库的 install.sh 脚本在你的 VPS 上运行：
 
 
-bash <(curl -Ls https://raw.githubusercontent.com/JBl9527/singbox-all/refs/heads/main/install.sh)
+bash <(curl -Ls https://raw.githubusercontent.com/JBl9527/singbox-all/main/install.sh)
 
 
 
