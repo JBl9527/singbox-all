@@ -6,7 +6,7 @@
 # ==========================================
 
 # ！！！非常重要：请将下面的 URL 替换为你 GitHub 仓库中该脚本的真实 Raw 链接 ！！！
-SCRIPT_URL="https://raw.githubusercontent.com/你的用户名/你的仓库名/main/install.sh"
+SCRIPT_URL="https://raw.githubusercontent.com/JBl9527/singbox-all/refs/heads/main/install.sh"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
