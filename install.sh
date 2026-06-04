@@ -1,10 +1,12 @@
 #!/bin/bash
 
 # ==========================================
-# Sing-box 高级多协议一键部署脚本 (终极版)
-# 协议: REALITY, AnyTLS, Hysteria2 (含端口跳跃), TUIC
-# 特性: 凭证全独立随机 / 交互式端口映射 / 最强 Padding Scheme
+# Sing-box 高级多协议一键部署脚本 (菜单管理版)
+# 特性: sba快捷调用 / 纯净卸载 / 独立随机凭证 / 端口跳跃
 # ==========================================
+
+# ！！！非常重要：请将下面的 URL 替换为你 GitHub 仓库中该脚本的真实 Raw 链接 ！！！
+SCRIPT_URL="https://raw.githubusercontent.com/你的用户名/你的仓库名/main/install.sh"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -22,23 +24,33 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-# ================= 交互式配置信息 =================
-interactive_setup() {
+# 获取公网 IP
+get_public_ip() {
+    PUBLIC_IP=$(curl -s4 ifconfig.me || curl -s4 ipv4.icanhazip.com || curl -s4 api.ipify.org)
+    if [ -z "$PUBLIC_IP" ]; then
+        PUBLIC_IP="你的VPS_IP"
+    fi
+}
+
+# ================= 1. 核心安装模块 =================
+main_install() {
     clear
     echo -e "${CYAN}==========================================${PLAIN}"
-    echo -e "${CYAN}      Sing-box 多协议高级部署脚本         ${PLAIN}"
+    echo -e "${CYAN}        开始全新安装 Sing-box 服务        ${PLAIN}"
     echo -e "${CYAN}==========================================${PLAIN}"
 
-    # 1. 证书配置
+    # --- 证书配置 ---
     echo -e "\n${YELLOW}=== 1. 证书模式选择 ===${PLAIN}"
     echo "1. 生成临时自签证书 (有效期10年，适合单纯使用 REALITY / AnyTLS 无需真实域名)"
     echo "2. 申请永久域名证书 (使用 acme.sh，需提前解析真实域名到本机并确保 80 端口空闲)"
     read -p "请输入选项 [1-2]: " CERT_CHOICE
     if [ "$CERT_CHOICE" == "2" ]; then
         read -p "请输入已解析到本机的域名: " DOMAIN
+    else
+        DOMAIN="bing.com"
     fi
 
-    # 2. 端口与端口跳跃配置
+    # --- 端口配置 ---
     echo -e "\n${YELLOW}=== 2. 协议端口设置 ===${PLAIN}"
     read -p "请输入 REALITY 端口 [默认 34433]: " PORT_REALITY
     PORT_REALITY=${PORT_REALITY:-34433}
@@ -50,17 +62,14 @@ interactive_setup() {
     PORT_HY2=${PORT_HY2:-54433}
 
     echo -e "\n${CYAN}Hysteria2 端口跳跃 (Port Hopping) 设置:${PLAIN}"
-    echo "输入一个端口段，例如 20000:30000，客户端可在此范围内动态跳跃防封锁。"
-    read -p "请输入 Hy2 跳跃端口段 (直接回车表示不开启端口跳跃): " PORT_HY2_RANGE
-    # 将用户可能输入的减号替换为冒号，适配 iptables 格式
+    read -p "请输入 Hy2 跳跃端口段 (如 20000:30000，直接回车表示不开启): " PORT_HY2_RANGE
     PORT_HY2_RANGE=$(echo "$PORT_HY2_RANGE" | tr '-' ':')
 
     read -p "请输入 TUIC 端口 [默认 54434]: " PORT_TUIC
     PORT_TUIC=${PORT_TUIC:-54434}
 
-    # 3. AnyTLS Padding Scheme
+    # --- AnyTLS Padding ---
     echo -e "\n${YELLOW}=== 3. AnyTLS 阻断防护 (Padding Scheme) 设置 ===${PLAIN}"
-    echo -e "脚本默认内置了最强抗检测方案，通过高度模拟真实复杂的 HTTPS Fragment 与延迟特征防止阻断。"
     read -p "请输入自定义 padding-scheme (如需使用内置最强默认配置，请直接回车): " CUSTOM_PADDING
 
     if [ -z "$CUSTOM_PADDING" ]; then
@@ -68,11 +77,20 @@ interactive_setup() {
     else
         PADDING_SCHEME_JSON="$CUSTOM_PADDING"
     fi
-    echo -e "\n${GREEN}交互配置完成，开始全自动安装部署...${PLAIN}\n"
+    
+    echo -e "\n${GREEN}交互配置完成，开始全自动部署...${PLAIN}\n"
     sleep 2
+
+    # --- 执行部署流程 ---
+    install_dependencies
+    install_sing_box
+    manage_cert
+    generate_config
+    configure_systemd
+    install_sba_shortcut
+    show_links
 }
 
-# 安装基础依赖
 install_dependencies() {
     echo -e "${GREEN}[1/5] 正在安装基础依赖...${PLAIN}"
     apt-get update -y > /dev/null 2>&1
@@ -81,7 +99,6 @@ install_dependencies() {
     mkdir -p "$CERT_DIR"
 }
 
-# 安装 Sing-box 核心
 install_sing_box() {
     echo -e "${GREEN}[2/5] 正在下载并安装 Sing-box 最新版...${PLAIN}"
     LATEST_VERSION=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r .tag_name | sed 's/v//')
@@ -92,21 +109,19 @@ install_sing_box() {
         *) echo -e "${RED}不支持的架构: $ARCH${PLAIN}"; exit 1 ;;
     esac
     
-    DL_URL="https://github.com/SagerNet/sing-box/releases/download/v${LATEST_VERSION}/sing-box-${LATEST_VERSION}-linux-${DL_ARCH}.tar.gz"
-    wget -qO sing-box.tar.gz "$DL_URL"
+    wget -qO sing-box.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v${LATEST_VERSION}/sing-box-${LATEST_VERSION}-linux-${DL_ARCH}.tar.gz"
     tar -xzf sing-box.tar.gz
     mv sing-box-${LATEST_VERSION}-linux-${DL_ARCH}/sing-box $SING_BOX_BIN
     chmod +x $SING_BOX_BIN
     rm -rf sing-box.tar.gz sing-box-${LATEST_VERSION}-linux-${DL_ARCH}
 }
 
-# 处理证书逻辑
 manage_cert() {
     echo -e "${GREEN}[3/5] 正在处理证书配置...${PLAIN}"
     if [ "$CERT_CHOICE" == "1" ]; then
         openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
             -keyout "$CERT_DIR/server.key" -out "$CERT_DIR/server.crt" \
-            -subj "/C=US/ST=State/L=City/O=Organization/CN=bing.com" > /dev/null 2>&1
+            -subj "/C=US/ST=State/L=City/O=Organization/CN=$DOMAIN" > /dev/null 2>&1
     elif [ "$CERT_CHOICE" == "2" ]; then
         curl -s https://get.acme.sh | sh
         ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt
@@ -118,18 +133,12 @@ manage_cert() {
     fi
 }
 
-# 生成配置文件 (独立生成各项凭据)
 generate_config() {
     echo -e "${GREEN}[4/5] 正在独立生成各协议的随机凭证...${PLAIN}"
     
-    # 完全独立的凭证生成
-    UUID_REALITY=$(uuidgen)
-    PASS_ANYTLS=$(openssl rand -base64 12)
-    PASS_HY2=$(openssl rand -base64 12)
-    UUID_TUIC=$(uuidgen)
-    PASS_TUIC=$(openssl rand -base64 12)
-
-    # REALITY 专属公私钥
+    UUID_REALITY=$(uuidgen); PASS_ANYTLS=$(openssl rand -base64 12)
+    PASS_HY2=$(openssl rand -base64 12); UUID_TUIC=$(uuidgen); PASS_TUIC=$(openssl rand -base64 12)
+    
     REALITY_KEYPAIR=$($SING_BOX_BIN generate reality-keypair)
     REALITY_PRIVATE=$(echo "$REALITY_KEYPAIR" | grep PrivateKey | awk '{print $2}')
     REALITY_PUBLIC=$(echo "$REALITY_KEYPAIR" | grep PublicKey | awk '{print $2}')
@@ -137,120 +146,44 @@ generate_config() {
 
     cat > "$CONFIG_DIR/config.json" <<EOF
 {
-  "log": {
-    "level": "info",
-    "timestamp": true
-  },
+  "log": { "level": "info", "timestamp": true },
   "inbounds": [
     {
-      "type": "vless",
-      "tag": "reality-in",
-      "listen": "::",
-      "listen_port": $PORT_REALITY,
-      "users": [
-        {
-          "uuid": "$UUID_REALITY",
-          "flow": "xtls-rprx-vision"
-        }
-      ],
+      "type": "vless", "tag": "reality-in", "listen": "::", "listen_port": $PORT_REALITY,
+      "users": [ { "uuid": "$UUID_REALITY", "flow": "xtls-rprx-vision" } ],
       "tls": {
-        "enabled": true,
-        "server_name": "www.microsoft.com",
-        "reality": {
-          "enabled": true,
-          "handshake": {
-            "server": "www.microsoft.com",
-            "server_port": 443
-          },
-          "private_key": "$REALITY_PRIVATE",
-          "short_id": ["$REALITY_SHORT_ID"]
-        }
+        "enabled": true, "server_name": "www.microsoft.com",
+        "reality": { "enabled": true, "handshake": { "server": "www.microsoft.com", "server_port": 443 }, "private_key": "$REALITY_PRIVATE", "short_id": ["$REALITY_SHORT_ID"] }
       }
     },
     {
-      "type": "anytls",
-      "tag": "anytls-in",
-      "listen": "::",
-      "listen_port": $PORT_ANYTLS,
-      "users": [
-        {
-          "password": "$PASS_ANYTLS"
-        }
-      ],
-      "padding_scheme": [
-        $PADDING_SCHEME_JSON
-      ],
-      "tls": {
-        "enabled": true,
-        "certificate_path": "$CERT_DIR/server.crt",
-        "key_path": "$CERT_DIR/server.key"
-      }
+      "type": "anytls", "tag": "anytls-in", "listen": "::", "listen_port": $PORT_ANYTLS,
+      "users": [ { "password": "$PASS_ANYTLS" } ],
+      "padding_scheme": [ $PADDING_SCHEME_JSON ],
+      "tls": { "enabled": true, "certificate_path": "$CERT_DIR/server.crt", "key_path": "$CERT_DIR/server.key" }
     },
     {
-      "type": "hysteria2",
-      "tag": "hy2-in",
-      "listen": "::",
-      "listen_port": $PORT_HY2,
-      "users": [
-        {
-          "password": "$PASS_HY2"
-        }
-      ],
-      "tls": {
-        "enabled": true,
-        "alpn": ["h3"],
-        "certificate_path": "$CERT_DIR/server.crt",
-        "key_path": "$CERT_DIR/server.key"
-      }
+      "type": "hysteria2", "tag": "hy2-in", "listen": "::", "listen_port": $PORT_HY2,
+      "users": [ { "password": "$PASS_HY2" } ],
+      "tls": { "enabled": true, "alpn": ["h3"], "certificate_path": "$CERT_DIR/server.crt", "key_path": "$CERT_DIR/server.key" }
     },
     {
-      "type": "tuic",
-      "tag": "tuic-in",
-      "listen": "::",
-      "listen_port": $PORT_TUIC,
-      "users": [
-        {
-          "uuid": "$UUID_TUIC",
-          "password": "$PASS_TUIC"
-        }
-      ],
-      "tls": {
-        "enabled": true,
-        "alpn": ["h3", "spdy/3.1"],
-        "certificate_path": "$CERT_DIR/server.crt",
-        "key_path": "$CERT_DIR/server.key"
-      }
+      "type": "tuic", "tag": "tuic-in", "listen": "::", "listen_port": $PORT_TUIC,
+      "users": [ { "uuid": "$UUID_TUIC", "password": "$PASS_TUIC" } ],
+      "tls": { "enabled": true, "alpn": ["h3", "spdy/3.1"], "certificate_path": "$CERT_DIR/server.crt", "key_path": "$CERT_DIR/server.key" }
     }
   ],
-  "outbounds": [
-    {
-      "type": "direct",
-      "tag": "direct"
-    },
-    {
-      "type": "block",
-      "tag": "block"
-    }
-  ]
+  "outbounds": [ { "type": "direct", "tag": "direct" }, { "type": "block", "tag": "block" } ]
 }
 EOF
 }
 
-# 配置 Systemd 服务并绑定 iptables 端口跳跃规则
 configure_systemd() {
-    echo -e "${GREEN}[5/5] 正在配置系统服务及防火墙映射...${PLAIN}"
-    
-    # 初始化 systemd 的 Exec 规则变量
-    IPTABLES_START=""
-    IPTABLES_STOP=""
-
-    # 如果配置了端口跳跃，自动向 systemd 注入 iptables NAT 规则
+    echo -e "${GREEN}[5/5] 正在配置系统服务及生成分享链接...${PLAIN}"
+    IPTABLES_START=""; IPTABLES_STOP=""
     if [ -n "$PORT_HY2_RANGE" ]; then
-        IPTABLES_START="ExecStartPost=-/sbin/iptables -t nat -A PREROUTING -p udp --dport $PORT_HY2_RANGE -j REDIRECT --to-ports $PORT_HY2
-ExecStartPost=-/sbin/ip6tables -t nat -A PREROUTING -p udp --dport $PORT_HY2_RANGE -j REDIRECT --to-ports $PORT_HY2"
-        
-        IPTABLES_STOP="ExecStopPost=-/sbin/iptables -t nat -D PREROUTING -p udp --dport $PORT_HY2_RANGE -j REDIRECT --to-ports $PORT_HY2
-ExecStopPost=-/sbin/ip6tables -t nat -D PREROUTING -p udp --dport $PORT_HY2_RANGE -j REDIRECT --to-ports $PORT_HY2"
+        IPTABLES_START="ExecStartPost=-/sbin/iptables -t nat -A PREROUTING -p udp --dport $PORT_HY2_RANGE -j REDIRECT --to-ports $PORT_HY2\nExecStartPost=-/sbin/ip6tables -t nat -A PREROUTING -p udp --dport $PORT_HY2_RANGE -j REDIRECT --to-ports $PORT_HY2"
+        IPTABLES_STOP="ExecStopPost=-/sbin/iptables -t nat -D PREROUTING -p udp --dport $PORT_HY2_RANGE -j REDIRECT --to-ports $PORT_HY2\nExecStopPost=-/sbin/ip6tables -t nat -D PREROUTING -p udp --dport $PORT_HY2_RANGE -j REDIRECT --to-ports $PORT_HY2"
     fi
 
     cat > /etc/systemd/system/sing-box.service <<EOF
@@ -263,8 +196,8 @@ After=network.target nss-lookup.target
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 ExecStart=$SING_BOX_BIN run -c $CONFIG_DIR/config.json
-$IPTABLES_START
-$IPTABLES_STOP
+${IPTABLES_START}
+${IPTABLES_STOP}
 Restart=on-failure
 RestartSec=10s
 LimitNOFILE=infinity
@@ -276,48 +209,84 @@ EOF
     systemctl daemon-reload
     systemctl enable sing-box > /dev/null 2>&1
     systemctl restart sing-box
+}
 
-    # 打印最终连接信息
+install_sba_shortcut() {
+    cat > /usr/bin/sba <<EOF
+#!/bin/bash
+bash <(curl -Ls $SCRIPT_URL)
+EOF
+    chmod +x /usr/bin/sba
+}
+
+show_links() {
+    get_public_ip
+    INSECURE_FLAG="0"
+    if [ "$CERT_CHOICE" == "1" ]; then INSECURE_FLAG="1"; fi
+
+    VLESS_LINK="vless://${UUID_REALITY}@${PUBLIC_IP}:${PORT_REALITY}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.microsoft.com&fp=chrome&pbk=${REALITY_PUBLIC}&sid=${REALITY_SHORT_ID}&type=tcp&headerType=none#SingBox-REALITY"
+    HY2_PORT_DISPLAY=${PORT_HY2}
+    if [ -n "$PORT_HY2_RANGE" ]; then HY2_PORT_DISPLAY=${PORT_HY2_RANGE/-/:}; fi
+    HY2_LINK="hy2://${PASS_HY2}@${PUBLIC_IP}:${HY2_PORT_DISPLAY}?insecure=${INSECURE_FLAG}&sni=${DOMAIN}#SingBox-Hy2"
+    TUIC_LINK="tuic://${UUID_TUIC}:${PASS_TUIC}@${PUBLIC_IP}:${PORT_TUIC}?sni=${DOMAIN}&alpn=h3&allow_insecure=${INSECURE_FLAG}#SingBox-TUIC"
+
     clear
     echo -e "${CYAN}===========================================${PLAIN}"
     echo -e "${CYAN}        Sing-box 服务端部署成功！           ${PLAIN}"
     echo -e "${CYAN}===========================================${PLAIN}"
-    
-    echo -e "${YELLOW}[1] REALITY 配置信息 (VLESS + TCP):${PLAIN}"
-    echo -e "  端口: ${GREEN}$PORT_REALITY${PLAIN} ${CYAN}[xtls-rprx-vision 流控]${PLAIN}"
-    echo -e "  UUID: ${GREEN}$UUID_REALITY${PLAIN}"
-    echo -e "  公钥: ${GREEN}$REALITY_PUBLIC${PLAIN}"
-    echo -e "  Short ID: ${GREEN}$REALITY_SHORT_ID${PLAIN}"
-    
-    echo -e "\n${YELLOW}[2] AnyTLS 配置信息 (AnyTLS + TCP):${PLAIN}"
-    echo -e "  端口: ${GREEN}$PORT_ANYTLS${PLAIN} ${CYAN}[已应用最强 Padding]${PLAIN}"
-    echo -e "  密码: ${GREEN}$PASS_ANYTLS${PLAIN}"
-
-    echo -e "\n${YELLOW}[3] Hysteria2 配置信息 (UDP):${PLAIN}"
-    if [ -n "$PORT_HY2_RANGE" ]; then
-        echo -e "  端口: ${GREEN}$PORT_HY2${PLAIN} 或跳跃端口段: ${GREEN}$PORT_HY2_RANGE${PLAIN}"
-        echo -e "  (客户端地址填写示例: ${GREEN}你的IP:${PORT_HY2_RANGE/-/:}${PLAIN})"
-    else
-        echo -e "  端口: ${GREEN}$PORT_HY2${PLAIN} (未开启跳跃)"
-    fi
-    echo -e "  密码: ${GREEN}$PASS_HY2${PLAIN}"
-
-    echo -e "\n${YELLOW}[4] TUIC v5 配置信息 (UDP):${PLAIN}"
-    echo -e "  端口: ${GREEN}$PORT_TUIC${PLAIN}"
-    echo -e "  UUID: ${GREEN}$UUID_TUIC${PLAIN}"
-    echo -e "  密码: ${GREEN}$PASS_TUIC${PLAIN}"
-    
+    echo -e "${YELLOW}↓↓↓ 复制以下代码直接导入客户端 ↓↓↓${PLAIN}\n"
+    echo -e "${GREEN}[1] REALITY:${PLAIN}\n${VLESS_LINK}\n"
+    echo -e "${GREEN}[2] Hysteria2:${PLAIN}\n${HY2_LINK}\n"
+    echo -e "${GREEN}[3] TUIC v5:${PLAIN}\n${TUIC_LINK}\n"
     echo -e "${CYAN}===========================================${PLAIN}"
-    echo -e "${RED}重要提示: 请务必在云提供商防火墙及系统防火墙中放行上述所有 TCP/UDP 端口！${PLAIN}"
-    if [ -n "$PORT_HY2_RANGE" ]; then
-        echo -e "${RED}由于开启了 Hy2 端口跳跃，请务必放行 UDP 端口段: ${PORT_HY2_RANGE}${PLAIN}"
-    fi
+    echo -e "${YELLOW}AnyTLS 端口: ${GREEN}$PORT_ANYTLS${PLAIN}  | 密码: ${GREEN}$PASS_ANYTLS${PLAIN}"
+    echo -e "${GREEN}提示: 以后可随时在终端输入 sba 呼出管理菜单！${PLAIN}"
+    echo -e "${CYAN}===========================================${PLAIN}"
 }
 
-# 运行主流程
-interactive_setup
-install_dependencies
-install_sing_box
-manage_cert
-generate_config
-configure_systemd
+# ================= 2. 卸载模块 =================
+uninstall_singbox() {
+    clear
+    echo -e "${RED}警告: 即将卸载 Sing-box 及所有配置文件！${PLAIN}"
+    read -p "确认要卸载吗？[y/N]: " UNINSTALL_CONFIRM
+    if [[ "$UNINSTALL_CONFIRM" =~ ^[Yy]$ ]]; then
+        echo -e "${YELLOW}正在停止并禁用 Sing-box 服务...${PLAIN}"
+        systemctl stop sing-box > /dev/null 2>&1
+        systemctl disable sing-box > /dev/null 2>&1
+        rm -f /etc/systemd/system/sing-box.service
+        systemctl daemon-reload
+        
+        echo -e "${YELLOW}正在清理核心文件与配置...${PLAIN}"
+        rm -rf "$CONFIG_DIR"
+        rm -f "$SING_BOX_BIN"
+        rm -f /usr/bin/sba
+        
+        echo -e "${GREEN}卸载完成！系统已恢复纯净状态。${PLAIN}"
+    else
+        echo -e "${GREEN}已取消卸载。${PLAIN}"
+    fi
+    sleep 2
+    start_menu
+}
+
+# ================= 3. 主菜单控制流 =================
+start_menu() {
+    clear
+    echo -e "${CYAN}==========================================${PLAIN}"
+    echo -e "${CYAN}      Sing-box 高级部署及管理脚本         ${PLAIN}"
+    echo -e "${CYAN}==========================================${PLAIN}"
+    echo -e "${GREEN}1.${PLAIN} 安装/更新 Sing-box (多协议防封锁版)"
+    echo -e "${GREEN}2.${PLAIN} 彻底卸载 Sing-box"
+    echo -e "${GREEN}0.${PLAIN} 退出脚本"
+    echo -e "${CYAN}==========================================${PLAIN}"
+    read -p "请输入选项 [0-2]: " MENU_CHOICE
+    case "$MENU_CHOICE" in
+        1) main_install ;;
+        2) uninstall_singbox ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}输入错误，请重新选择！${PLAIN}"; sleep 1; start_menu ;;
+    esac
+}
+
+# 脚本入口
+start_menu
