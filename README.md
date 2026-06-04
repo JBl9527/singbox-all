@@ -20,9 +20,13 @@ TUIC v5 (UDP): 54434
 📦 快速安装
 将本仓库的 install.sh 脚本在你的 VPS 上运行：
 
-Bash
-# 替换为你的真实 GitHub 仓库地址
+
 bash <(curl -Ls https://raw.githubusercontent.com/JBl9527/singbox-all/refs/heads/main/install.sh)
+
+
+
+
+
 安装过程选项说明
 在运行脚本时，系统会提示你选择证书模式：
 
