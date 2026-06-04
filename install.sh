@@ -1,9 +1,9 @@
 #!/bin/bash
 
 # ==========================================
-# Sing-box 高级多协议一键部署脚本
-# 包含协议: REALITY (开启 vision 流控), AnyTLS, Hysteria2, TUIC
-# 特性: 端口自定义 / 自签或独立证书 / 极强 Padding Scheme
+# Sing-box 高级多协议一键部署脚本 (终极版)
+# 协议: REALITY, AnyTLS, Hysteria2 (含端口跳跃), TUIC
+# 特性: 凭证全独立随机 / 交互式端口映射 / 最强 Padding Scheme
 # ==========================================
 
 RED='\033[0;31m'
@@ -38,7 +38,7 @@ interactive_setup() {
         read -p "请输入已解析到本机的域名: " DOMAIN
     fi
 
-    # 2. 端口配置
+    # 2. 端口与端口跳跃配置
     echo -e "\n${YELLOW}=== 2. 协议端口设置 ===${PLAIN}"
     read -p "请输入 REALITY 端口 [默认 34433]: " PORT_REALITY
     PORT_REALITY=${PORT_REALITY:-34433}
@@ -46,8 +46,14 @@ interactive_setup() {
     read -p "请输入 AnyTLS 端口 [默认 44433]: " PORT_ANYTLS
     PORT_ANYTLS=${PORT_ANYTLS:-44433}
 
-    read -p "请输入 Hysteria2 端口 [默认 54433]: " PORT_HY2
+    read -p "请输入 Hysteria2 主监听端口 [默认 54433]: " PORT_HY2
     PORT_HY2=${PORT_HY2:-54433}
+
+    echo -e "\n${CYAN}Hysteria2 端口跳跃 (Port Hopping) 设置:${PLAIN}"
+    echo "输入一个端口段，例如 20000:30000，客户端可在此范围内动态跳跃防封锁。"
+    read -p "请输入 Hy2 跳跃端口段 (直接回车表示不开启端口跳跃): " PORT_HY2_RANGE
+    # 将用户可能输入的减号替换为冒号，适配 iptables 格式
+    PORT_HY2_RANGE=$(echo "$PORT_HY2_RANGE" | tr '-' ':')
 
     read -p "请输入 TUIC 端口 [默认 54434]: " PORT_TUIC
     PORT_TUIC=${PORT_TUIC:-54434}
@@ -58,10 +64,8 @@ interactive_setup() {
     read -p "请输入自定义 padding-scheme (如需使用内置最强默认配置，请直接回车): " CUSTOM_PADDING
 
     if [ -z "$CUSTOM_PADDING" ]; then
-        # 默认最强抗检测方案 (AnyTLS Default Recommended)
         PADDING_SCHEME_JSON='"stop=8", "0=30-30", "1=100-400", "2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000", "3=9-9,500-1000", "4=500-1000", "5=500-1000", "6=500-1000", "7=500-1000"'
     else
-        # 用户自定义的数组内容
         PADDING_SCHEME_JSON="$CUSTOM_PADDING"
     fi
     echo -e "\n${GREEN}交互配置完成，开始全自动安装部署...${PLAIN}\n"
@@ -72,7 +76,7 @@ interactive_setup() {
 install_dependencies() {
     echo -e "${GREEN}[1/5] 正在安装基础依赖...${PLAIN}"
     apt-get update -y > /dev/null 2>&1
-    apt-get install -y curl wget jq openssl socat uuid-runtime cron > /dev/null 2>&1
+    apt-get install -y curl wget jq openssl socat uuid-runtime cron iptables > /dev/null 2>&1
     mkdir -p "$CONFIG_DIR"
     mkdir -p "$CERT_DIR"
 }
@@ -111,17 +115,21 @@ manage_cert() {
             --fullchain-file "$CERT_DIR/server.crt" \
             --key-file "$CERT_DIR/server.key" \
             --reloadcmd "systemctl restart sing-box"
-    else
-        echo -e "${RED}证书模式选择错误！${PLAIN}"
-        exit 1
     fi
 }
 
-# 生成配置文件
+# 生成配置文件 (独立生成各项凭据)
 generate_config() {
-    echo -e "${GREEN}[4/5] 正在生成核心配置文件...${PLAIN}"
-    UUID=$(uuidgen)
-    PASSWORD=$(openssl rand -base64 12)
+    echo -e "${GREEN}[4/5] 正在独立生成各协议的随机凭证...${PLAIN}"
+    
+    # 完全独立的凭证生成
+    UUID_REALITY=$(uuidgen)
+    PASS_ANYTLS=$(openssl rand -base64 12)
+    PASS_HY2=$(openssl rand -base64 12)
+    UUID_TUIC=$(uuidgen)
+    PASS_TUIC=$(openssl rand -base64 12)
+
+    # REALITY 专属公私钥
     REALITY_KEYPAIR=$($SING_BOX_BIN generate reality-keypair)
     REALITY_PRIVATE=$(echo "$REALITY_KEYPAIR" | grep PrivateKey | awk '{print $2}')
     REALITY_PUBLIC=$(echo "$REALITY_KEYPAIR" | grep PublicKey | awk '{print $2}')
@@ -141,7 +149,7 @@ generate_config() {
       "listen_port": $PORT_REALITY,
       "users": [
         {
-          "uuid": "$UUID",
+          "uuid": "$UUID_REALITY",
           "flow": "xtls-rprx-vision"
         }
       ],
@@ -166,7 +174,7 @@ generate_config() {
       "listen_port": $PORT_ANYTLS,
       "users": [
         {
-          "password": "$PASSWORD"
+          "password": "$PASS_ANYTLS"
         }
       ],
       "padding_scheme": [
@@ -185,7 +193,7 @@ generate_config() {
       "listen_port": $PORT_HY2,
       "users": [
         {
-          "password": "$PASSWORD"
+          "password": "$PASS_HY2"
         }
       ],
       "tls": {
@@ -202,8 +210,8 @@ generate_config() {
       "listen_port": $PORT_TUIC,
       "users": [
         {
-          "uuid": "$UUID",
-          "password": "$PASSWORD"
+          "uuid": "$UUID_TUIC",
+          "password": "$PASS_TUIC"
         }
       ],
       "tls": {
@@ -228,9 +236,23 @@ generate_config() {
 EOF
 }
 
-# 配置 Systemd 服务并收尾
+# 配置 Systemd 服务并绑定 iptables 端口跳跃规则
 configure_systemd() {
-    echo -e "${GREEN}[5/5] 正在配置系统服务...${PLAIN}"
+    echo -e "${GREEN}[5/5] 正在配置系统服务及防火墙映射...${PLAIN}"
+    
+    # 初始化 systemd 的 Exec 规则变量
+    IPTABLES_START=""
+    IPTABLES_STOP=""
+
+    # 如果配置了端口跳跃，自动向 systemd 注入 iptables NAT 规则
+    if [ -n "$PORT_HY2_RANGE" ]; then
+        IPTABLES_START="ExecStartPost=-/sbin/iptables -t nat -A PREROUTING -p udp --dport $PORT_HY2_RANGE -j REDIRECT --to-ports $PORT_HY2
+ExecStartPost=-/sbin/ip6tables -t nat -A PREROUTING -p udp --dport $PORT_HY2_RANGE -j REDIRECT --to-ports $PORT_HY2"
+        
+        IPTABLES_STOP="ExecStopPost=-/sbin/iptables -t nat -D PREROUTING -p udp --dport $PORT_HY2_RANGE -j REDIRECT --to-ports $PORT_HY2
+ExecStopPost=-/sbin/ip6tables -t nat -D PREROUTING -p udp --dport $PORT_HY2_RANGE -j REDIRECT --to-ports $PORT_HY2"
+    fi
+
     cat > /etc/systemd/system/sing-box.service <<EOF
 [Unit]
 Description=Sing-box Service
@@ -241,6 +263,8 @@ After=network.target nss-lookup.target
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 ExecStart=$SING_BOX_BIN run -c $CONFIG_DIR/config.json
+$IPTABLES_START
+$IPTABLES_STOP
 Restart=on-failure
 RestartSec=10s
 LimitNOFILE=infinity
@@ -253,26 +277,41 @@ EOF
     systemctl enable sing-box > /dev/null 2>&1
     systemctl restart sing-box
 
-    # 打印连接信息
+    # 打印最终连接信息
     clear
     echo -e "${CYAN}===========================================${PLAIN}"
     echo -e "${CYAN}        Sing-box 服务端部署成功！           ${PLAIN}"
     echo -e "${CYAN}===========================================${PLAIN}"
-    echo -e "${YELLOW}核心节点凭证:${PLAIN}"
-    echo -e "UUID: ${GREEN}$UUID${PLAIN}"
-    echo -e "密码 (AnyTLS/Hy2/TUIC 共用): ${GREEN}$PASSWORD${PLAIN}"
-    echo -e "-------------------------------------------"
-    echo -e "${YELLOW}各协议端口信息:${PLAIN}"
-    echo -e "REALITY (TCP): ${GREEN}$PORT_REALITY${PLAIN} ${CYAN}[已开启 xtls-rprx-vision 流控]${PLAIN}"
-    echo -e "AnyTLS  (TCP): ${GREEN}$PORT_ANYTLS${PLAIN} ${CYAN}[已应用最强 Padding 抗检测机制]${PLAIN}"
-    echo -e "Hysteria2(UDP): ${GREEN}$PORT_HY2${PLAIN}"
-    echo -e "TUIC    (UDP): ${GREEN}$PORT_TUIC${PLAIN}"
-    echo -e "-------------------------------------------"
-    echo -e "${YELLOW}REALITY 专属验证信息:${PLAIN}"
-    echo -e "Public Key (公钥): ${GREEN}$REALITY_PUBLIC${PLAIN}"
-    echo -e "Short ID: ${GREEN}$REALITY_SHORT_ID${PLAIN}"
+    
+    echo -e "${YELLOW}[1] REALITY 配置信息 (VLESS + TCP):${PLAIN}"
+    echo -e "  端口: ${GREEN}$PORT_REALITY${PLAIN} ${CYAN}[xtls-rprx-vision 流控]${PLAIN}"
+    echo -e "  UUID: ${GREEN}$UUID_REALITY${PLAIN}"
+    echo -e "  公钥: ${GREEN}$REALITY_PUBLIC${PLAIN}"
+    echo -e "  Short ID: ${GREEN}$REALITY_SHORT_ID${PLAIN}"
+    
+    echo -e "\n${YELLOW}[2] AnyTLS 配置信息 (AnyTLS + TCP):${PLAIN}"
+    echo -e "  端口: ${GREEN}$PORT_ANYTLS${PLAIN} ${CYAN}[已应用最强 Padding]${PLAIN}"
+    echo -e "  密码: ${GREEN}$PASS_ANYTLS${PLAIN}"
+
+    echo -e "\n${YELLOW}[3] Hysteria2 配置信息 (UDP):${PLAIN}"
+    if [ -n "$PORT_HY2_RANGE" ]; then
+        echo -e "  端口: ${GREEN}$PORT_HY2${PLAIN} 或跳跃端口段: ${GREEN}$PORT_HY2_RANGE${PLAIN}"
+        echo -e "  (客户端地址填写示例: ${GREEN}你的IP:${PORT_HY2_RANGE/-/:}${PLAIN})"
+    else
+        echo -e "  端口: ${GREEN}$PORT_HY2${PLAIN} (未开启跳跃)"
+    fi
+    echo -e "  密码: ${GREEN}$PASS_HY2${PLAIN}"
+
+    echo -e "\n${YELLOW}[4] TUIC v5 配置信息 (UDP):${PLAIN}"
+    echo -e "  端口: ${GREEN}$PORT_TUIC${PLAIN}"
+    echo -e "  UUID: ${GREEN}$UUID_TUIC${PLAIN}"
+    echo -e "  密码: ${GREEN}$PASS_TUIC${PLAIN}"
+    
     echo -e "${CYAN}===========================================${PLAIN}"
-    echo -e "提示: 请务必在云提供商后台防火墙放行上述对应的 TCP/UDP 端口！"
+    echo -e "${RED}重要提示: 请务必在云提供商防火墙及系统防火墙中放行上述所有 TCP/UDP 端口！${PLAIN}"
+    if [ -n "$PORT_HY2_RANGE" ]; then
+        echo -e "${RED}由于开启了 Hy2 端口跳跃，请务必放行 UDP 端口段: ${PORT_HY2_RANGE}${PLAIN}"
+    fi
 }
 
 # 运行主流程
