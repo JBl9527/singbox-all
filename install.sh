@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==========================================
-# Sing-box 终极多协议管理脚本 (BBR 加速集成版)
+# Sing-box 终极多协议管理脚本 (无坑健壮版)
 # 特性: 智能菜单 / 绝对静默更新 / 动态修参 / 状态持久化 / 一键BBR
 # ==========================================
 
@@ -39,7 +39,7 @@ check_bbr_status() {
     fi
 }
 
-# 一键开启 BBR 加速
+# 一键开启 BBR 加加速
 enable_bbr() {
     clear
     echo -e "${YELLOW}正在检测当前系统 BBR 状态...${PLAIN}"
@@ -47,22 +47,15 @@ enable_bbr() {
         echo -e "${GREEN}您的系统已经开启了 BBR 加速，无需重复开启！${PLAIN}"
     else
         echo -e "${YELLOW}正在为您的 VPS 注入 BBR 加速内核参数...${PLAIN}"
-        # 清理旧的可能残留的配置
         sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf
         sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
-        
-        # 写入最优配置 (fq 队列 + bbr)
         echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
         echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
-        
-        # 刷新系统内核参数
         sysctl -p >/dev/null 2>&1
-        
-        # 二次验证
         if sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q "bbr"; then
-            echo -e "${GREEN}✔ BBR 加速开启成功！高丢包环境下的网络吞吐量已大幅优化。${PLAIN}"
+            echo -e "${GREEN}✔ BBR 加速开启成功！${PLAIN}"
         else
-            echo -e "${RED}❌ BBR 开启失败！请检查 VPS 虚拟化架构（部分 OpenVZ 架构的 VPS 不支持修改内核参数）。${PLAIN}"
+            echo -e "${RED}❌ BBR 开启失败！部分 OpenVZ 架构的 VPS 不支持修改内核参数。${PLAIN}"
         fi
     fi
     sleep 2
@@ -114,7 +107,7 @@ silent_update_core() {
     rm -rf sing-box.tar.gz sing-box-${LATEST_VERSION}-linux-${DL_ARCH}
     
     systemctl restart sing-box
-    echo -e "${GREEN}✔ Sing-box 核心已成功无损更新至 v${LATEST_VERSION}！现有配置与链接完全保留。${PLAIN}"
+    echo -e "${GREEN}✔ Sing-box 核心已成功无损更新至 v${LATEST_VERSION}！${PLAIN}"
     install_sba_shortcut
     sleep 3
     start_menu
@@ -151,24 +144,26 @@ fresh_install() {
         PADDING_SCHEME_JSON='"stop=8", "0=30-30", "1=100-400", "2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000", "3=9-9,500-1000", "4=500-1000", "5=500-1000", "6=500-1000", "7=500-1000"'
     else PADDING_SCHEME_JSON="$CUSTOM_PADDING"; fi
     
-    echo -e "\n${GREEN}开始全自动部署...${PLAIN}\n"
-    apt-get update -y > /dev/null 2>&1
-    apt-get install -y curl wget jq openssl socat uuid-runtime cron iptables > /dev/null 2>&1
+    echo -e "\n${GREEN}正在安装基础依赖组件...${PLAIN}\n"
+    apt-get update -y
+    apt-get install -y curl wget jq openssl socat uuid-runtime cron iptables
     mkdir -p "$CERT_DIR"
 
     # 安装核心
+    echo -e "\n${GREEN}正在从官方源拉取最新 Sing-box 核心...${PLAIN}\n"
     LATEST_VERSION=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r .tag_name | sed 's/v//')
     ARCH=$(uname -m)
-    case "$ARCH" in x86_64) DL_ARCH="amd64" ;; aarch64) DL_ARCH="arm64" ;; *) exit 1 ;; esac
+    case "$ARCH" in x86_64) DL_ARCH="amd64" ;; aarch64) DL_ARCH="arm64" ;; *) exit 1 ;; macos) exit 1 ;; esac
     wget -qO sing-box.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v${LATEST_VERSION}/sing-box-${LATEST_VERSION}-linux-${DL_ARCH}.tar.gz"
     tar -xzf sing-box.tar.gz
     mv sing-box-${LATEST_VERSION}-linux-${DL_ARCH}/sing-box $SING_BOX_BIN
     chmod +x $SING_BOX_BIN
     rm -rf sing-box.tar.gz sing-box-${LATEST_VERSION}-linux-${DL_ARCH}
 
-    # 证书
+    # 证书生成逻辑（取消静默，保留可见报错）
+    echo -e "\n${GREEN}正在配置安全证书加密层...${PLAIN}\n"
     if [ "$CERT_CHOICE" == "1" ]; then
-        openssl req -x509 -nodes -days 3650 -newkey rsa:2048 -keyout "$CERT_DIR/server.key" -out "$CERT_DIR/server.crt" -subj "/C=US/ST=State/L=City/O=Organization/CN=$DOMAIN" > /dev/null 2>&1
+        openssl req -x509 -nodes -days 3650 -newkey rsa:2048 -keyout "$CERT_DIR/server.key" -out "$CERT_DIR/server.crt" -subj "/C=US/ST=State/L=City/O=Organization/CN=$DOMAIN"
     elif [ "$CERT_CHOICE" == "2" ]; then
         curl -s https://get.acme.sh | sh
         ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt
@@ -362,7 +357,6 @@ start_menu() {
     echo -e "${CYAN}      Sing-box 终极部署及管理脚本         ${PLAIN}"
     echo -e "${CYAN}==========================================${PLAIN}"
     
-    # 状态实时检测
     BBR_TXT=$(check_bbr_status)
     if [ -f "$CONF_FILE" ]; then
         echo -e "系统状态: ${GREEN}已安装${PLAIN}   |   BBR加速状态: ${BBR_TXT}"
