@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # ==========================================
-# Sing-box 终极多协议管理脚本 (ACME 修复版)
-# 特性: 智能菜单 / 解决 ACME 邮箱封禁 / 动态修参 / 一键BBR
+# Sing-box 终极多协议管理脚本 (独立证书修复版)
+# 特性: 独立证书申请 / CF-DNS双模 / 智能菜单 / 一键BBR
 # ==========================================
 
 SCRIPT_URL="https://raw.githubusercontent.com/JBl9527/singbox-all/main/install.sh"
@@ -39,7 +39,7 @@ check_bbr_status() {
     fi
 }
 
-# 一键开启 BBR 网络加速
+# 一键开启 BBR 加速
 enable_bbr() {
     clear
     echo -e "${YELLOW}正在检测当前系统 BBR 状态...${PLAIN}"
@@ -55,7 +55,7 @@ enable_bbr() {
         if sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q "bbr"; then
             echo -e "${GREEN}✔ BBR 加速开启成功！${PLAIN}"
         else
-            echo -e "${RED}❌ BBR 开启失败！部分 OpenVZ 架构的 VPS 不支持修改内核参数。${PLAIN}"
+            echo -e "${RED}❌ BBR 开启失败！部分 OpenVZ 架构不支持修改内核参数。${PLAIN}"
         fi
     fi
     sleep 2
@@ -67,6 +67,9 @@ save_config() {
     cat > "$CONF_FILE" <<EOF
 CERT_CHOICE="${CERT_CHOICE}"
 DOMAIN="${DOMAIN}"
+ACME_EMAIL="${ACME_EMAIL}"
+CF_EMAIL="${CF_EMAIL}"
+CF_KEY="${CF_KEY}"
 PORT_REALITY="${PORT_REALITY}"
 PORT_ANYTLS="${PORT_ANYTLS}"
 PORT_HY2="${PORT_HY2}"
@@ -84,21 +87,16 @@ REALITY_SHORT_ID="${REALITY_SHORT_ID}"
 EOF
 }
 
-# 静默更新二进制核心
+# 静默更新核心
 silent_update_core() {
     clear
     echo -e "${YELLOW}正在检测并下载最新版 Sing-box 核心...${PLAIN}"
     LATEST_VERSION=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r .tag_name | sed 's/v//')
     ARCH=$(uname -m)
-    case "$ARCH" in
-        x86_64) DL_ARCH="amd64" ;; aarch64) DL_ARCH="arm64" ;; *) echo -e "${RED}不支持的架构${PLAIN}"; exit 1 ;;
-    esac
+    case "$ARCH" in x86_64) DL_ARCH="amd64" ;; aarch64) DL_ARCH="arm64" ;; *) echo -e "${RED}不支持的架构${PLAIN}"; exit 1 ;; esac
     
     wget -qO sing-box.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v${LATEST_VERSION}/sing-box-${LATEST_VERSION}-linux-${DL_ARCH}.tar.gz"
-    if [ $? -ne 0 ]; then
-        echo -e "${RED}下载失败，请检查网络！${PLAIN}"
-        sleep 2; start_menu; return
-    fi
+    if [ $? -ne 0 ]; then echo -e "${RED}下载失败，请检查网络！${PLAIN}"; sleep 2; start_menu; return; fi
     
     systemctl stop sing-box > /dev/null 2>&1
     tar -xzf sing-box.tar.gz
@@ -113,18 +111,29 @@ silent_update_core() {
     start_menu
 }
 
-# 全新安装流程
+# 全新安装
 fresh_install() {
     clear
     echo -e "${CYAN}==========================================${PLAIN}"
     echo -e "${CYAN}        开始全新安装 Sing-box 服务        ${PLAIN}"
     echo -e "${CYAN}==========================================${PLAIN}"
 
-    echo -e "\n${YELLOW}=== 1. 证书模式选择 ===${PLAIN}"
-    echo "1. 生成临时自签证书 (有效期10年，适合单纯使用 REALITY / AnyTLS 无需真实域名)"
-    echo "2. 申请永久域名证书 (使用 acme.sh，需提前解析真实域名到本机并确保 80 端口空闲)"
-    read -p "请输入选项 [1-2]: " CERT_CHOICE
-    if [ "$CERT_CHOICE" == "2" ]; then read -p "请输入已解析到本机的域名: " DOMAIN; else DOMAIN="bing.com"; fi
+    echo -e "\n${YELLOW}=== 1. 安全证书配置 ===${PLAIN}"
+    echo "1. 生成临时自签证书 (有效期10年，适合无域名场景)"
+    echo "2. 使用自定义邮箱申请永久证书 (Standalone 模式，需放行 80 端口)"
+    echo "3. 使用 Cloudflare API 申请永久证书 (DNS 模式，无需放行 80 端口)"
+    read -p "请输入选项 [1-3]: " CERT_CHOICE
+    
+    if [ "$CERT_CHOICE" == "2" ]; then
+        read -p "请输入解析到本机的域名: " DOMAIN
+        read -p "请输入 ACME 注册邮箱: " ACME_EMAIL
+    elif [ "$CERT_CHOICE" == "3" ]; then
+        read -p "请输入托管在 CF 上的域名: " DOMAIN
+        read -p "请输入 CF 账号邮箱: " CF_EMAIL
+        read -p "请输入 CF Global API Key: " CF_KEY
+    else
+        CERT_CHOICE="1"; DOMAIN="bing.com"
+    fi
 
     echo -e "\n${YELLOW}=== 2. 协议端口设置 ===${PLAIN}"
     read -p "请输入 REALITY 端口 [默认 34433]: " PORT_REALITY
@@ -133,23 +142,21 @@ fresh_install() {
     PORT_ANYTLS=${PORT_ANYTLS:-44433}
     read -p "请输入 Hysteria2 主监听端口 [默认 54433]: " PORT_HY2
     PORT_HY2=${PORT_HY2:-54433}
-    read -p "请输入 Hy2 跳跃端口段 (如 20000:30000，直接回车不跳跃): " PORT_HY2_RANGE
+    read -p "请输入 Hy2 跳跃端口段 (直接回车不跳跃): " PORT_HY2_RANGE
     PORT_HY2_RANGE=$(echo "$PORT_HY2_RANGE" | tr '-' ':')
     read -p "请输入 TUIC 端口 [默认 54434]: " PORT_TUIC
     PORT_TUIC=${PORT_TUIC:-54434}
 
-    echo -e "\n${YELLOW}=== 3. AnyTLS 阻断防护 (Padding) 设置 ===${PLAIN}"
-    read -p "请输入自定义 padding-scheme (直接回车使用最强默认配置): " CUSTOM_PADDING
+    echo -e "\n${YELLOW}=== 3. AnyTLS Padding 设置 ===${PLAIN}"
+    read -p "请输入自定义 padding-scheme (直接回车使用内置最强配置): " CUSTOM_PADDING
     if [ -z "$CUSTOM_PADDING" ]; then
         PADDING_SCHEME_JSON='"stop=8", "0=30-30", "1=100-400", "2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000", "3=9-9,500-1000", "4=500-1000", "5=500-1000", "6=500-1000", "7=500-1000"'
     else PADDING_SCHEME_JSON="$CUSTOM_PADDING"; fi
     
-    echo -e "\n${GREEN}正在安装基础依赖组件...${PLAIN}\n"
-    apt-get update -y
-    apt-get install -y curl wget jq openssl socat uuid-runtime cron iptables
+    apt-get update -y > /dev/null 2>&1
+    apt-get install -y curl wget jq openssl socat uuid-runtime cron iptables > /dev/null 2>&1
     mkdir -p "$CERT_DIR"
 
-    # 安装核心
     LATEST_VERSION=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r .tag_name | sed 's/v//')
     ARCH=$(uname -m)
     case "$ARCH" in x86_64) DL_ARCH="amd64" ;; aarch64) DL_ARCH="arm64" ;; *) exit 1 ;; esac
@@ -159,19 +166,24 @@ fresh_install() {
     chmod +x $SING_BOX_BIN
     rm -rf sing-box.tar.gz sing-box-${LATEST_VERSION}-linux-${DL_ARCH}
 
-    # 证书生成逻辑 (解决 example.com 封禁问题)
     if [ "$CERT_CHOICE" == "1" ]; then
         openssl req -x509 -nodes -days 3650 -newkey rsa:2048 -keyout "$CERT_DIR/server.key" -out "$CERT_DIR/server.crt" -subj "/C=US/ST=State/L=City/O=Organization/CN=$DOMAIN"
     elif [ "$CERT_CHOICE" == "2" ]; then
         curl -s https://get.acme.sh | sh
         ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt
-        # 【核心修复点】显式注册一个绝对不会被封禁的自定义合法邮箱
-        ~/.acme.sh/acme.sh --register-account -m sba_admin2026@gmail.com --server letsencrypt --force
+        ~/.acme.sh/acme.sh --register-account -m "$ACME_EMAIL" --server letsencrypt --force
         ~/.acme.sh/acme.sh --issue -d "$DOMAIN" --standalone -k ec-256 --force
-        ~/.acme.sh/acme.sh --installcert -d "$DOMAIN" --ecc --fullchain-file "$CERT_DIR/server.crt" --key-file "$CERT_DIR/server.key" --reloadcmd "systemctl restart sing-box"
+        ~/.acme.sh/acme.sh --installcert -d "$DOMAIN" --ecc --fullchain-file "$CERT_DIR/server.crt" --key-file "$CERT_DIR/server.key"
+    elif [ "$CERT_CHOICE" == "3" ]; then
+        curl -s https://get.acme.sh | sh
+        ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt
+        export CF_Key="$CF_KEY"
+        export CF_Email="$CF_EMAIL"
+        ~/.acme.sh/acme.sh --register-account -m "$CF_EMAIL" --server letsencrypt --force
+        ~/.acme.sh/acme.sh --issue --dns dns_cf -d "$DOMAIN" -k ec-256 --force
+        ~/.acme.sh/acme.sh --installcert -d "$DOMAIN" --ecc --fullchain-file "$CERT_DIR/server.crt" --key-file "$CERT_DIR/server.key"
     fi
 
-    # 凭证独立生成
     UUID_REALITY=$(uuidgen); PASS_ANYTLS=$(openssl rand -base64 12)
     PASS_HY2=$(openssl rand -base64 12); UUID_TUIC=$(uuidgen); PASS_TUIC=$(openssl rand -base64 12)
     REALITY_KEYPAIR=$($SING_BOX_BIN generate reality-keypair)
@@ -183,6 +195,80 @@ fresh_install() {
     generate_config_json
     configure_systemd
     install_sba_shortcut
+    show_links
+}
+
+# ================= 新增：独立证书申请模块 =================
+standalone_cert_manager() {
+    clear
+    if [ ! -f "$CONF_FILE" ]; then
+        echo -e "${RED}未检测到配置文件，请先选择安装！${PLAIN}"
+        sleep 2; start_menu; return
+    fi
+    source "$CONF_FILE"
+
+    echo -e "${CYAN}==========================================${PLAIN}"
+    echo -e "${CYAN}          独立证书申请与修复模块          ${PLAIN}"
+    echo -e "${CYAN}==========================================${PLAIN}"
+    echo -e "${YELLOW}当前绑定的域名: ${GREEN}${DOMAIN:-无}${PLAIN}"
+    echo -e "------------------------------------------"
+    echo "1. 重新生成 临时自签证书"
+    echo "2. 使用 Standalone 模式申请 永久域名证书 (需放行 80 端口)"
+    echo "3. 使用 Cloudflare API 申请 永久域名证书 (DNS 验证，无需 80 端口)"
+    echo "0. 返回主菜单"
+    read -p "请输入选项 [0-3]: " RE_CERT_CHOICE
+
+    if [ "$RE_CERT_CHOICE" == "0" ]; then start_menu; return; fi
+
+    if [ "$RE_CERT_CHOICE" == "2" ]; then
+        read -p "请输入域名 (默认 $DOMAIN): " NEW_DOMAIN; DOMAIN=${NEW_DOMAIN:-$DOMAIN}
+        read -p "请输入邮箱 (默认 $ACME_EMAIL): " NEW_EMAIL; ACME_EMAIL=${NEW_EMAIL:-$ACME_EMAIL}
+        CERT_CHOICE="2"
+    elif [ "$RE_CERT_CHOICE" == "3" ]; then
+        read -p "请输入域名 (默认 $DOMAIN): " NEW_DOMAIN; DOMAIN=${NEW_DOMAIN:-$DOMAIN}
+        read -p "请输入 CF 邮箱 (默认 $CF_EMAIL): " NEW_CF_EMAIL; CF_EMAIL=${NEW_CF_EMAIL:-$CF_EMAIL}
+        read -p "请输入 CF API Key: " NEW_CF_KEY; CF_KEY=${NEW_CF_KEY:-$CF_KEY}
+        CERT_CHOICE="3"
+    elif [ "$RE_CERT_CHOICE" == "1" ]; then
+        CERT_CHOICE="1"; DOMAIN="bing.com"
+    else
+        echo -e "${RED}输入无效！${PLAIN}"; sleep 1; standalone_cert_manager; return
+    fi
+
+    # 保存新的证书偏好并强行停掉占用端口的服务
+    save_config
+    mkdir -p "$CERT_DIR"
+    systemctl stop sing-box > /dev/null 2>&1
+
+    if [ "$CERT_CHOICE" == "1" ]; then
+        echo -e "\n${GREEN}正在生成自签证书...${PLAIN}"
+        openssl req -x509 -nodes -days 3650 -newkey rsa:2048 -keyout "$CERT_DIR/server.key" -out "$CERT_DIR/server.crt" -subj "/C=US/ST=State/L=City/O=Organization/CN=$DOMAIN"
+        echo -e "${GREEN}✔ 自签证书生成成功！${PLAIN}"
+    elif [ "$CERT_CHOICE" == "2" ]; then
+        echo -e "\n${GREEN}正在通过 Standalone 申请 Let's Encrypt 证书...${PLAIN}"
+        curl -s https://get.acme.sh | sh
+        ~/.acme.sh/acme.sh --register-account -m "$ACME_EMAIL" --server letsencrypt --force
+        ~/.acme.sh/acme.sh --issue -d "$DOMAIN" --standalone -k ec-256 --force
+        ~/.acme.sh/acme.sh --installcert -d "$DOMAIN" --ecc --fullchain-file "$CERT_DIR/server.crt" --key-file "$CERT_DIR/server.key"
+    elif [ "$CERT_CHOICE" == "3" ]; then
+        echo -e "\n${GREEN}正在通过 Cloudflare DNS API 申请 Let's Encrypt 证书...${PLAIN}"
+        curl -s https://get.acme.sh | sh
+        export CF_Key="$CF_KEY"
+        export CF_Email="$CF_EMAIL"
+        ~/.acme.sh/acme.sh --register-account -m "$CF_EMAIL" --server letsencrypt --force
+        ~/.acme.sh/acme.sh --issue --dns dns_cf -d "$DOMAIN" -k ec-256 --force
+        ~/.acme.sh/acme.sh --installcert -d "$DOMAIN" --ecc --fullchain-file "$CERT_DIR/server.crt" --key-file "$CERT_DIR/server.key"
+    fi
+
+    echo -e "\n${YELLOW}正在重启并校验 Sing-box 核心...${PLAIN}"
+    systemctl restart sing-box
+    sleep 1
+    if systemctl is-active --quiet sing-box; then
+        echo -e "${GREEN}✔ 证书部署成功，Sing-box 运行正常！${PLAIN}"
+    else
+        echo -e "${RED}❌ 启动失败！可能是刚才的申请由于网络或配置原因失败，缺少证书文件。${PLAIN}"
+    fi
+    sleep 3
     show_links
 }
 
@@ -257,13 +343,9 @@ EOF
     chmod +x /usr/bin/sba
 }
 
-# 动态修改参数
 modify_parameters() {
     clear
-    if [ ! -f "$CONF_FILE" ]; then
-        echo -e "${RED}未检测到配置文件，请先选择安装！${PLAIN}"
-        sleep 2; start_menu; return
-    fi
+    if [ ! -f "$CONF_FILE" ]; then echo -e "${RED}未检测到配置！${PLAIN}"; sleep 2; start_menu; return; fi
     source "$CONF_FILE"
 
     echo -e "${CYAN}==========================================${PLAIN}"
@@ -273,36 +355,29 @@ modify_parameters() {
     echo -e "2. 修改 AnyTLS 端口 (当前: $PORT_ANYTLS)"
     echo -e "3. 修改 Hysteria2 端口及跳跃"
     echo -e "4. 修改 TUIC 端口 (当前: $PORT_TUIC)"
-    echo -e "5. 修改 AnyTLS Padding Scheme"
+    echo -e "5. 修改 AnyTLS Padding"
     echo -e "0. 返回主菜单"
-    read -p "请选择需要修改的选项 [0-5]: " MOD_CHOICE
+    read -p "请选择 [0-5]: " MOD_CHOICE
 
     case "$MOD_CHOICE" in
-        1) read -p "输入新的 REALITY 端口: " NEW_PORT; [ -n "$NEW_PORT" ] && PORT_REALITY=$NEW_PORT ;;
-        2) read -p "输入新的 AnyTLS 端口: " NEW_PORT; [ -n "$NEW_PORT" ] && PORT_ANYTLS=$NEW_PORT ;;
-        3) 
-           read -p "输入新的主监听端口 (当前 $PORT_HY2): " NEW_PORT; [ -n "$NEW_PORT" ] && PORT_HY2=$NEW_PORT
-           read -p "输入新的跳跃端口段 (当前 $PORT_HY2_RANGE，清空请输入 none): " NEW_RANGE
-           if [ "$NEW_RANGE" == "none" ]; then PORT_HY2_RANGE=""; elif [ -n "$NEW_RANGE" ]; then PORT_HY2_RANGE=$(echo "$NEW_RANGE" | tr '-' ':'); fi
-           ;;
-        4) read -p "输入新的 TUIC 端口: " NEW_PORT; [ -n "$NEW_PORT" ] && PORT_TUIC=$NEW_PORT ;;
-        5) 
-           echo "当前 Padding: $PADDING_SCHEME_JSON"
-           read -p "输入新的 Padding 规则: " NEW_PAD; [ -n "$NEW_PAD" ] && PADDING_SCHEME_JSON=$NEW_PAD ;;
+        1) read -p "新 REALITY 端口: " NEW_PORT; [ -n "$NEW_PORT" ] && PORT_REALITY=$NEW_PORT ;;
+        2) read -p "新 AnyTLS 端口: " NEW_PORT; [ -n "$NEW_PORT" ] && PORT_ANYTLS=$NEW_PORT ;;
+        3) read -p "新 Hy2 主监听端口: " NEW_PORT; [ -n "$NEW_PORT" ] && PORT_HY2=$NEW_PORT
+           read -p "新 Hy2 跳跃端口段 (清空填none): " NEW_RANGE
+           if [ "$NEW_RANGE" == "none" ]; then PORT_HY2_RANGE=""; elif [ -n "$NEW_RANGE" ]; then PORT_HY2_RANGE=$(echo "$NEW_RANGE" | tr '-' ':'); fi ;;
+        4) read -p "新 TUIC 端口: " NEW_PORT; [ -n "$NEW_PORT" ] && PORT_TUIC=$NEW_PORT ;;
+        5) read -p "新 Padding: " NEW_PAD; [ -n "$NEW_PAD" ] && PADDING_SCHEME_JSON=$NEW_PAD ;;
         0) start_menu; return ;;
-        *) echo -e "${RED}选择无效！${PLAIN}"; sleep 1; modify_parameters; return ;;
+        *) echo -e "${RED}无效！${PLAIN}"; sleep 1; modify_parameters; return ;;
     esac
 
     systemctl stop sing-box
     save_config
     generate_config_json
     configure_systemd
-    echo -e "${GREEN}修改成功！参数已生效。${PLAIN}"
-    sleep 1
-    show_links
+    echo -e "${GREEN}修改成功！${PLAIN}"; sleep 1; show_links
 }
 
-# 链接展示
 show_links() {
     if [ ! -f "$CONF_FILE" ]; then echo "未找到配置！"; sleep 1; return; fi
     source "$CONF_FILE"
@@ -330,7 +405,6 @@ show_links() {
     start_menu
 }
 
-# 彻底卸载
 uninstall_singbox() {
     clear
     echo -e "${RED}警告: 即将清除所有核心、配置、证书及状态！${PLAIN}"
@@ -350,7 +424,6 @@ uninstall_singbox() {
     fi
 }
 
-# ================= 主菜单控制流 =================
 start_menu() {
     clear
     echo -e "${CYAN}==========================================${PLAIN}"
@@ -360,41 +433,44 @@ start_menu() {
     BBR_TXT=$(check_bbr_status)
     if [ -f "$CONF_FILE" ]; then
         echo -e "系统状态: ${GREEN}已安装${PLAIN}   |   BBR加速状态: ${BBR_TXT}"
-        echo -e "${GREEN}1.${PLAIN} ${CYAN}一键无损更新 Sing-box 核心 (直接静默升级，绝不动配置)${PLAIN}"
+        echo -e "${GREEN}1.${PLAIN} ${CYAN}一键无损更新 Sing-box 核心${PLAIN}"
         echo -e "${GREEN}2.${PLAIN} 动态修改端口或配置参数"
-        echo -e "${GREEN}3.${PLAIN} 查看当前节点分享链接"
-        echo -e "${GREEN}4.${PLAIN} 强制彻底覆盖并全新安装"
+        echo -e "${GREEN}3.${PLAIN} ${YELLOW}独立申请或修复安全证书 (防闪退神器)${PLAIN}"
+        echo -e "${GREEN}4.${PLAIN} 查看当前节点分享链接"
+        echo -e "${GREEN}5.${PLAIN} 强制彻底覆盖并全新安装"
+        echo -e "${GREEN}6.${PLAIN} 一键开启 BBR 网络加速机制"
+        echo -e "${GREEN}7.${PLAIN} 彻底卸载 Sing-box"
     else
         echo -e "系统状态: ${YELLOW}未安装${PLAIN}   |   BBR加速状态: ${BBR_TXT}"
         echo -e "${GREEN}1.${PLAIN} 全新安装 Sing-box (多协议防封锁版)"
+        echo -e "${GREEN}6.${PLAIN} 一键开启 BBR 网络加速机制"
+        echo -e "${GREEN}7.${PLAIN} 彻底卸载 Sing-box"
     fi
-    echo -e "${GREEN}5.${PLAIN} ${YELLOW}一键开启 BBR 网络加速机制${PLAIN}"
-    echo -e "${GREEN}6.${PLAIN} 彻底卸载 Sing-box"
     echo -e "${GREEN}0.${PLAIN} 退出脚本"
     echo -e "${CYAN}==========================================${PLAIN}"
-    read -p "请输入选项 [0-6]: " MENU_CHOICE
+    read -p "请输入选项: " MENU_CHOICE
     
     if [ -f "$CONF_FILE" ]; then
         case "$MENU_CHOICE" in
             1) silent_update_core ;;
             2) modify_parameters ;;
-            3) show_links ;;
-            4) fresh_install ;;
-            5) enable_bbr ;;
-            6) uninstall_singbox ;;
+            3) standalone_cert_manager ;;
+            4) show_links ;;
+            5) fresh_install ;;
+            6) enable_bbr ;;
+            7) uninstall_singbox ;;
             0) exit 0 ;;
             *) echo -e "${RED}选择无效！${PLAIN}"; sleep 1; start_menu ;;
         esac
     else
         case "$MENU_CHOICE" in
             1) fresh_install ;;
-            5) enable_bbr ;;
-            6) uninstall_singbox ;;
+            6) enable_bbr ;;
+            7) uninstall_singbox ;;
             0) exit 0 ;;
             *) echo -e "${RED}选择无效！${PLAIN}"; sleep 1; start_menu ;;
         esac
     fi
 }
 
-# 脚本入口
 start_menu
