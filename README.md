@@ -22,7 +22,7 @@ TUIC v5 (UDP): 54434
 
 Bash
 # 替换为你的真实 GitHub 仓库地址
-bash <(curl -Ls https://raw.githubusercontent.com/你的用户名/你的仓库名/main/install.sh)
+bash <(curl -Ls https://raw.githubusercontent.com/JBl9527/singbox-all/refs/heads/main/install.sh)
 安装过程选项说明
 在运行脚本时，系统会提示你选择证书模式：
 
