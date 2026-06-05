@@ -1,9 +1,9 @@
 #!/bin/bash
 
 # ==========================================
-# Sing-box 五协议终极版 (随机端口/纯净版)
+# Sing-box 五协议终极版 (动态分区面板)
 # 包含: VLESS-REALITY, AnyTLS, Any-Reality, Hy2, TUIC
-# 特性: 端口绝对随机防冲突 / 证书双模 / 动态修参
+# 特性: 一键脚本升级 / 随机端口 / 证书双模 / 分区菜单
 # ==========================================
 
 SCRIPT_URL="https://raw.githubusercontent.com/JBl9527/singbox-all/main/install.sh"
@@ -106,6 +106,18 @@ REALITY_SHORT_ID="${REALITY_SHORT_ID}"
 EOF
 }
 
+# ================= 脚本与核心更新模块 =================
+update_script() {
+    clear
+    echo -e "${YELLOW}正在从 GitHub 同步最新版 SBA 管理脚本...${PLAIN}"
+    install_sba_shortcut
+    echo -e "${GREEN}✔ SBA 脚本已成功更新至最新版！${PLAIN}"
+    echo -e "${CYAN}即将为您自动重载最新菜单...${PLAIN}"
+    sleep 2
+    sba
+    exit 0
+}
+
 silent_update_core() {
     clear
     echo -e "${YELLOW}正在检测并下载最新版 Sing-box 核心...${PLAIN}"
@@ -128,10 +140,11 @@ silent_update_core() {
     start_menu
 }
 
+# ================= 全新安装模块 =================
 fresh_install() {
     clear
     echo -e "${CYAN}==========================================${PLAIN}"
-    echo -e "${CYAN}        开始全新安装 Sing-box 服务        ${PLAIN}"
+    echo -e "${CYAN}        开始全新重装 Sing-box 服务        ${PLAIN}"
     echo -e "${CYAN}==========================================${PLAIN}"
 
     echo -e "\n${YELLOW}=== 1. 安全证书配置 ===${PLAIN}"
@@ -187,6 +200,7 @@ fresh_install() {
     chmod +x $SING_BOX_BIN
     rm -rf sing-box.tar.gz sing-box-${LATEST_VERSION}-linux-${DL_ARCH}
 
+    # ================= 证书生成逻辑 =================
     if [ "$CERT_CHOICE" == "1" ]; then
         echo -e "\n${GREEN}正在生成自签证书...${PLAIN}"
         openssl req -x509 -nodes -days 3650 -newkey rsa:2048 -keyout "$CERT_DIR/server.key" -out "$CERT_DIR/server.crt" -subj "/C=US/ST=State/L=City/O=Organization/CN=$DOMAIN"
@@ -378,9 +392,9 @@ modify_parameters() {
     echo -e "${CYAN}==========================================${PLAIN}"
     echo -e "${CYAN}        动态修改节点参数 (无损重载)         ${PLAIN}"
     echo -e "${CYAN}==========================================${PLAIN}"
-    echo -e "1. 修改 VLESS-REALITY 端口 (当前: $PORT_REALITY)"
-    echo -e "2. 修改 标准 AnyTLS 端口 (当前: $PORT_ANYTLS)"
-    echo -e "3. 修改 究极 Any-Reality 端口 (当前: $PORT_ANYREALITY)"
+    echo -e "1. 修改 REALITY 端口 (当前: $PORT_REALITY)"
+    echo -e "2. 修改 AnyTLS 端口 (当前: $PORT_ANYTLS)"
+    echo -e "3. 修改 Any-Reality 端口 (当前: $PORT_ANYREALITY)"
     echo -e "4. 修改 Hysteria2 端口 (当前: $PORT_HY2)"
     echo -e "5. 修改 TUIC v5 端口 (当前: $PORT_TUIC)"
     echo -e "6. 修改 AnyTLS/Any-Reality Padding Scheme"
@@ -420,26 +434,19 @@ show_links() {
     if [ -n "$PORT_HY2_RANGE" ]; then HY2_PORT_DISPLAY=${PORT_HY2_RANGE/-/:}; fi
     HY2_LINK="hy2://${PASS_HY2}@${PUBLIC_IP}:${HY2_PORT_DISPLAY}?insecure=${INSECURE_FLAG}&sni=${DOMAIN}#SingBox-Hy2"
     TUIC_LINK="tuic://${UUID_TUIC}:${PASS_TUIC}@${PUBLIC_IP}:${PORT_TUIC}?sni=${DOMAIN}&alpn=h3&allow_insecure=${INSECURE_FLAG}#SingBox-TUIC"
+    ANYTLS_LINK="anytls://${PASS_ANYTLS}@${PUBLIC_IP}:${PORT_ANYTLS}?security=tls&sni=${DOMAIN}&fp=chrome&alpn=http%2F1.1&insecure=${INSECURE_FLAG}&allowInsecure=${INSECURE_FLAG}&type=tcp&headerType=none#SingBox-AnyTLS"
+    ANYREALITY_LINK="anytls://${PASS_ANYREALITY}@${PUBLIC_IP}:${PORT_ANYREALITY}?security=reality&sni=www.microsoft.com&fp=chrome&pbk=${REALITY_PUBLIC}&sid=${REALITY_SHORT_ID}&type=tcp&headerType=none#SingBox-AnyReality"
 
     clear
     echo -e "${CYAN}===========================================${PLAIN}"
     echo -e "${YELLOW}↓↓↓ 您的最新节点连接代码 ↓↓↓${PLAIN}\n"
     
     echo -e "${GREEN}[1] VLESS + REALITY (常规抗封锁):${PLAIN}\n${VLESS_LINK}\n"
-    echo -e "${GREEN}[2] Hysteria2 (含UDP端口跳跃):${PLAIN}\n${HY2_LINK}\n"
-    echo -e "${GREEN}[3] TUIC v5 (高丢包保活):${PLAIN}\n${TUIC_LINK}\n"
+    echo -e "${GREEN}[2] 标准 AnyTLS (需真实域名):${PLAIN}\n${ANYTLS_LINK}\n"
+    echo -e "${GREEN}[3] 究极 Any-Reality (免证书强混淆):${PLAIN}\n${ANYREALITY_LINK}\n"
+    echo -e "${GREEN}[4] Hysteria2 (含UDP端口跳跃):${PLAIN}\n${HY2_LINK}\n"
+    echo -e "${GREEN}[5] TUIC v5 (高丢包保活):${PLAIN}\n${TUIC_LINK}\n"
     
-    echo -e "${YELLOW}-------------------------------------------${PLAIN}"
-    echo -e "${CYAN}⚠️ 下方为 Sing-box 高阶私有协议，需在客户端手动配置或自定义导入：${PLAIN}"
-    echo -e "${YELLOW}-------------------------------------------${PLAIN}"
-    echo -e "${GREEN}[4] 标准 AnyTLS (最强Padding混淆，需真实域名):${PLAIN}"
-    echo -e "IP: ${PUBLIC_IP}  |  端口: ${PORT_ANYTLS}  |  密码: ${PASS_ANYTLS}"
-    echo -e "SNI: ${DOMAIN}  |  跳过证书验证: ${INSECURE_FLAG}\n"
-    
-    echo -e "${GREEN}[5] 究极 Any-Reality (最强混淆 + 免证书):${PLAIN}"
-    echo -e "IP: ${PUBLIC_IP}  |  端口: ${PORT_ANYREALITY}  |  密码: ${PASS_ANYREALITY}"
-    echo -e "SNI: www.microsoft.com  |  公钥: ${REALITY_PUBLIC}"
-    echo -e "Short ID: ${REALITY_SHORT_ID}"
     echo -e "${CYAN}===========================================${PLAIN}"
     read -n 1 -s -r -p "按任意键返回主菜单..."
     start_menu
@@ -468,26 +475,30 @@ uninstall_singbox() {
 start_menu() {
     clear
     echo -e "${CYAN}==========================================${PLAIN}"
-    echo -e "${CYAN}     Sing-box 极简纯净版管理脚本 (SBA)    ${PLAIN}"
+    echo -e "${CYAN}     Sing-box 五协议终极版管理脚本 (SBA)  ${PLAIN}"
     echo -e "${CYAN}==========================================${PLAIN}"
     
     BBR_TXT=$(check_bbr_status)
     if [ -f "$CONF_FILE" ]; then
         echo -e "系统状态: ${GREEN}已安装${PLAIN}   |   BBR加速状态: ${BBR_TXT}"
         echo -e "------------------------------------------"
-        echo -e "${GREEN}1.${PLAIN} ${CYAN}一键无损更新 Sing-box 核心${PLAIN}"
-        echo -e "${GREEN}2.${PLAIN} 动态修改端口或高级参数"
-        echo -e "${GREEN}3.${PLAIN} ${YELLOW}独立申请或修复安全证书${PLAIN}"
-        echo -e "${GREEN}4.${PLAIN} 查看节点分享链接/手动配置参数"
-        echo -e "${GREEN}5.${PLAIN} 强制彻底覆盖并全新安装"
-        echo -e "${GREEN}6.${PLAIN} 一键开启 BBR 网络加速机制"
-        echo -e "${GREEN}7.${PLAIN} 彻底卸载 Sing-box"
+        echo -e "${YELLOW}[ 更新与重装 ]${PLAIN}"
+        echo -e "${GREEN}1.${PLAIN} 一键升级 SBA 管理脚本 (同步 GitHub 最新代码)"
+        echo -e "${GREEN}2.${PLAIN} 一键无损更新 Sing-box 核心 (保留配置)"
+        echo -e "${GREEN}3.${PLAIN} 强制彻底重装 Sing-box (清空并重新配置)"
+        echo -e "------------------------------------------"
+        echo -e "${YELLOW}[ 配置与管理 ]${PLAIN}"
+        echo -e "${GREEN}4.${PLAIN} 动态修改端口或高级参数"
+        echo -e "${GREEN}5.${PLAIN} 独立申请或修复安全证书"
+        echo -e "${GREEN}6.${PLAIN} 查看所有节点一键分享链接"
+        echo -e "${GREEN}7.${PLAIN} 一键开启 BBR 网络加速机制"
+        echo -e "${GREEN}8.${PLAIN} 彻底卸载 Sing-box"
     else
         echo -e "系统状态: ${YELLOW}未安装${PLAIN}   |   BBR加速状态: ${BBR_TXT}"
         echo -e "------------------------------------------"
-        echo -e "${GREEN}1.${PLAIN} 全新安装 Sing-box"
-        echo -e "${GREEN}6.${PLAIN} 一键开启 BBR 网络加速机制"
-        echo -e "${GREEN}7.${PLAIN} 彻底卸载 Sing-box"
+        echo -e "${GREEN}3.${PLAIN} 全新安装 Sing-box"
+        echo -e "${GREEN}7.${PLAIN} 一键开启 BBR 网络加速机制"
+        echo -e "${GREEN}8.${PLAIN} 彻底卸载 Sing-box"
     fi
     echo -e "${GREEN}0.${PLAIN} 退出脚本"
     echo -e "${CYAN}==========================================${PLAIN}"
@@ -495,21 +506,22 @@ start_menu() {
     
     if [ -f "$CONF_FILE" ]; then
         case "$MENU_CHOICE" in
-            1) silent_update_core ;;
-            2) modify_parameters ;;
-            3) standalone_cert_manager ;;
-            4) show_links ;;
-            5) fresh_install ;;
-            6) enable_bbr ;;
-            7) uninstall_singbox ;;
+            1) update_script ;;
+            2) silent_update_core ;;
+            3) fresh_install ;;
+            4) modify_parameters ;;
+            5) standalone_cert_manager ;;
+            6) show_links ;;
+            7) enable_bbr ;;
+            8) uninstall_singbox ;;
             0) exit 0 ;;
             *) echo -e "${RED}选择无效！${PLAIN}"; sleep 1; start_menu ;;
         esac
     else
         case "$MENU_CHOICE" in
-            1) fresh_install ;;
-            6) enable_bbr ;;
-            7) uninstall_singbox ;;
+            3) fresh_install ;;
+            7) enable_bbr ;;
+            8) uninstall_singbox ;;
             0) exit 0 ;;
             *) echo -e "${RED}选择无效！${PLAIN}"; sleep 1; start_menu ;;
         esac
