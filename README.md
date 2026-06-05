@@ -20,9 +20,9 @@ TUIC v5 (UDP): 54434
 📦 快速安装
 将本仓库的 install.sh 脚本在你的 VPS 上运行：
 
-
+```bash
 bash <(curl -Ls https://raw.githubusercontent.com/JBl9527/singbox-all/main/install.sh)
-
+```
 
 
 
