@@ -1,8 +1,9 @@
 #!/bin/bash
 
 # ==========================================
-# Sing-box 终极多协议管理脚本 (ACME 缓存除根版)
-# 特性: 暴力清除ACME缓存 / 独立证书申请 / CF双模 / BBR
+# Sing-box 纯净防封锁管理脚本 (Any-Reality专供版)
+# 包含: VLESS-REALITY, 标准AnyTLS, Any-Reality
+# 特性: 证书双模申请 / 动态修参 / 纯粹轻量无冗余
 # ==========================================
 
 SCRIPT_URL="https://raw.githubusercontent.com/JBl9527/singbox-all/main/install.sh"
@@ -18,19 +19,16 @@ CERT_DIR="${CONFIG_DIR}/cert"
 CONF_FILE="${CONFIG_DIR}/sba.conf"
 SING_BOX_BIN="/usr/local/bin/sing-box"
 
-# 检查 Root 权限
 if [[ $EUID -ne 0 ]]; then
     echo -e "${RED}错误: 必须使用 root 用户运行此脚本！${PLAIN}"
     exit 1
 fi
 
-# 获取公网 IP
 get_public_ip() {
     PUBLIC_IP=$(curl -s4 ifconfig.me || curl -s4 ipv4.icanhazip.com || curl -s4 api.ipify.org)
     if [ -z "$PUBLIC_IP" ]; then PUBLIC_IP="你的VPS_IP"; fi
 }
 
-# 检测 BBR 状态
 check_bbr_status() {
     if sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q "bbr"; then
         echo -e "${GREEN}已开启${PLAIN}"
@@ -39,7 +37,6 @@ check_bbr_status() {
     fi
 }
 
-# 一键开启 BBR 加速
 enable_bbr() {
     clear
     echo -e "${YELLOW}正在检测当前系统 BBR 状态...${PLAIN}"
@@ -55,14 +52,13 @@ enable_bbr() {
         if sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q "bbr"; then
             echo -e "${GREEN}✔ BBR 加速开启成功！${PLAIN}"
         else
-            echo -e "${RED}❌ BBR 开启失败！部分 OpenVZ 架构不支持修改内核参数。${PLAIN}"
+            echo -e "${RED}❌ BBR 开启失败！部分虚拟化架构不支持修改内核参数。${PLAIN}"
         fi
     fi
     sleep 2
     start_menu
 }
 
-# 保存配置
 save_config() {
     cat > "$CONF_FILE" <<EOF
 CERT_CHOICE="${CERT_CHOICE}"
@@ -72,22 +68,17 @@ CF_EMAIL="${CF_EMAIL}"
 CF_KEY="${CF_KEY}"
 PORT_REALITY="${PORT_REALITY}"
 PORT_ANYTLS="${PORT_ANYTLS}"
-PORT_HY2="${PORT_HY2}"
-PORT_HY2_RANGE="${PORT_HY2_RANGE}"
-PORT_TUIC="${PORT_TUIC}"
+PORT_ANYREALITY="${PORT_ANYREALITY}"
 PADDING_SCHEME_JSON='${PADDING_SCHEME_JSON}'
 UUID_REALITY="${UUID_REALITY}"
 PASS_ANYTLS="${PASS_ANYTLS}"
-PASS_HY2="${PASS_HY2}"
-UUID_TUIC="${UUID_TUIC}"
-PASS_TUIC="${PASS_TUIC}"
+PASS_ANYREALITY="${PASS_ANYREALITY}"
 REALITY_PRIVATE="${REALITY_PRIVATE}"
 REALITY_PUBLIC="${REALITY_PUBLIC}"
 REALITY_SHORT_ID="${REALITY_SHORT_ID}"
 EOF
 }
 
-# 静默更新核心
 silent_update_core() {
     clear
     echo -e "${YELLOW}正在检测并下载最新版 Sing-box 核心...${PLAIN}"
@@ -111,7 +102,6 @@ silent_update_core() {
     start_menu
 }
 
-# 全新安装
 fresh_install() {
     clear
     echo -e "${CYAN}==========================================${PLAIN}"
@@ -136,16 +126,12 @@ fresh_install() {
     fi
 
     echo -e "\n${YELLOW}=== 2. 协议端口设置 ===${PLAIN}"
-    read -p "请输入 REALITY 端口 [默认 34433]: " PORT_REALITY
+    read -p "请输入 VLESS-REALITY 端口 [默认 34433]: " PORT_REALITY
     PORT_REALITY=${PORT_REALITY:-34433}
-    read -p "请输入 AnyTLS 端口 [默认 44433]: " PORT_ANYTLS
+    read -p "请输入 标准 AnyTLS 端口 [默认 44433]: " PORT_ANYTLS
     PORT_ANYTLS=${PORT_ANYTLS:-44433}
-    read -p "请输入 Hysteria2 主监听端口 [默认 54433]: " PORT_HY2
-    PORT_HY2=${PORT_HY2:-54433}
-    read -p "请输入 Hy2 跳跃端口段 (直接回车不跳跃): " PORT_HY2_RANGE
-    PORT_HY2_RANGE=$(echo "$PORT_HY2_RANGE" | tr '-' ':')
-    read -p "请输入 TUIC 端口 [默认 54434]: " PORT_TUIC
-    PORT_TUIC=${PORT_TUIC:-54434}
+    read -p "请输入 究极 Any-Reality 端口 [默认 54433]: " PORT_ANYREALITY
+    PORT_ANYREALITY=${PORT_ANYREALITY:-54433}
 
     echo -e "\n${YELLOW}=== 3. AnyTLS Padding 设置 ===${PLAIN}"
     read -p "请输入自定义 padding-scheme (直接回车使用内置最强配置): " CUSTOM_PADDING
@@ -166,21 +152,20 @@ fresh_install() {
     chmod +x $SING_BOX_BIN
     rm -rf sing-box.tar.gz sing-box-${LATEST_VERSION}-linux-${DL_ARCH}
 
-    # ================= 彻底修复 ACME 核心痛点 =================
+    # ================= 证书生成逻辑 =================
     if [ "$CERT_CHOICE" == "1" ]; then
+        echo -e "\n${GREEN}正在生成自签证书...${PLAIN}"
         openssl req -x509 -nodes -days 3650 -newkey rsa:2048 -keyout "$CERT_DIR/server.key" -out "$CERT_DIR/server.crt" -subj "/C=US/ST=State/L=City/O=Organization/CN=$DOMAIN"
     elif [ "$CERT_CHOICE" == "2" ]; then
         echo -e "\n${GREEN}正在清理旧缓存并使用 Standalone 申请证书...${PLAIN}"
-        rm -rf ~/.acme.sh # 暴力清除旧的 example.com 缓存
-        # 直接在安装时注入合法邮箱骗过 Let's Encrypt
+        rm -rf ~/.acme.sh 
         curl -s https://get.acme.sh | sh -s email="sba_cert_${RANDOM}@gmail.com"
         ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt
         ~/.acme.sh/acme.sh --issue -d "$DOMAIN" --standalone -k ec-256 --force
         ~/.acme.sh/acme.sh --installcert -d "$DOMAIN" --ecc --fullchain-file "$CERT_DIR/server.crt" --key-file "$CERT_DIR/server.key"
     elif [ "$CERT_CHOICE" == "3" ]; then
-        echo -e "\n${GREEN}正在清理旧缓存并使用 Cloudflare DNS 申请证书...${PLAIN}"
-        rm -rf ~/.acme.sh # 暴力清除旧的 example.com 缓存
-        # 直接在安装时注入合法邮箱骗过 Let's Encrypt
+        echo -e "\n${GREEN}正在清理旧缓存并使用 Cloudflare DNS API 申请证书...${PLAIN}"
+        rm -rf ~/.acme.sh 
         curl -s https://get.acme.sh | sh -s email="sba_cert_${RANDOM}@gmail.com"
         ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt
         export CF_Key="$CF_KEY"
@@ -189,8 +174,11 @@ fresh_install() {
         ~/.acme.sh/acme.sh --installcert -d "$DOMAIN" --ecc --fullchain-file "$CERT_DIR/server.crt" --key-file "$CERT_DIR/server.key"
     fi
 
-    UUID_REALITY=$(uuidgen); PASS_ANYTLS=$(openssl rand -base64 12)
-    PASS_HY2=$(openssl rand -base64 12); UUID_TUIC=$(uuidgen); PASS_TUIC=$(openssl rand -base64 12)
+    # 凭证独立生成
+    UUID_REALITY=$(uuidgen)
+    PASS_ANYTLS=$(openssl rand -base64 12)
+    PASS_ANYREALITY=$(openssl rand -base64 12)
+    
     REALITY_KEYPAIR=$($SING_BOX_BIN generate reality-keypair)
     REALITY_PRIVATE=$(echo "$REALITY_KEYPAIR" | grep PrivateKey | awk '{print $2}')
     REALITY_PUBLIC=$(echo "$REALITY_KEYPAIR" | grep PublicKey | awk '{print $2}')
@@ -203,7 +191,6 @@ fresh_install() {
     show_links
 }
 
-# 独立证书修复模块
 standalone_cert_manager() {
     clear
     if [ ! -f "$CONF_FILE" ]; then
@@ -240,26 +227,24 @@ standalone_cert_manager() {
         echo -e "${RED}输入无效！${PLAIN}"; sleep 1; standalone_cert_manager; return
     fi
 
-    # 保存新的证书偏好并强行停掉占用端口的服务
     save_config
     mkdir -p "$CERT_DIR"
     systemctl stop sing-box > /dev/null 2>&1
 
-    # ================= 彻底修复 ACME 核心痛点 =================
     if [ "$CERT_CHOICE" == "1" ]; then
         echo -e "\n${GREEN}正在生成自签证书...${PLAIN}"
         openssl req -x509 -nodes -days 3650 -newkey rsa:2048 -keyout "$CERT_DIR/server.key" -out "$CERT_DIR/server.crt" -subj "/C=US/ST=State/L=City/O=Organization/CN=$DOMAIN"
         echo -e "${GREEN}✔ 自签证书生成成功！${PLAIN}"
     elif [ "$CERT_CHOICE" == "2" ]; then
         echo -e "\n${GREEN}正在清理旧缓存并使用 Standalone 申请证书...${PLAIN}"
-        rm -rf ~/.acme.sh # 暴力清除缓存
+        rm -rf ~/.acme.sh
         curl -s https://get.acme.sh | sh -s email="sba_cert_${RANDOM}@gmail.com"
         ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt
         ~/.acme.sh/acme.sh --issue -d "$DOMAIN" --standalone -k ec-256 --force
         ~/.acme.sh/acme.sh --installcert -d "$DOMAIN" --ecc --fullchain-file "$CERT_DIR/server.crt" --key-file "$CERT_DIR/server.key"
     elif [ "$CERT_CHOICE" == "3" ]; then
         echo -e "\n${GREEN}正在清理旧缓存并使用 Cloudflare DNS API 申请证书...${PLAIN}"
-        rm -rf ~/.acme.sh # 暴力清除缓存
+        rm -rf ~/.acme.sh
         curl -s https://get.acme.sh | sh -s email="sba_cert_${RANDOM}@gmail.com"
         ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt
         export CF_Key="$CF_KEY"
@@ -297,14 +282,19 @@ generate_config_json() {
       "tls": { "enabled": true, "certificate_path": "$CERT_DIR/server.crt", "key_path": "$CERT_DIR/server.key" }
     },
     {
-      "type": "hysteria2", "tag": "hy2-in", "listen": "::", "listen_port": $PORT_HY2,
-      "users": [ { "password": "$PASS_HY2" } ],
-      "tls": { "enabled": true, "alpn": ["h3"], "certificate_path": "$CERT_DIR/server.crt", "key_path": "$CERT_DIR/server.key" }
-    },
-    {
-      "type": "tuic", "tag": "tuic-in", "listen": "::", "listen_port": $PORT_TUIC,
-      "users": [ { "uuid": "$UUID_TUIC", "password": "$PASS_TUIC" } ],
-      "tls": { "enabled": true, "alpn": ["h3", "spdy/3.1"], "certificate_path": "$CERT_DIR/server.crt", "key_path": "$CERT_DIR/server.key" }
+      "type": "anytls", "tag": "any-reality-in", "listen": "::", "listen_port": $PORT_ANYREALITY,
+      "users": [ { "password": "$PASS_ANYREALITY" } ],
+      "padding_scheme": [ $PADDING_SCHEME_JSON ],
+      "tls": { 
+          "enabled": true, 
+          "server_name": "www.microsoft.com", 
+          "reality": { 
+              "enabled": true, 
+              "handshake": { "server": "www.microsoft.com", "server_port": 443 }, 
+              "private_key": "$REALITY_PRIVATE", 
+              "short_id": ["$REALITY_SHORT_ID"] 
+          } 
+      }
     }
   ],
   "outbounds": [ { "type": "direct", "tag": "direct" }, { "type": "block", "tag": "block" } ]
@@ -313,12 +303,6 @@ EOF
 }
 
 configure_systemd() {
-    IPTABLES_START=""; IPTABLES_STOP=""
-    if [ -n "$PORT_HY2_RANGE" ]; then
-        IPTABLES_START="ExecStartPost=-/sbin/iptables -t nat -A PREROUTING -p udp --dport $PORT_HY2_RANGE -j REDIRECT --to-ports $PORT_HY2\nExecStartPost=-/sbin/ip6tables -t nat -A PREROUTING -p udp --dport $PORT_HY2_RANGE -j REDIRECT --to-ports $PORT_HY2"
-        IPTABLES_STOP="ExecStopPost=-/sbin/iptables -t nat -D PREROUTING -p udp --dport $PORT_HY2_RANGE -j REDIRECT --to-ports $PORT_HY2\nExecStopPost=-/sbin/ip6tables -t nat -D PREROUTING -p udp --dport $PORT_HY2_RANGE -j REDIRECT --to-ports $PORT_HY2"
-    fi
-
     cat > /etc/systemd/system/sing-box.service <<EOF
 [Unit]
 Description=Sing-box Service
@@ -328,8 +312,6 @@ After=network.target nss-lookup.target
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 ExecStart=$SING_BOX_BIN run -c $CONFIG_DIR/config.json
-${IPTABLES_START}
-${IPTABLES_STOP}
 Restart=on-failure
 RestartSec=10s
 LimitNOFILE=infinity
@@ -359,22 +341,18 @@ modify_parameters() {
     echo -e "${CYAN}==========================================${PLAIN}"
     echo -e "${CYAN}        动态修改节点参数 (无损重载)         ${PLAIN}"
     echo -e "${CYAN}==========================================${PLAIN}"
-    echo -e "1. 修改 REALITY 端口 (当前: $PORT_REALITY)"
-    echo -e "2. 修改 AnyTLS 端口 (当前: $PORT_ANYTLS)"
-    echo -e "3. 修改 Hysteria2 端口及跳跃"
-    echo -e "4. 修改 TUIC 端口 (当前: $PORT_TUIC)"
-    echo -e "5. 修改 AnyTLS Padding"
+    echo -e "1. 修改 VLESS-REALITY 端口 (当前: $PORT_REALITY)"
+    echo -e "2. 修改 标准 AnyTLS 端口 (当前: $PORT_ANYTLS)"
+    echo -e "3. 修改 究极 Any-Reality 端口 (当前: $PORT_ANYREALITY)"
+    echo -e "4. 修改 AnyTLS/Any-Reality Padding Scheme"
     echo -e "0. 返回主菜单"
-    read -p "请选择 [0-5]: " MOD_CHOICE
+    read -p "请选择 [0-4]: " MOD_CHOICE
 
     case "$MOD_CHOICE" in
-        1) read -p "新 REALITY 端口: " NEW_PORT; [ -n "$NEW_PORT" ] && PORT_REALITY=$NEW_PORT ;;
+        1) read -p "新 VLESS-REALITY 端口: " NEW_PORT; [ -n "$NEW_PORT" ] && PORT_REALITY=$NEW_PORT ;;
         2) read -p "新 AnyTLS 端口: " NEW_PORT; [ -n "$NEW_PORT" ] && PORT_ANYTLS=$NEW_PORT ;;
-        3) read -p "新 Hy2 主监听端口: " NEW_PORT; [ -n "$NEW_PORT" ] && PORT_HY2=$NEW_PORT
-           read -p "新 Hy2 跳跃端口段 (清空填none): " NEW_RANGE
-           if [ "$NEW_RANGE" == "none" ]; then PORT_HY2_RANGE=""; elif [ -n "$NEW_RANGE" ]; then PORT_HY2_RANGE=$(echo "$NEW_RANGE" | tr '-' ':'); fi ;;
-        4) read -p "新 TUIC 端口: " NEW_PORT; [ -n "$NEW_PORT" ] && PORT_TUIC=$NEW_PORT ;;
-        5) read -p "新 Padding: " NEW_PAD; [ -n "$NEW_PAD" ] && PADDING_SCHEME_JSON=$NEW_PAD ;;
+        3) read -p "新 Any-Reality 端口: " NEW_PORT; [ -n "$NEW_PORT" ] && PORT_ANYREALITY=$NEW_PORT ;;
+        4) read -p "新 Padding: " NEW_PAD; [ -n "$NEW_PAD" ] && PADDING_SCHEME_JSON=$NEW_PAD ;;
         0) start_menu; return ;;
         *) echo -e "${RED}无效！${PLAIN}"; sleep 1; modify_parameters; return ;;
     esac
@@ -383,7 +361,7 @@ modify_parameters() {
     save_config
     generate_config_json
     configure_systemd
-    echo -e "${GREEN}修改成功！${PLAIN}"; sleep 1; show_links
+    echo -e "${GREEN}修改成功！参数已生效。${PLAIN}"; sleep 1; show_links
 }
 
 show_links() {
@@ -395,19 +373,16 @@ show_links() {
     if [ "$CERT_CHOICE" == "1" ]; then INSECURE_FLAG="1"; fi
 
     VLESS_LINK="vless://${UUID_REALITY}@${PUBLIC_IP}:${PORT_REALITY}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.microsoft.com&fp=chrome&pbk=${REALITY_PUBLIC}&sid=${REALITY_SHORT_ID}&type=tcp&headerType=none#SingBox-REALITY"
-    HY2_PORT_DISPLAY=${PORT_HY2}
-    if [ -n "$PORT_HY2_RANGE" ]; then HY2_PORT_DISPLAY=${PORT_HY2_RANGE/-/:}; fi
-    HY2_LINK="hy2://${PASS_HY2}@${PUBLIC_IP}:${HY2_PORT_DISPLAY}?insecure=${INSECURE_FLAG}&sni=${DOMAIN}#SingBox-Hy2"
-    TUIC_LINK="tuic://${UUID_TUIC}:${PASS_TUIC}@${PUBLIC_IP}:${PORT_TUIC}?sni=${DOMAIN}&alpn=h3&allow_insecure=${INSECURE_FLAG}#SingBox-TUIC"
     ANYTLS_LINK="anytls://${PASS_ANYTLS}@${PUBLIC_IP}:${PORT_ANYTLS}?security=tls&sni=${DOMAIN}&fp=chrome&alpn=http%2F1.1&insecure=${INSECURE_FLAG}&allowInsecure=${INSECURE_FLAG}&type=tcp&headerType=none#SingBox-AnyTLS"
+    ANYREALITY_LINK="anytls://${PASS_ANYREALITY}@${PUBLIC_IP}:${PORT_ANYREALITY}?security=reality&sni=www.microsoft.com&fp=chrome&pbk=${REALITY_PUBLIC}&sid=${REALITY_SHORT_ID}&type=tcp&headerType=none#SingBox-AnyReality"
 
     clear
     echo -e "${CYAN}===========================================${PLAIN}"
     echo -e "${YELLOW}↓↓↓ 您的最新节点连接代码 ↓↓↓${PLAIN}\n"
-    echo -e "${GREEN}[1] REALITY (VLESS + Vision):${PLAIN}\n${VLESS_LINK}\n"
-    echo -e "${GREEN}[2] AnyTLS:${PLAIN}\n${ANYTLS_LINK}\n"
-    echo -e "${GREEN}[3] Hysteria2:${PLAIN}\n${HY2_LINK}\n"
-    echo -e "${GREEN}[4] TUIC v5:${PLAIN}\n${TUIC_LINK}\n"
+    echo -e "${GREEN}[1] VLESS + REALITY (常规抗封锁):${PLAIN}\n${VLESS_LINK}\n"
+    echo -e "${GREEN}[2] 标准 AnyTLS (需真实域名/允许不安全):${PLAIN}\n${ANYTLS_LINK}\n"
+    echo -e "${GREEN}[3] 究极 Any-Reality (免证书强混淆):${PLAIN}\n${ANYREALITY_LINK}\n"
+    echo -e "${YELLOW}⚠️ 注意: Any-Reality 协议较为前沿，请确保您的本地客户端支持解析 anytls+reality 的配置组合 (如最新版 Sing-box 客户端、部分最新版 NekoBox/Mihomo)。${PLAIN}"
     echo -e "${CYAN}===========================================${PLAIN}"
     read -n 1 -s -r -p "按任意键返回主菜单..."
     start_menu
@@ -436,22 +411,23 @@ uninstall_singbox() {
 start_menu() {
     clear
     echo -e "${CYAN}==========================================${PLAIN}"
-    echo -e "${CYAN}      Sing-box 终极部署及管理脚本         ${PLAIN}"
+    echo -e "${CYAN}     Sing-box 极简纯净版管理脚本 (SBA)    ${PLAIN}"
     echo -e "${CYAN}==========================================${PLAIN}"
     
-    BBR_TXT=$(check_bbr_status)
     if [ -f "$CONF_FILE" ]; then
-        echo -e "系统状态: ${GREEN}已安装${PLAIN}   |   BBR加速状态: ${BBR_TXT}"
+        echo -e "系统状态: ${GREEN}已安装${PLAIN}"
+        echo -e "------------------------------------------"
         echo -e "${GREEN}1.${PLAIN} ${CYAN}一键无损更新 Sing-box 核心${PLAIN}"
-        echo -e "${GREEN}2.${PLAIN} 动态修改端口或配置参数"
-        echo -e "${GREEN}3.${PLAIN} ${YELLOW}独立申请或修复安全证书 (防闪退神器)${PLAIN}"
-        echo -e "${GREEN}4.${PLAIN} 查看当前节点分享链接"
+        echo -e "${GREEN}2.${PLAIN} 动态修改端口或高级参数"
+        echo -e "${GREEN}3.${PLAIN} ${YELLOW}独立申请或修复安全证书${PLAIN}"
+        echo -e "${GREEN}4.${PLAIN} 查看节点分享链接"
         echo -e "${GREEN}5.${PLAIN} 强制彻底覆盖并全新安装"
         echo -e "${GREEN}6.${PLAIN} 一键开启 BBR 网络加速机制"
         echo -e "${GREEN}7.${PLAIN} 彻底卸载 Sing-box"
     else
-        echo -e "系统状态: ${YELLOW}未安装${PLAIN}   |   BBR加速状态: ${BBR_TXT}"
-        echo -e "${GREEN}1.${PLAIN} 全新安装 Sing-box (多协议防封锁版)"
+        echo -e "系统状态: ${YELLOW}未安装${PLAIN}"
+        echo -e "------------------------------------------"
+        echo -e "${GREEN}1.${PLAIN} 全新安装 Sing-box"
         echo -e "${GREEN}6.${PLAIN} 一键开启 BBR 网络加速机制"
         echo -e "${GREEN}7.${PLAIN} 彻底卸载 Sing-box"
     fi
