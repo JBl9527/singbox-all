@@ -2,7 +2,7 @@
 
 # ==========================================
 # Sing-box 全能一键管理脚本 (含域名修改与扫码功能)
-# 适用系统: Debian / Ubuntu / CentOS 等主流 Linux
+# 适用系统: Debian / Ubuntu / CentOS 等主流 Linux VPS
 # ==========================================
 
 RED='\033[0;31m'
@@ -37,7 +37,7 @@ check_dependencies() {
 }
 
 # ==========================================
-# 核心功能区 (需要你填入你的具体安装逻辑)
+# 核心功能区 
 # ==========================================
 install_singbox() {
     clear
@@ -113,7 +113,6 @@ modify_camouflage_domain() {
     echo -e "${CYAN}          修改 Sing-box 伪装域名          ${PLAIN}"
     echo -e "${CYAN}==========================================${PLAIN}"
     
-    # Sing-box 的标准配置文件路径
     local CONFIG_FILE="/etc/sing-box/config.json" 
 
     if [ ! -f "$CONFIG_FILE" ]; then
@@ -123,7 +122,6 @@ modify_camouflage_domain() {
         return 1
     fi
 
-    # 解析现有的域名
     local CURRENT_DOMAIN=$(jq -r '.inbounds[0].tls.reality.server_names[0] // .inbounds[0].transport.host // "未找到"' "$CONFIG_FILE")
     
     echo -e "当前配置的伪装域名为: ${YELLOW}${CURRENT_DOMAIN}${PLAIN}"
@@ -139,7 +137,6 @@ modify_camouflage_domain() {
 
     local TMP_CONFIG=$(mktemp)
     
-    # 智能匹配 REALITY 或 WebSocket 协议结构并覆盖域名
     if jq -e '.inbounds[0].tls.reality' "$CONFIG_FILE" >/dev/null 2>&1; then
         jq ".inbounds[0].tls.reality.server_names = [\"$NEW_DOMAIN\"] | .inbounds[0].tls.key_pair.server_name = \"$NEW_DOMAIN\"" "$CONFIG_FILE" > "$TMP_CONFIG"
     elif jq -e '.inbounds[0].transport.host' "$CONFIG_FILE" >/dev/null 2>&1; then
@@ -155,8 +152,6 @@ modify_camouflage_domain() {
         echo -e "${YELLOW}⟳ 正在重启 Sing-box 服务以应用新配置...${PLAIN}"
         systemctl restart sing-box >/dev/null 2>&1
         echo -e "${GREEN}🎉 重启成功，新域名已生效！${PLAIN}"
-        
-        # 可选：如果你有存链接的文件，这里可以加上 sed 替换旧域名为新域名的逻辑
     else
         rm -f "$TMP_CONFIG"
         echo -e "${RED}❌ 写入配置失败，请检查文件权限或格式。${PLAIN}"
@@ -177,7 +172,6 @@ show_qr_code() {
     echo -e "${CYAN}==========================================${PLAIN}"
 
     local SHARE_LINK=""
-    # 假设你的安装脚本把链接放在了这个位置
     local LINK_FILE="/etc/sing-box/share_link.txt" 
     
     if [ -f "$LINK_FILE" ]; then
@@ -195,7 +189,6 @@ show_qr_code() {
     fi
 
     echo -e "\n${GREEN}请打开手机客户端扫描下方二维码：${PLAIN}\n"
-    # 调用 qrencode 在终端渲染高清二维码
     qrencode -t ANSIUTF8 "$SHARE_LINK"
     
     echo -e "\n${YELLOW}节点明文链接 (可手动复制)：${PLAIN}"
