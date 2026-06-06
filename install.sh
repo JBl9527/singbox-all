@@ -316,7 +316,6 @@ standalone_cert_manager() {
 }
 
 generate_config_json() {
-    # 如果没读到配置参数，则给出默认守护项
     local FINAL_DEST=${REALITY_DEST:-"www.microsoft.com"}
     cat > "$CONFIG_DIR/config.json" <<EOF
 {
@@ -397,13 +396,11 @@ EOF
     chmod +x /usr/bin/sba
 }
 
-# ================= 核心重构：多向联动参数修改模块 =================
 modify_parameters() {
     clear
     if [ ! -f "$CONF_FILE" ]; then echo -e "${RED}未检测到配置！${PLAIN}"; sleep 2; start_menu; return; fi
     source "$CONF_FILE"
 
-    # 兼容处理未保存旧版域名的场景
     [ -z "$REALITY_DEST" ] && REALITY_DEST="www.microsoft.com"
 
     echo -e "${CYAN}==========================================${PLAIN}"
@@ -445,16 +442,13 @@ modify_parameters() {
     echo -e "${GREEN}修改成功！参数已生效并已联动全套协议。${PLAIN}"; sleep 1; show_links
 }
 
-# ================= 核心重构：节点链接展示与高清晰二维码生成 =================
 show_links() {
     if [ ! -f "$CONF_FILE" ]; then echo "未找到配置！"; sleep 1; return; fi
     source "$CONF_FILE"
     check_deps_extra
     get_public_ip
 
-    # 兼容旧配置默认域名
     local FINAL_DEST=${REALITY_DEST:-"www.microsoft.com"}
-
     INSECURE_FLAG="0"
     if [ "$CERT_CHOICE" == "1" ]; then INSECURE_FLAG="1"; fi
 
