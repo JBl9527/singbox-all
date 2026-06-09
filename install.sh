@@ -2,8 +2,8 @@
 
 # ==========================================
 # Sing-box 五协议终极版 + Realm 动态转发整合版
-# 特性: 一键脚本升级 / 随机端口 / 证书双模 / 分区菜单 / 中转支持
-# 增强: Realm 端口转发 / 自动检测公网IP动态命名节点
+# 特性: 一键脚本升级 / 随机端口 / 证书双模 / 分区菜单 / 独立的转发模块
+# 增强: Realm 端口转发 / 自动检测公网IP动态命名节点 / 禁用强制云端覆盖
 # ==========================================
 
 SCRIPT_URL="https://raw.githubusercontent.com/JBl9527/sing-box-all/main/install.sh"
@@ -14,27 +14,27 @@ YELLOW='\033[0;33m'
 CYAN='\033[0;36m'
 PLAIN='\033[0m'
 
-# --- Sing-box 配置路径 ---
+# --- Sing-box 核心配置路径 ---
 CONFIG_DIR="/usr/local/etc/sing-box"
 CERT_DIR="${CONFIG_DIR}/cert"
 CONF_FILE="${CONFIG_DIR}/sba.conf"
 SING_BOX_BIN="/usr/local/bin/sing-box"
 
-# --- Realm 配置路径 ---
+# --- Realm 核心配置路径 ---
 REALM_DIR="/root/realm"
 REALM_BIN="${REALM_DIR}/realm"
 REALM_CONF_DIR="/root/.realm"
 REALM_CONF_FILE="${REALM_CONF_DIR}/config.toml"
 REALM_SERVICE_FILE="/etc/systemd/system/realm.service"
 
-PUBLIC_IP=""
+PUBLIC_IP="" 
 
 if [[ $EUID -ne 0 ]]; then
     echo -e "${RED}错误: 必须使用 root 用户运行此脚本！${PLAIN}"
     exit 1
 fi
 
-# ================= 公共函数 =================
+# ================= 公共基础函数 =================
 
 get_public_ip() {
     if [ -z "$PUBLIC_IP" ]; then
@@ -127,18 +127,27 @@ REALITY_PRIVATE="${REALITY_PRIVATE}"
 REALITY_PUBLIC="${REALITY_PUBLIC}"
 REALITY_SHORT_ID="${REALITY_SHORT_ID}"
 REALITY_DEST="${REALITY_DEST}"
-RELAY_IP="${RELAY_IP}"
 EOF
 }
 
+# 【修复一】禁用官方更新，防止覆盖丢失融合版脚本
 update_script() {
     clear
-    echo -e "${YELLOW}正在从 GitHub 同步最新版 SBA 管理脚本...${PLAIN}"
-    install_sba_shortcut
-    echo -e "${GREEN}✔ SBA 脚本已成功更新至最新版！${PLAIN}"
-    sleep 2
-    sba
-    exit 0
+    echo -e "${RED}⚠️ 注意：当前为您定制的 Sing-box + Realm 终极融合版！${PLAIN}"
+    echo -e "${YELLOW}为防止原作者的普通脚本覆盖掉您的“端口转发”菜单，已屏蔽此更新功能。${PLAIN}"
+    echo -e "${CYAN}如果需要更新代码，请手动替换本脚本。${PLAIN}"
+    sleep 3
+    start_menu
+}
+
+# 【修复二】快捷命令生成，直接复制本地脚本，不再从 Github 拉取原版
+install_sba_shortcut() {
+    if [ -f "$0" ] && [[ "$0" != *"bash"* ]] && [[ "$0" != *"sh"* ]]; then
+        cp -f "$0" /usr/bin/sba
+        chmod +x /usr/bin/sba
+    else
+        echo -e "${YELLOW}提示：建议将本脚本文件直接保存到 /usr/bin/sba 以实现快捷呼出。${PLAIN}"
+    fi
 }
 
 silent_update_core() {
@@ -212,14 +221,6 @@ fresh_install() {
         PADDING_SCHEME_JSON='"stop=8", "0=30-30", "1=100-400", "2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000", "3=9-9,500-1000", "4=500-1000", "5=500-1000", "6=500-1000", "7=500-1000"'
     else PADDING_SCHEME_JSON="$CUSTOM_PADDING"; fi
     
-    echo -e "\n${YELLOW}=== 5. 中转节点(Relay)配置 ===${PLAIN}"
-    read -p "是否使用国内/其他中转机接入本节点？(y/N): " USE_RELAY
-    if [[ "$USE_RELAY" =~ ^[Yy]$ ]]; then
-        read -p "请输入中转机的 IP 地址或域名: " RELAY_IP
-    else
-        RELAY_IP=""
-    fi
-
     echo -e "\n${GREEN}正在安装基础依赖组件...${PLAIN}\n"
     apt-get update -y > /dev/null 2>&1
     apt-get install -y curl wget jq openssl socat uuid-runtime cron iptables qrencode > /dev/null 2>&1
@@ -400,14 +401,6 @@ EOF
     systemctl restart sing-box
 }
 
-install_sba_shortcut() {
-    cat > /usr/bin/sba <<EOF
-#!/bin/bash
-bash <(curl -Ls $SCRIPT_URL)
-EOF
-    chmod +x /usr/bin/sba
-}
-
 modify_parameters() {
     clear
     if [ ! -f "$CONF_FILE" ]; then echo -e "${RED}未检测到配置！${PLAIN}"; sleep 2; start_menu; return; fi
@@ -425,9 +418,8 @@ modify_parameters() {
     echo -e "5. 修改 TUIC v5 端口 (当前: $PORT_TUIC)"
     echo -e "6. 修改 AnyTLS/Any-Reality Padding Scheme"
     echo -e "7. ${YELLOW}修改 REALITY 伪装域名 (当前: $REALITY_DEST)${PLAIN}"
-    echo -e "8. ${YELLOW}修改 中转 IP 地址 (当前: ${RELAY_IP:-未设置})${PLAIN}"
     echo -e "0. 返回主菜单"
-    read -p "请选择 [0-8]: " MOD_CHOICE
+    read -p "请选择 [0-7]: " MOD_CHOICE
 
     case "$MOD_CHOICE" in
         1) read -p "新 REALITY 端口: " NEW_PORT; [ -n "$NEW_PORT" ] && PORT_REALITY=$NEW_PORT ;;
@@ -439,7 +431,6 @@ modify_parameters() {
         5) read -p "新 TUIC 端口: " NEW_PORT; [ -n "$NEW_PORT" ] && PORT_TUIC=$NEW_PORT ;;
         6) read -p "新 Padding: " NEW_PAD; [ -n "$NEW_PAD" ] && PADDING_SCHEME_JSON=$NEW_PAD ;;
         7) read -p "请输入全新 REALITY 伪装域名 (如 apple.com): " NEW_DEST; [ -n "$NEW_DEST" ] && REALITY_DEST=$NEW_DEST ;;
-        8) read -p "请输入新的中转 IP (留空则清除): " NEW_RELAY; RELAY_IP=$NEW_RELAY ;;
         0) start_menu; return ;;
         *) echo -e "${RED}无效！${PLAIN}"; sleep 1; modify_parameters; return ;;
     esac
@@ -457,32 +448,25 @@ show_links() {
     check_deps_extra
     get_public_ip
 
-    if [ -n "$RELAY_IP" ]; then
-        DISPLAY_IP="$RELAY_IP"
-    else
-        DISPLAY_IP="$PUBLIC_IP"
-    fi
-
     local FINAL_DEST=${REALITY_DEST:-"www.microsoft.com"}
     INSECURE_FLAG="0"
     if [ "$CERT_CHOICE" == "1" ]; then INSECURE_FLAG="1"; fi
 
-    VLESS_LINK="vless://${UUID_REALITY}@${DISPLAY_IP}:${PORT_REALITY}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${FINAL_DEST}&fp=chrome&pbk=${REALITY_PUBLIC}&sid=${REALITY_SHORT_ID}&type=tcp&headerType=none#${DISPLAY_IP}-VLESS-REALITY"
+    VLESS_LINK="vless://${UUID_REALITY}@${PUBLIC_IP}:${PORT_REALITY}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${FINAL_DEST}&fp=chrome&pbk=${REALITY_PUBLIC}&sid=${REALITY_SHORT_ID}&type=tcp&headerType=none#${PUBLIC_IP}-VLESS-REALITY"
     
     HY2_PORT_DISPLAY=${PORT_HY2}
     if [ -n "$PORT_HY2_RANGE" ]; then HY2_PORT_DISPLAY=${PORT_HY2_RANGE/-/:}; fi
-    HY2_LINK="hy2://${PASS_HY2}@${DISPLAY_IP}:${HY2_PORT_DISPLAY}?insecure=${INSECURE_FLAG}&sni=${DOMAIN}#${DISPLAY_IP}-Hysteria2"
+    HY2_LINK="hy2://${PASS_HY2}@${PUBLIC_IP}:${HY2_PORT_DISPLAY}?insecure=${INSECURE_FLAG}&sni=${DOMAIN}#${PUBLIC_IP}-Hysteria2"
     
-    TUIC_LINK="tuic://${UUID_TUIC}:${PASS_TUIC}@${DISPLAY_IP}:${PORT_TUIC}?sni=${DOMAIN}&alpn=h3&allow_insecure=${INSECURE_FLAG}#${DISPLAY_IP}-TUIC"
+    TUIC_LINK="tuic://${UUID_TUIC}:${PASS_TUIC}@${PUBLIC_IP}:${PORT_TUIC}?sni=${DOMAIN}&alpn=h3&allow_insecure=${INSECURE_FLAG}#${PUBLIC_IP}-TUIC"
     
-    ANYTLS_LINK="anytls://${PASS_ANYTLS}@${DISPLAY_IP}:${PORT_ANYTLS}?security=tls&sni=${DOMAIN}&fp=chrome&alpn=http%2F1.1&insecure=${INSECURE_FLAG}&allowInsecure=${INSECURE_FLAG}&type=tcp&headerType=none#${DISPLAY_IP}-AnyTLS"
+    ANYTLS_LINK="anytls://${PASS_ANYTLS}@${PUBLIC_IP}:${PORT_ANYTLS}?security=tls&sni=${DOMAIN}&fp=chrome&alpn=http%2F1.1&insecure=${INSECURE_FLAG}&allowInsecure=${INSECURE_FLAG}&type=tcp&headerType=none#${PUBLIC_IP}-AnyTLS"
     
-    ANYREALITY_LINK="anytls://${PASS_ANYREALITY}@${DISPLAY_IP}:${PORT_ANYREALITY}?security=reality&sni=${FINAL_DEST}&fp=chrome&pbk=${REALITY_PUBLIC}&sid=${REALITY_SHORT_ID}&type=tcp&headerType=none#${DISPLAY_IP}-AnyReality"
+    ANYREALITY_LINK="anytls://${PASS_ANYREALITY}@${PUBLIC_IP}:${PORT_ANYREALITY}?security=reality&sni=${FINAL_DEST}&fp=chrome&pbk=${REALITY_PUBLIC}&sid=${REALITY_SHORT_ID}&type=tcp&headerType=none#${PUBLIC_IP}-AnyReality"
 
     clear
     echo -e "${CYAN}===========================================${PLAIN}"
     echo -e "${YELLOW}↓↓↓ 您的当前核心节点一键分享链接 ↓↓↓${PLAIN}\n"
-    if [ -n "$RELAY_IP" ]; then echo -e "${YELLOW}>>> 当前已开启中转模式，流量将通过: $RELAY_IP 转发 <<<${PLAIN}\n"; fi
     
     echo -e "${GREEN}[1] VLESS + REALITY:${PLAIN}\n${VLESS_LINK}\n"
     echo -e "${GREEN}[2] 标准 AnyTLS:${PLAIN}\n${ANYTLS_LINK}\n"
@@ -524,7 +508,7 @@ uninstall_singbox() {
 }
 
 
-# ================= Realm 端口转发模块 =================
+# ================= Realm 端口转发独立模块 =================
 
 get_realm_status() {
     if systemctl is-active --quiet realm; then echo -e "${GREEN}运行中${PLAIN}"; else echo -e "${RED}未运行${PLAIN}"; fi
@@ -584,7 +568,7 @@ realm_add_forward() {
     read -p "请输入目标落地端口: " rp
     
     get_public_ip
-    read -p "请输入转发协议名称(如 VLESS, Hy2，回车默认Realm): " protocol
+    read -p "请输入此节点协议名称(如 VLESS, Hy2，回车默认填Realm): " protocol
     protocol=${protocol:-Realm}
     node_name="${PUBLIC_IP}-${protocol}"
 
@@ -597,7 +581,7 @@ remote = "$rip:$rp"
 EOF
     systemctl restart realm
     echo -e "${GREEN}✔ 转发规则添加成功！${PLAIN}"
-    echo -e "节点备注: ${YELLOW}${node_name}${PLAIN}  |  连接端口: ${YELLOW}${lp}${PLAIN}"
+    echo -e "自动命名节点: ${YELLOW}${node_name}${PLAIN}  |  本机中转端口: ${YELLOW}${lp}${PLAIN}"
     sleep 3
 }
 
@@ -611,7 +595,7 @@ realm_add_range() {
     read -p "请输入目标落地基准端口: " rbp
 
     get_public_ip
-    read -p "请输入转发协议名称(如 VLESS, Hy2，回车默认Realm): " protocol
+    read -p "请输入此节点协议名称(如 VLESS, Hy2，回车默认填Realm): " protocol
     protocol=${protocol:-Realm}
 
     local rp=$rbp
@@ -679,21 +663,21 @@ realm_menu() {
     while true; do
         clear
         echo -e "${CYAN}==========================================${PLAIN}"
-        echo -e "${CYAN}        端口转发管理 (基于 Realm)         ${PLAIN}"
+        echo -e "${CYAN}        端口转发管理 (独立 Realm 模块)    ${PLAIN}"
         echo -e "${CYAN}==========================================${PLAIN}"
         if [ -f "$REALM_BIN" ]; then
             echo -e "Realm 转发状态: $(get_realm_status)"
             echo -e "------------------------------------------"
-            echo -e "${GREEN}1.${PLAIN} 添加单端口转发"
-            echo -e "${GREEN}2.${PLAIN} 添加端口段转发"
-            echo -e "${GREEN}3.${PLAIN} 查看/删除转发规则"
-            echo -e "${GREEN}4.${PLAIN} 卸载 Realm 转发服务"
+            echo -e "${GREEN}1.${PLAIN} ➕ 添加单端口转发"
+            echo -e "${GREEN}2.${PLAIN} ➕ 添加端口段转发"
+            echo -e "${GREEN}3.${PLAIN} 📋 查看或删除转发规则"
+            echo -e "${GREEN}4.${PLAIN} 🗑 彻底卸载 Realm 转发服务"
         else
             echo -e "Realm 转发状态: ${YELLOW}未安装${PLAIN}"
             echo -e "------------------------------------------"
-            echo -e "${GREEN}1.${PLAIN} 安装 Realm 并添加转发规则"
+            echo -e "${GREEN}1.${PLAIN} 🚀 立即安装 Realm 并添加转发规则"
         fi
-        echo -e "${GREEN}0.${PLAIN} 返回主菜单"
+        echo -e "${GREEN}0.${PLAIN} 🔙 返回上一级主菜单"
         echo -e "${CYAN}==========================================${PLAIN}"
         read -p "请输入选项: " RMENU_CHOICE
 
@@ -705,15 +689,14 @@ realm_menu() {
                systemctl stop realm >/dev/null 2>&1; systemctl disable realm >/dev/null 2>&1
                rm -f "$REALM_SERVICE_FILE"; systemctl daemon-reload
                rm -rf "$REALM_DIR" "$REALM_CONF_DIR"
-               echo -e "${GREEN}Realm 已卸载！${PLAIN}"; sleep 2 ;;
+               echo -e "${GREEN}Realm 已彻底卸载！${PLAIN}"; sleep 2 ;;
             0) break ;;
             *) echo -e "${RED}选择无效！${PLAIN}"; sleep 1 ;;
         esac
     done
-    start_menu
 }
 
-# ================= 主菜单 =================
+# ================= 首页主菜单 =================
 
 start_menu() {
     clear
@@ -725,13 +708,11 @@ start_menu() {
     if [ -f "$CONF_FILE" ]; then
         echo -e "系统状态: ${GREEN}已安装${PLAIN}   |   BBR加速状态: ${BBR_TXT}"
         echo -e "------------------------------------------"
-        echo -e "${YELLOW}[ 更新与重装 ]${PLAIN}"
+        echo -e "${YELLOW}[ Sing-box 节点选项 ]${PLAIN}"
         echo -e "${GREEN}1.${PLAIN} 一键升级 SBA 管理脚本"
         echo -e "${GREEN}2.${PLAIN} 一键无损更新 Sing-box 核心 (保留配置)"
         echo -e "${GREEN}3.${PLAIN} 强制彻底重装 Sing-box"
-        echo -e "------------------------------------------"
-        echo -e "${YELLOW}[ 配置与管理 ]${PLAIN}"
-        echo -e "${GREEN}4.${PLAIN} 动态修改端口、中转IP、伪装域名等参数"
+        echo -e "${GREEN}4.${PLAIN} 动态修改端口、伪装域名等参数"
         echo -e "${GREEN}5.${PLAIN} 独立申请或修复安全证书"
         echo -e "${GREEN}6.${PLAIN} 查看所有节点并生成终端二维码"
         echo -e "${GREEN}7.${PLAIN} 一键开启 BBR 网络加速机制"
@@ -739,13 +720,14 @@ start_menu() {
     else
         echo -e "系统状态: ${YELLOW}未安装${PLAIN}   |   BBR加速状态: ${BBR_TXT}"
         echo -e "------------------------------------------"
+        echo -e "${YELLOW}[ Sing-box 节点选项 ]${PLAIN}"
         echo -e "${GREEN}3.${PLAIN} 全新安装 Sing-box"
         echo -e "${GREEN}7.${PLAIN} 一键开启 BBR 网络加速机制"
         echo -e "${GREEN}8.${PLAIN} 彻底卸载 Sing-box"
     fi
     echo -e "------------------------------------------"
-    echo -e "${YELLOW}[ 高级扩展功能 ]${PLAIN}"
-    echo -e "${GREEN}9.${PLAIN} ${YELLOW}端口转发管理 (按需配置 Realm)${PLAIN}"
+    echo -e "${YELLOW}[ 高级扩展模块 ]${PLAIN}"
+    echo -e "${GREEN}9.${PLAIN} ➡️ ${YELLOW}端口转发管理 (基于 Realm)${PLAIN}"
     echo -e "${GREEN}0.${PLAIN} 退出脚本"
     echo -e "${CYAN}==========================================${PLAIN}"
     read -p "请输入选项: " MENU_CHOICE
@@ -760,7 +742,7 @@ start_menu() {
             6) show_links ;;
             7) enable_bbr ;;
             8) uninstall_singbox ;;
-            9) realm_menu ;;
+            9) realm_menu; start_menu ;;
             0) exit 0 ;;
             *) echo -e "${RED}选择无效！${PLAIN}"; sleep 1; start_menu ;;
         esac
@@ -769,7 +751,7 @@ start_menu() {
             3) fresh_install ;;
             7) enable_bbr ;;
             8) uninstall_singbox ;;
-            9) realm_menu ;;
+            9) realm_menu; start_menu ;;
             0) exit 0 ;;
             *) echo -e "${RED}选择无效！${PLAIN}"; sleep 1; start_menu ;;
         esac
