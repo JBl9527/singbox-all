@@ -1,172 +1,563 @@
 #!/bin/bash
 
 # ==========================================
-# Realm 一键转发脚本 v3.2.4 (含动态节点命名增强)
-# 更新日志:
-# 1. 新增输入错误计数器
-# 2. 连续输错 2 次自动返回主菜单
-# 3. 新增本机公网 IP 自动检测
-# 4. 新增 IP+协议 自动拼装生成节点名称
+# Sing-box 五协议终极版 + Realm 动态转发整合版
+# 特性: 一键脚本升级 / 随机端口 / 证书双模 / 分区菜单 / 中转支持
+# 增强: Realm 端口转发 / 自动检测公网IP动态命名节点
 # ==========================================
 
-# --- 基础配置 ---
-sh_ver="3.2.4"
-panel_ver="v3.2.4"
+SCRIPT_URL="https://raw.githubusercontent.com/JBl9527/sing-box-all/main/install.sh"
 
-# 颜色定义
-RED="\033[31m"
-GREEN="\033[32m"
-YELLOW="\033[33m"
-PLAIN="\033[0m"
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+CYAN='\033[0;36m'
+PLAIN='\033[0m'
 
-# 路径定义
+# --- Sing-box 配置路径 ---
+CONFIG_DIR="/usr/local/etc/sing-box"
+CERT_DIR="${CONFIG_DIR}/cert"
+CONF_FILE="${CONFIG_DIR}/sba.conf"
+SING_BOX_BIN="/usr/local/bin/sing-box"
+
+# --- Realm 配置路径 ---
 REALM_DIR="/root/realm"
 REALM_BIN="${REALM_DIR}/realm"
-CONFIG_DIR="/root/.realm"
-CONFIG_FILE="${CONFIG_DIR}/config.toml"
-SERVICE_FILE="/etc/systemd/system/realm.service"
-PANEL_DIR="${REALM_DIR}/web"
-PANEL_BIN="${PANEL_DIR}/realm_web"
+REALM_CONF_DIR="/root/.realm"
+REALM_CONF_FILE="${REALM_CONF_DIR}/config.toml"
+REALM_SERVICE_FILE="/etc/systemd/system/realm.service"
 
-PUBLIC_IP="" # 全局IP变量缓存
+PUBLIC_IP=""
 
-# --- 状态检测函数 ---
+if [[ $EUID -ne 0 ]]; then
+    echo -e "${RED}错误: 必须使用 root 用户运行此脚本！${PLAIN}"
+    exit 1
+fi
 
-get_status() {
-    if systemctl is-active --quiet realm; then
-        echo -e "${GREEN}运行中${PLAIN}"
-    else
-        echo -e "${RED}未运行${PLAIN}"
-    fi
-}
-
-get_panel_status() {
-    if [ ! -f "$PANEL_BIN" ]; then
-        echo -e "${RED}未安装${PLAIN}"
-    elif systemctl is-active --quiet realm-panel; then
-        echo -e "${GREEN}运行中${PLAIN}"
-    else
-        echo -e "${YELLOW}已安装但未启动${PLAIN}"
-    fi
-}
-
-# --- 核心校验与辅助函数 ---
+# ================= 公共函数 =================
 
 get_public_ip() {
     if [ -z "$PUBLIC_IP" ]; then
-        echo -e "${YELLOW}正在自动检测本机公网 IP，请稍候...${PLAIN}"
         PUBLIC_IP=$(curl -s4 ifconfig.me || curl -s4 ipv4.icanhazip.com || curl -s4 api.ipify.org)
-        if [ -z "$PUBLIC_IP" ]; then 
-            PUBLIC_IP="自动获取失败IP"
-            echo -e "${RED}IP获取失败，将使用默认占位符。${PLAIN}"
-        fi
+        if [ -z "$PUBLIC_IP" ]; then PUBLIC_IP="自动获取失败IP"; fi
     fi
 }
 
-validate_port() {
-    local port=$1
-    if [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ]; then
-        return 0
+check_bbr_status() {
+    if sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q "bbr"; then
+        echo -e "${GREEN}已开启${PLAIN}"
     else
-        echo -e "${RED}错误: 端口必须是 1-65535 之间的数字。${PLAIN}"
-        return 1
+        echo -e "${RED}未开启${PLAIN}"
     fi
 }
 
-validate_ip() {
-    local ip=$1
-    if [[ -z "$ip" ]]; then
-        echo -e "${RED}错误: 地址不能为空。${PLAIN}"
-        return 1
-    fi
-    if [[ "$ip" =~ ^[a-zA-Z0-9\.\:\-\[\]]+$ ]]; then
-        return 0
+enable_bbr() {
+    clear
+    echo -e "${YELLOW}正在检测当前系统 BBR 状态...${PLAIN}"
+    if sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q "bbr"; then
+        echo -e "${GREEN}您的系统已经开启了 BBR 加速，无需重复开启！${PLAIN}"
     else
-        echo -e "${RED}错误: 无效的 IP 或域名格式。${PLAIN}"
-        return 1
-    fi
-}
-
-check_port_available() {
-    local port=$1
-    if command -v ss >/dev/null; then
-        if ss -tulpn | grep ":${port} " | grep -qv "realm"; then
-            echo -e "${RED}错误: 本机端口 ${port} 已被其他程序占用。${PLAIN}"
-            return 1
+        echo -e "${YELLOW}正在为您的 VPS 注入 BBR 加速内核参数...${PLAIN}"
+        sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf
+        sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
+        echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
+        echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
+        sysctl -p >/dev/null 2>&1
+        if sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q "bbr"; then
+            echo -e "${GREEN}✔ BBR 加速开启成功！${PLAIN}"
+        else
+            echo -e "${RED}❌ BBR 开启失败！部分虚拟化架构不支持。${PLAIN}"
         fi
     fi
-    return 0
+    sleep 2
+    start_menu
 }
 
-check_rule_exists() {
-    local port=$1
-    if [ -f "$CONFIG_FILE" ]; then
-        if grep -qE "listen = \"(\\[::]:${port}|0\\.0\\.0\\.0:${port})\"" "$CONFIG_FILE"; then
-            echo -e "${RED}错误: 端口 ${port} 的规则已存在。${PLAIN}"
-            return 0
-        fi
+# ================= Sing-box 核心模块 =================
+
+check_deps_extra() {
+    if ! command -v jq >/dev/null 2>&1 || ! command -v qrencode >/dev/null 2>&1; then
+        echo -e "${YELLOW}⟳ 正在检测并安装高阶扩展组件 (jq, qrencode)...${PLAIN}"
+        apt-get update -y > /dev/null 2>&1
+        apt-get install -y jq qrencode > /dev/null 2>&1
     fi
-    return 1
 }
 
-# --- 基础功能 ---
-
-init_env() {
-    mkdir -p "$REALM_DIR"
-    mkdir -p "$CONFIG_DIR"
-    [ ! -f "$CONFIG_FILE" ] && write_config_header
+generate_random_ports() {
+    USED_PORTS=()
+    get_unique_port() {
+        local p
+        while true; do
+            p=$(shuf -i 10000-65535 -n 1)
+            if [[ ! " ${USED_PORTS[@]} " =~ " ${p} " ]]; then
+                USED_PORTS+=($p)
+                echo "$p"
+                break
+            fi
+        done
+    }
+    RND_REALITY=$(get_unique_port)
+    RND_ANYTLS=$(get_unique_port)
+    RND_ANYREALITY=$(get_unique_port)
+    RND_HY2=$(get_unique_port)
+    RND_TUIC=$(get_unique_port)
 }
 
-write_config_header() {
-    cat <<EOF > "$CONFIG_FILE"
+save_config() {
+    cat > "$CONF_FILE" <<EOF
+CERT_CHOICE="${CERT_CHOICE}"
+DOMAIN="${DOMAIN}"
+ACME_EMAIL="${ACME_EMAIL}"
+CF_EMAIL="${CF_EMAIL}"
+CF_KEY="${CF_KEY}"
+PORT_REALITY="${PORT_REALITY}"
+PORT_ANYTLS="${PORT_ANYTLS}"
+PORT_ANYREALITY="${PORT_ANYREALITY}"
+PORT_HY2="${PORT_HY2}"
+PORT_HY2_RANGE="${PORT_HY2_RANGE}"
+PORT_TUIC="${PORT_TUIC}"
+PADDING_SCHEME_JSON='${PADDING_SCHEME_JSON}'
+UUID_REALITY="${UUID_REALITY}"
+PASS_ANYTLS="${PASS_ANYTLS}"
+PASS_ANYREALITY="${PASS_ANYREALITY}"
+PASS_HY2="${PASS_HY2}"
+UUID_TUIC="${UUID_TUIC}"
+PASS_TUIC="${PASS_TUIC}"
+REALITY_PRIVATE="${REALITY_PRIVATE}"
+REALITY_PUBLIC="${REALITY_PUBLIC}"
+REALITY_SHORT_ID="${REALITY_SHORT_ID}"
+REALITY_DEST="${REALITY_DEST}"
+RELAY_IP="${RELAY_IP}"
+EOF
+}
+
+update_script() {
+    clear
+    echo -e "${YELLOW}正在从 GitHub 同步最新版 SBA 管理脚本...${PLAIN}"
+    install_sba_shortcut
+    echo -e "${GREEN}✔ SBA 脚本已成功更新至最新版！${PLAIN}"
+    sleep 2
+    sba
+    exit 0
+}
+
+silent_update_core() {
+    clear
+    echo -e "${YELLOW}正在检测并下载最新版 Sing-box 核心...${PLAIN}"
+    LATEST_VERSION=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r .tag_name | sed 's/v//')
+    ARCH=$(uname -m)
+    case "$ARCH" in x86_64) DL_ARCH="amd64" ;; aarch64) DL_ARCH="arm64" ;; *) echo -e "${RED}不支持的架构${PLAIN}"; exit 1 ;; esac
+    
+    wget -qO sing-box.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v${LATEST_VERSION}/sing-box-${LATEST_VERSION}-linux-${DL_ARCH}.tar.gz"
+    if [ $? -ne 0 ]; then echo -e "${RED}下载失败！${PLAIN}"; sleep 2; start_menu; return; fi
+    
+    systemctl stop sing-box > /dev/null 2>&1
+    tar -xzf sing-box.tar.gz
+    mv sing-box-${LATEST_VERSION}-linux-${DL_ARCH}/sing-box $SING_BOX_BIN
+    chmod +x $SING_BOX_BIN
+    rm -rf sing-box.tar.gz sing-box-${LATEST_VERSION}-linux-${DL_ARCH}
+    systemctl restart sing-box
+    echo -e "${GREEN}✔ Sing-box 核心已成功更新至 v${LATEST_VERSION}！${PLAIN}"
+    install_sba_shortcut
+    sleep 3
+    start_menu
+}
+
+fresh_install() {
+    clear
+    echo -e "${CYAN}==========================================${PLAIN}"
+    echo -e "${CYAN}        开始全新重装 Sing-box 服务        ${PLAIN}"
+    echo -e "${CYAN}==========================================${PLAIN}"
+
+    echo -e "\n${YELLOW}=== 1. 安全证书配置 ===${PLAIN}"
+    echo "1. 生成临时自签证书 (有效期10年，适合无域名场景)"
+    echo "2. 使用 自定义邮箱 申请永久证书 (Standalone 模式，需放行 80 端口)"
+    echo "3. 使用 Cloudflare API 申请永久证书 (DNS 模式，无需放行 80 端口)"
+    read -p "请输入选项 [1-3]: " CERT_CHOICE
+    
+    if [ "$CERT_CHOICE" == "2" ]; then
+        read -p "请输入解析到本机的域名: " DOMAIN
+        read -p "请输入 ACME 注册邮箱(用于接通知): " ACME_EMAIL
+    elif [ "$CERT_CHOICE" == "3" ]; then
+        read -p "请输入托管在 CF 上的域名: " DOMAIN
+        read -p "请输入 CF 账号的登录邮箱: " CF_EMAIL
+        read -p "请输入 CF Global API Key: " CF_KEY
+    else
+        CERT_CHOICE="1"; DOMAIN="bing.com"
+    fi
+
+    generate_random_ports
+
+    echo -e "\n${YELLOW}=== 2. 协议端口设置 (已自动生成不重复的随机端口) ===${PLAIN}"
+    read -p "VLESS-REALITY 端口 [默认 $RND_REALITY]: " PORT_REALITY
+    PORT_REALITY=${PORT_REALITY:-$RND_REALITY}
+    read -p "标准 AnyTLS 端口 [默认 $RND_ANYTLS]: " PORT_ANYTLS
+    PORT_ANYTLS=${PORT_ANYTLS:-$RND_ANYTLS}
+    read -p "究极 Any-Reality 端口 [默认 $RND_ANYREALITY]: " PORT_ANYREALITY
+    PORT_ANYREALITY=${PORT_ANYREALITY:-$RND_ANYREALITY}
+    read -p "Hysteria2 端口 [默认 $RND_HY2]: " PORT_HY2
+    PORT_HY2=${PORT_HY2:-$RND_HY2}
+    read -p "Hy2 跳跃端口段 (如 20000:30000，直接回车不跳跃): " PORT_HY2_RANGE
+    PORT_HY2_RANGE=$(echo "$PORT_HY2_RANGE" | tr '-' ':')
+    read -p "TUIC v5 端口 [默认 $RND_TUIC]: " PORT_TUIC
+    PORT_TUIC=${PORT_TUIC:-$RND_TUIC}
+
+    echo -e "\n${YELLOW}=== 3. REALITY 伪装域名配置 ===${PLAIN}"
+    read -p "请输入 REALITY 伪装目标域名 [默认: www.microsoft.com]: " INPUT_DEST
+    REALITY_DEST=${INPUT_DEST:-"www.microsoft.com"}
+
+    echo -e "\n${YELLOW}=== 4. AnyTLS Padding 设置 ===${PLAIN}"
+    read -p "请输入自定义 padding-scheme (直接回车使用内置最强配置): " CUSTOM_PADDING
+    if [ -z "$CUSTOM_PADDING" ]; then
+        PADDING_SCHEME_JSON='"stop=8", "0=30-30", "1=100-400", "2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000", "3=9-9,500-1000", "4=500-1000", "5=500-1000", "6=500-1000", "7=500-1000"'
+    else PADDING_SCHEME_JSON="$CUSTOM_PADDING"; fi
+    
+    echo -e "\n${YELLOW}=== 5. 中转节点(Relay)配置 ===${PLAIN}"
+    read -p "是否使用国内/其他中转机接入本节点？(y/N): " USE_RELAY
+    if [[ "$USE_RELAY" =~ ^[Yy]$ ]]; then
+        read -p "请输入中转机的 IP 地址或域名: " RELAY_IP
+    else
+        RELAY_IP=""
+    fi
+
+    echo -e "\n${GREEN}正在安装基础依赖组件...${PLAIN}\n"
+    apt-get update -y > /dev/null 2>&1
+    apt-get install -y curl wget jq openssl socat uuid-runtime cron iptables qrencode > /dev/null 2>&1
+    mkdir -p "$CERT_DIR"
+
+    LATEST_VERSION=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r .tag_name | sed 's/v//')
+    ARCH=$(uname -m)
+    case "$ARCH" in x86_64) DL_ARCH="amd64" ;; aarch64) DL_ARCH="arm64" ;; *) exit 1 ;; esac
+    wget -qO sing-box.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v${LATEST_VERSION}/sing-box-${LATEST_VERSION}-linux-${DL_ARCH}.tar.gz"
+    tar -xzf sing-box.tar.gz
+    mv sing-box-${LATEST_VERSION}-linux-${DL_ARCH}/sing-box $SING_BOX_BIN
+    chmod +x $SING_BOX_BIN
+    rm -rf sing-box.tar.gz sing-box-${LATEST_VERSION}-linux-${DL_ARCH}
+
+    if [ "$CERT_CHOICE" == "1" ]; then
+        openssl req -x509 -nodes -days 3650 -newkey rsa:2048 -keyout "$CERT_DIR/server.key" -out "$CERT_DIR/server.crt" -subj "/C=US/ST=State/L=City/O=Organization/CN=$DOMAIN"
+    elif [ "$CERT_CHOICE" == "2" ]; then
+        rm -rf ~/.acme.sh 
+        curl -s https://get.acme.sh | sh -s email="sba_cert_${RANDOM}@gmail.com"
+        ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt
+        ~/.acme.sh/acme.sh --issue -d "$DOMAIN" --standalone -k ec-256 --force
+        ~/.acme.sh/acme.sh --installcert -d "$DOMAIN" --ecc --fullchain-file "$CERT_DIR/server.crt" --key-file "$CERT_DIR/server.key"
+    elif [ "$CERT_CHOICE" == "3" ]; then
+        rm -rf ~/.acme.sh 
+        curl -s https://get.acme.sh | sh -s email="sba_cert_${RANDOM}@gmail.com"
+        ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt
+        export CF_Key="$CF_KEY"
+        export CF_Email="$CF_EMAIL"
+        ~/.acme.sh/acme.sh --issue --dns dns_cf -d "$DOMAIN" -k ec-256 --force
+        ~/.acme.sh/acme.sh --installcert -d "$DOMAIN" --ecc --fullchain-file "$CERT_DIR/server.crt" --key-file "$CERT_DIR/server.key"
+    fi
+
+    UUID_REALITY=$(uuidgen); PASS_ANYTLS=$(openssl rand -base64 12)
+    PASS_ANYREALITY=$(openssl rand -base64 12); PASS_HY2=$(openssl rand -base64 12)
+    UUID_TUIC=$(uuidgen); PASS_TUIC=$(openssl rand -base64 12)
+    
+    REALITY_KEYPAIR=$($SING_BOX_BIN generate reality-keypair)
+    REALITY_PRIVATE=$(echo "$REALITY_KEYPAIR" | grep PrivateKey | awk '{print $2}')
+    REALITY_PUBLIC=$(echo "$REALITY_KEYPAIR" | grep PublicKey | awk '{print $2}')
+    REALITY_SHORT_ID=$($SING_BOX_BIN generate rand --hex 8)
+
+    save_config
+    generate_config_json
+    configure_systemd
+    install_sba_shortcut
+    show_links
+}
+
+standalone_cert_manager() {
+    clear
+    if [ ! -f "$CONF_FILE" ]; then echo -e "${RED}未检测到配置！${PLAIN}"; sleep 2; start_menu; return; fi
+    source "$CONF_FILE"
+
+    echo -e "${CYAN}==========================================${PLAIN}"
+    echo -e "${CYAN}          独立证书申请与修复模块          ${PLAIN}"
+    echo -e "${CYAN}==========================================${PLAIN}"
+    echo -e "${YELLOW}当前绑定的域名: ${GREEN}${DOMAIN:-无}${PLAIN}"
+    echo -e "------------------------------------------"
+    echo "1. 重新生成 临时自签证书"
+    echo "2. 使用 Standalone 模式申请 永久域名证书"
+    echo "3. 使用 Cloudflare API 申请 永久域名证书"
+    echo "0. 返回主菜单"
+    read -p "请输入选项 [0-3]: " RE_CERT_CHOICE
+
+    if [ "$RE_CERT_CHOICE" == "0" ]; then start_menu; return; fi
+
+    if [ "$RE_CERT_CHOICE" == "2" ]; then
+        read -p "请输入域名 (默认 $DOMAIN): " NEW_DOMAIN; DOMAIN=${NEW_DOMAIN:-$DOMAIN}
+        read -p "请输入接收通知邮箱 (默认 $ACME_EMAIL): " NEW_EMAIL; ACME_EMAIL=${NEW_EMAIL:-$ACME_EMAIL}
+        CERT_CHOICE="2"
+    elif [ "$RE_CERT_CHOICE" == "3" ]; then
+        read -p "请输入域名 (默认 $DOMAIN): " NEW_DOMAIN; DOMAIN=${NEW_DOMAIN:-$DOMAIN}
+        read -p "请输入 CF 账号登录邮箱 (默认 $CF_EMAIL): " NEW_CF_EMAIL; CF_EMAIL=${NEW_CF_EMAIL:-$CF_EMAIL}
+        read -p "请输入 CF Global API Key: " NEW_CF_KEY; CF_KEY=${NEW_CF_KEY:-$CF_KEY}
+        CERT_CHOICE="3"
+    elif [ "$RE_CERT_CHOICE" == "1" ]; then
+        CERT_CHOICE="1"; DOMAIN="bing.com"
+    else
+        echo -e "${RED}无效！${PLAIN}"; sleep 1; standalone_cert_manager; return
+    fi
+
+    save_config
+    mkdir -p "$CERT_DIR"
+    systemctl stop sing-box > /dev/null 2>&1
+
+    if [ "$CERT_CHOICE" == "1" ]; then
+        openssl req -x509 -nodes -days 3650 -newkey rsa:2048 -keyout "$CERT_DIR/server.key" -out "$CERT_DIR/server.crt" -subj "/C=US/ST=State/L=City/O=Organization/CN=$DOMAIN"
+    elif [ "$CERT_CHOICE" == "2" ]; then
+        rm -rf ~/.acme.sh
+        curl -s https://get.acme.sh | sh -s email="sba_cert_${RANDOM}@gmail.com"
+        ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt
+        ~/.acme.sh/acme.sh --issue -d "$DOMAIN" --standalone -k ec-256 --force
+        ~/.acme.sh/acme.sh --installcert -d "$DOMAIN" --ecc --fullchain-file "$CERT_DIR/server.crt" --key-file "$CERT_DIR/server.key"
+    elif [ "$CERT_CHOICE" == "3" ]; then
+        rm -rf ~/.acme.sh
+        curl -s https://get.acme.sh | sh -s email="sba_cert_${RANDOM}@gmail.com"
+        ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt
+        export CF_Key="$CF_KEY"
+        export CF_Email="$CF_EMAIL"
+        ~/.acme.sh/acme.sh --issue --dns dns_cf -d "$DOMAIN" -k ec-256 --force
+        ~/.acme.sh/acme.sh --installcert -d "$DOMAIN" --ecc --fullchain-file "$CERT_DIR/server.crt" --key-file "$CERT_DIR/server.key"
+    fi
+
+    systemctl restart sing-box
+    sleep 1; show_links
+}
+
+generate_config_json() {
+    local FINAL_DEST=${REALITY_DEST:-"www.microsoft.com"}
+    cat > "$CONFIG_DIR/config.json" <<EOF
+{
+  "log": { "level": "info", "timestamp": true },
+  "inbounds": [
+    {
+      "type": "vless", "tag": "reality-in", "listen": "::", "listen_port": $PORT_REALITY,
+      "users": [ { "uuid": "$UUID_REALITY", "flow": "xtls-rprx-vision" } ],
+      "tls": { "enabled": true, "server_name": "$FINAL_DEST", "reality": { "enabled": true, "handshake": { "server": "$FINAL_DEST", "server_port": 443 }, "private_key": "$REALITY_PRIVATE", "short_id": ["$REALITY_SHORT_ID"] } }
+    },
+    {
+      "type": "anytls", "tag": "anytls-in", "listen": "::", "listen_port": $PORT_ANYTLS,
+      "users": [ { "password": "$PASS_ANYTLS" } ],
+      "padding_scheme": [ $PADDING_SCHEME_JSON ],
+      "tls": { "enabled": true, "certificate_path": "$CERT_DIR/server.crt", "key_path": "$CERT_DIR/server.key" }
+    },
+    {
+      "type": "anytls", "tag": "any-reality-in", "listen": "::", "listen_port": $PORT_ANYREALITY,
+      "users": [ { "password": "$PASS_ANYREALITY" } ],
+      "padding_scheme": [ $PADDING_SCHEME_JSON ],
+      "tls": { 
+          "enabled": true, "server_name": "$FINAL_DEST", 
+          "reality": { "enabled": true, "handshake": { "server": "$FINAL_DEST", "server_port": 443 }, "private_key": "$REALITY_PRIVATE", "short_id": ["$REALITY_SHORT_ID"] } 
+      }
+    },
+    {
+      "type": "hysteria2", "tag": "hy2-in", "listen": "::", "listen_port": $PORT_HY2,
+      "users": [ { "password": "$PASS_HY2" } ],
+      "tls": { "enabled": true, "alpn": ["h3"], "certificate_path": "$CERT_DIR/server.crt", "key_path": "$CERT_DIR/server.key" }
+    },
+    {
+      "type": "tuic", "tag": "tuic-in", "listen": "::", "listen_port": $PORT_TUIC,
+      "users": [ { "uuid": "$UUID_TUIC", "password": "$PASS_TUIC" } ],
+      "tls": { "enabled": true, "alpn": ["h3", "spdy/3.1"], "certificate_path": "$CERT_DIR/server.crt", "key_path": "$CERT_DIR/server.key" }
+    }
+  ],
+  "outbounds": [ { "type": "direct", "tag": "direct" }, { "type": "block", "tag": "block" } ]
+}
+EOF
+}
+
+configure_systemd() {
+    IPTABLES_START=""; IPTABLES_STOP=""
+    if [ -n "$PORT_HY2_RANGE" ]; then
+        IPTABLES_START="ExecStartPost=-/sbin/iptables -t nat -A PREROUTING -p udp --dport $PORT_HY2_RANGE -j REDIRECT --to-ports $PORT_HY2\nExecStartPost=-/sbin/ip6tables -t nat -A PREROUTING -p udp --dport $PORT_HY2_RANGE -j REDIRECT --to-ports $PORT_HY2"
+        IPTABLES_STOP="ExecStopPost=-/sbin/iptables -t nat -D PREROUTING -p udp --dport $PORT_HY2_RANGE -j REDIRECT --to-ports $PORT_HY2\nExecStopPost=-/sbin/ip6tables -t nat -D PREROUTING -p udp --dport $PORT_HY2_RANGE -j REDIRECT --to-ports $PORT_HY2"
+    fi
+
+    cat > /etc/systemd/system/sing-box.service <<EOF
+[Unit]
+Description=Sing-box Service
+After=network.target nss-lookup.target
+
+[Service]
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+ExecStart=$SING_BOX_BIN run -c $CONFIG_DIR/config.json
+${IPTABLES_START}
+${IPTABLES_STOP}
+Restart=on-failure
+RestartSec=10s
+LimitNOFILE=infinity
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable sing-box > /dev/null 2>&1
+    systemctl restart sing-box
+}
+
+install_sba_shortcut() {
+    cat > /usr/bin/sba <<EOF
+#!/bin/bash
+bash <(curl -Ls $SCRIPT_URL)
+EOF
+    chmod +x /usr/bin/sba
+}
+
+modify_parameters() {
+    clear
+    if [ ! -f "$CONF_FILE" ]; then echo -e "${RED}未检测到配置！${PLAIN}"; sleep 2; start_menu; return; fi
+    source "$CONF_FILE"
+
+    [ -z "$REALITY_DEST" ] && REALITY_DEST="www.microsoft.com"
+
+    echo -e "${CYAN}==========================================${PLAIN}"
+    echo -e "${CYAN}        动态修改节点参数 (无损重载)         ${PLAIN}"
+    echo -e "${CYAN}==========================================${PLAIN}"
+    echo -e "1. 修改 REALITY 端口 (当前: $PORT_REALITY)"
+    echo -e "2. 修改 AnyTLS 端口 (当前: $PORT_ANYTLS)"
+    echo -e "3. 修改 Any-Reality 端口 (当前: $PORT_ANYREALITY)"
+    echo -e "4. 修改 Hysteria2 端口 (当前: $PORT_HY2)"
+    echo -e "5. 修改 TUIC v5 端口 (当前: $PORT_TUIC)"
+    echo -e "6. 修改 AnyTLS/Any-Reality Padding Scheme"
+    echo -e "7. ${YELLOW}修改 REALITY 伪装域名 (当前: $REALITY_DEST)${PLAIN}"
+    echo -e "8. ${YELLOW}修改 中转 IP 地址 (当前: ${RELAY_IP:-未设置})${PLAIN}"
+    echo -e "0. 返回主菜单"
+    read -p "请选择 [0-8]: " MOD_CHOICE
+
+    case "$MOD_CHOICE" in
+        1) read -p "新 REALITY 端口: " NEW_PORT; [ -n "$NEW_PORT" ] && PORT_REALITY=$NEW_PORT ;;
+        2) read -p "新 AnyTLS 端口: " NEW_PORT; [ -n "$NEW_PORT" ] && PORT_ANYTLS=$NEW_PORT ;;
+        3) read -p "新 Any-Reality 端口: " NEW_PORT; [ -n "$NEW_PORT" ] && PORT_ANYREALITY=$NEW_PORT ;;
+        4) read -p "新 Hy2 主监听端口: " NEW_PORT; [ -n "$NEW_PORT" ] && PORT_HY2=$NEW_PORT
+           read -p "新 Hy2 跳跃段(清空填none): " NEW_RANGE
+           if [ "$NEW_RANGE" == "none" ]; then PORT_HY2_RANGE=""; elif [ -n "$NEW_RANGE" ]; then PORT_HY2_RANGE=$(echo "$NEW_RANGE" | tr '-' ':'); fi ;;
+        5) read -p "新 TUIC 端口: " NEW_PORT; [ -n "$NEW_PORT" ] && PORT_TUIC=$NEW_PORT ;;
+        6) read -p "新 Padding: " NEW_PAD; [ -n "$NEW_PAD" ] && PADDING_SCHEME_JSON=$NEW_PAD ;;
+        7) read -p "请输入全新 REALITY 伪装域名 (如 apple.com): " NEW_DEST; [ -n "$NEW_DEST" ] && REALITY_DEST=$NEW_DEST ;;
+        8) read -p "请输入新的中转 IP (留空则清除): " NEW_RELAY; RELAY_IP=$NEW_RELAY ;;
+        0) start_menu; return ;;
+        *) echo -e "${RED}无效！${PLAIN}"; sleep 1; modify_parameters; return ;;
+    esac
+
+    systemctl stop sing-box
+    save_config
+    generate_config_json
+    configure_systemd
+    echo -e "${GREEN}修改成功！参数已生效并已联动全套协议。${PLAIN}"; sleep 1; show_links
+}
+
+show_links() {
+    if [ ! -f "$CONF_FILE" ]; then echo "未找到配置！"; sleep 1; return; fi
+    source "$CONF_FILE"
+    check_deps_extra
+    get_public_ip
+
+    if [ -n "$RELAY_IP" ]; then
+        DISPLAY_IP="$RELAY_IP"
+    else
+        DISPLAY_IP="$PUBLIC_IP"
+    fi
+
+    local FINAL_DEST=${REALITY_DEST:-"www.microsoft.com"}
+    INSECURE_FLAG="0"
+    if [ "$CERT_CHOICE" == "1" ]; then INSECURE_FLAG="1"; fi
+
+    VLESS_LINK="vless://${UUID_REALITY}@${DISPLAY_IP}:${PORT_REALITY}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${FINAL_DEST}&fp=chrome&pbk=${REALITY_PUBLIC}&sid=${REALITY_SHORT_ID}&type=tcp&headerType=none#${DISPLAY_IP}-VLESS-REALITY"
+    
+    HY2_PORT_DISPLAY=${PORT_HY2}
+    if [ -n "$PORT_HY2_RANGE" ]; then HY2_PORT_DISPLAY=${PORT_HY2_RANGE/-/:}; fi
+    HY2_LINK="hy2://${PASS_HY2}@${DISPLAY_IP}:${HY2_PORT_DISPLAY}?insecure=${INSECURE_FLAG}&sni=${DOMAIN}#${DISPLAY_IP}-Hysteria2"
+    
+    TUIC_LINK="tuic://${UUID_TUIC}:${PASS_TUIC}@${DISPLAY_IP}:${PORT_TUIC}?sni=${DOMAIN}&alpn=h3&allow_insecure=${INSECURE_FLAG}#${DISPLAY_IP}-TUIC"
+    
+    ANYTLS_LINK="anytls://${PASS_ANYTLS}@${DISPLAY_IP}:${PORT_ANYTLS}?security=tls&sni=${DOMAIN}&fp=chrome&alpn=http%2F1.1&insecure=${INSECURE_FLAG}&allowInsecure=${INSECURE_FLAG}&type=tcp&headerType=none#${DISPLAY_IP}-AnyTLS"
+    
+    ANYREALITY_LINK="anytls://${PASS_ANYREALITY}@${DISPLAY_IP}:${PORT_ANYREALITY}?security=reality&sni=${FINAL_DEST}&fp=chrome&pbk=${REALITY_PUBLIC}&sid=${REALITY_SHORT_ID}&type=tcp&headerType=none#${DISPLAY_IP}-AnyReality"
+
+    clear
+    echo -e "${CYAN}===========================================${PLAIN}"
+    echo -e "${YELLOW}↓↓↓ 您的当前核心节点一键分享链接 ↓↓↓${PLAIN}\n"
+    if [ -n "$RELAY_IP" ]; then echo -e "${YELLOW}>>> 当前已开启中转模式，流量将通过: $RELAY_IP 转发 <<<${PLAIN}\n"; fi
+    
+    echo -e "${GREEN}[1] VLESS + REALITY:${PLAIN}\n${VLESS_LINK}\n"
+    echo -e "${GREEN}[2] 标准 AnyTLS:${PLAIN}\n${ANYTLS_LINK}\n"
+    echo -e "${GREEN}[3] 究极 Any-Reality:${PLAIN}\n${ANYREALITY_LINK}\n"
+    echo -e "${GREEN}[4] Hysteria2:${PLAIN}\n${HY2_LINK}\n"
+    echo -e "${GREEN}[5] TUIC v5:${PLAIN}\n${TUIC_LINK}\n"
+    
+    echo -e "${CYAN}===========================================${PLAIN}"
+    read -p "需要显示二维码请输入节点数字 [1-5]，回车返回主菜单: " QR_CHOICE
+
+    case "$QR_CHOICE" in
+        1) qrencode -t ANSIUTF8 "$VLESS_LINK" ;;
+        2) qrencode -t ANSIUTF8 "$ANYTLS_LINK" ;;
+        3) qrencode -t ANSIUTF8 "$ANYREALITY_LINK" ;;
+        4) qrencode -t ANSIUTF8 "$HY2_LINK" ;;
+        5) qrencode -t ANSIUTF8 "$TUIC_LINK" ;;
+        *) start_menu; return ;;
+    esac
+
+    echo ""
+    read -n 1 -s -r -p "扫码完毕？按任意键返回主菜单..."
+    start_menu
+}
+
+uninstall_singbox() {
+    clear
+    read -p "确认要彻底卸载 Sing-box 吗？[y/N]: " UNINSTALL_CONFIRM
+    if [[ "$UNINSTALL_CONFIRM" =~ ^[Yy]$ ]]; then
+        systemctl stop sing-box > /dev/null 2>&1
+        systemctl disable sing-box > /dev/null 2>&1
+        rm -f /etc/systemd/system/sing-box.service
+        systemctl daemon-reload
+        rm -rf "$CONFIG_DIR"
+        rm -f "$SING_BOX_BIN"
+        echo -e "${GREEN}卸载完成！${PLAIN}"
+        sleep 2
+    fi
+    start_menu
+}
+
+
+# ================= Realm 端口转发模块 =================
+
+get_realm_status() {
+    if systemctl is-active --quiet realm; then echo -e "${GREEN}运行中${PLAIN}"; else echo -e "${RED}未运行${PLAIN}"; fi
+}
+
+install_realm() {
+    echo -e "${YELLOW}>>> 正在部署 Realm 转发服务...${PLAIN}"
+    mkdir -p "$REALM_DIR" "$REALM_CONF_DIR"
+    [ ! -f "$REALM_CONF_FILE" ] && cat <<EOF > "$REALM_CONF_FILE"
 [network]
 no_tcp = false
 use_udp = true
 
 EOF
-}
 
-check_dependencies() {
-    local dependencies=("wget" "tar" "systemctl" "sed" "grep" "curl" "unzip" "ss")
-    local missing=()
-    for dep in "${dependencies[@]}"; do
-        if ! command -v "$dep" &> /dev/null; then missing+=("$dep"); fi
-    done
-    if [ ${#missing[@]} -gt 0 ]; then
-        echo -e "${YELLOW}安装依赖: ${missing[*]} ...${PLAIN}"
-        if [ -x "$(command -v apt-get)" ]; then
-            apt-get update -y >/dev/null 2>&1 && apt-get install -y "${missing[@]}" iproute2
-        elif [ -x "$(command -v yum)" ]; then
-            yum install -y "${missing[@]}" iproute
-        else
-            echo -e "${RED}请手动安装依赖。${PLAIN}"; exit 1
-        fi
-    fi
-}
-
-install_realm() {
-    echo -e "${GREEN}> 部署 Realm...${PLAIN}"
-    check_dependencies; init_env
     local version=$(curl -s https://api.github.com/repos/zhboner/realm/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
     [ -z "$version" ] && version="v2.6.0"
-    
     local arch=$(uname -m)
     local filename=""
     case "$arch" in
         x86_64) filename="realm-x86_64-unknown-linux-gnu.tar.gz" ;;
         aarch64) filename="realm-aarch64-unknown-linux-gnu.tar.gz" ;;
-        *) echo -e "${RED}不支持架构: $arch${PLAIN}"; return 1 ;;
+        *) echo -e "${RED}不支持架构: $arch${PLAIN}"; sleep 2; return ;;
     esac
 
-    wget -O "/tmp/realm.tar.gz" "https://github.com/zhboner/realm/releases/download/${version}/${filename}" || { echo -e "${RED}下载失败${PLAIN}"; return 1; }
-    tar -xvf /tmp/realm.tar.gz -C "$REALM_DIR" && rm -f /tmp/realm.tar.gz
+    wget -qO "/tmp/realm.tar.gz" "https://github.com/zhboner/realm/releases/download/${version}/${filename}"
+    tar -xzf /tmp/realm.tar.gz -C "$REALM_DIR" && rm -f /tmp/realm.tar.gz
     chmod +x "$REALM_BIN"
 
-    cat <<EOF > "$SERVICE_FILE"
+    cat <<EOF > "$REALM_SERVICE_FILE"
 [Unit]
 Description=Realm Forwarding Service
 After=network-online.target
-Wants=network-online.target
 
 [Service]
 Type=simple
@@ -174,116 +565,59 @@ User=root
 Restart=on-failure
 RestartSec=5s
 WorkingDirectory=${REALM_DIR}
-ExecStart=${REALM_BIN} -c ${CONFIG_FILE}
+ExecStart=${REALM_BIN} -c ${REALM_CONF_FILE}
 
 [Install]
 WantedBy=multi-user.target
 EOF
-    systemctl daemon-reload; systemctl enable realm; systemctl restart realm
-    echo -e "${GREEN}安装完成${PLAIN}"
+    systemctl daemon-reload; systemctl enable realm >/dev/null 2>&1; systemctl restart realm
+    echo -e "${GREEN}✔ Realm 转发服务安装完成并已启动！${PLAIN}"
+    sleep 2
 }
 
-uninstall_realm() {
-    read -p "确定卸载 Realm? [y/N]: " confirm
-    [[ "$confirm" != "y" && "$confirm" != "Y" ]] && return
-    systemctl stop realm; systemctl disable realm
-    rm -f "$SERVICE_FILE"; systemctl daemon-reload; rm -rf "$REALM_DIR"
-    read -p "删除配置? [y/N]: " del_conf
-    [[ "$del_conf" == "y" || "$del_conf" == "Y" ]] && rm -rf "$CONFIG_DIR"
-    echo -e "${GREEN}已卸载${PLAIN}"
-}
-
-# --- 转发管理 (已添加重试限制) ---
-
-add_forward() {
-    echo -e "${YELLOW}>>> 添加转发 (连续错误2次自动返回)${PLAIN}"
+realm_add_forward() {
+    if [ ! -f "$REALM_BIN" ]; then install_realm; fi
+    clear
+    echo -e "${YELLOW}>>> 添加单端口转发 (Realm)${PLAIN}"
+    read -p "请输入本机监听端口: " lp
+    read -p "请输入目标落地 IP/域名: " rip
+    read -p "请输入目标落地端口: " rp
     
-    # 1. 本机端口
-    local attempt=0
-    while true; do
-        read -e -p "本机端口: " lp
-        if ! validate_port "$lp"; then
-            ((attempt++)); [ $attempt -ge 2 ] && { echo -e "${RED}错误过多，返回主菜单${PLAIN}"; return; }
-            continue
-        fi
-        if ! check_port_available "$lp"; then
-            ((attempt++)); [ $attempt -ge 2 ] && { echo -e "${RED}错误过多，返回主菜单${PLAIN}"; return; }
-            continue
-        fi
-        if check_rule_exists "$lp"; then
-            ((attempt++)); [ $attempt -ge 2 ] && { echo -e "${RED}错误过多，返回主菜单${PLAIN}"; return; }
-            continue
-        fi
-        break
-    done
-
-    # 2. 落地IP
-    attempt=0
-    while true; do
-        read -e -p "落地IP/域名: " rip
-        if ! validate_ip "$rip"; then
-             ((attempt++)); [ $attempt -ge 2 ] && { echo -e "${RED}错误过多，返回主菜单${PLAIN}"; return; }
-             continue
-        fi
-        break
-    done
-
-    # 3. 落地端口
-    attempt=0
-    while true; do
-        read -e -p "落地端口: " rp
-        if ! validate_port "$rp"; then
-            ((attempt++)); [ $attempt -ge 2 ] && { echo -e "${RED}错误过多，返回主菜单${PLAIN}"; return; }
-            continue
-        fi
-        break
-    done
-
-    # 4. 自动生成节点名称
     get_public_ip
-    read -e -p "请输入此转发的底层协议 (如 VLESS, Hy2, TUIC，直接回车默认填写 Realm): " protocol
+    read -p "请输入转发协议名称(如 VLESS, Hy2，回车默认Realm): " protocol
     protocol=${protocol:-Realm}
     node_name="${PUBLIC_IP}-${protocol}"
 
-    cat <<EOF >> "$CONFIG_FILE"
+    cat <<EOF >> "$REALM_CONF_FILE"
 
 # 节点名称: $node_name
 [[endpoints]]
 listen = "[::]:$lp"
 remote = "$rip:$rp"
 EOF
-    restart_service
-
-    echo ""
-    echo -e "${GREEN}==============================================${PLAIN}"
-    echo -e "${GREEN}✅ 转发添加成功！客户端配置信息如下：${PLAIN}"
-    echo -e "${YELLOW}节点建议名称 : ${GREEN}${node_name}${PLAIN}"
-    echo -e "${YELLOW}客户端连接IP : ${GREEN}${PUBLIC_IP}${PLAIN}"
-    echo -e "${YELLOW}客户端连接端口: ${GREEN}${lp}${PLAIN}"
-    echo -e "${GREEN}==============================================${PLAIN}"
+    systemctl restart realm
+    echo -e "${GREEN}✔ 转发规则添加成功！${PLAIN}"
+    echo -e "节点备注: ${YELLOW}${node_name}${PLAIN}  |  连接端口: ${YELLOW}${lp}${PLAIN}"
+    sleep 3
 }
 
-add_range_forward() {
-    echo -e "${YELLOW}>>> 端口段转发 (连续错误2次自动返回)${PLAIN}"
-    local attempt=0
-    
-    while true; do read -e -p "落地IP: " rip; validate_ip "$rip" && break; ((attempt++)); [ $attempt -ge 2 ] && return; done
-    attempt=0; while true; do read -e -p "起始端口: " sp; validate_port "$sp" && break; ((attempt++)); [ $attempt -ge 2 ] && return; done
-    attempt=0; while true; do read -e -p "结束端口: " ep; validate_port "$ep" && break; ((attempt++)); [ $attempt -ge 2 ] && return; done
-    attempt=0; while true; do read -e -p "落地基准端口: " rbp; validate_port "$rbp" && break; ((attempt++)); [ $attempt -ge 2 ] && return; done
+realm_add_range() {
+    if [ ! -f "$REALM_BIN" ]; then install_realm; fi
+    clear
+    echo -e "${YELLOW}>>> 添加端口段转发 (Realm)${PLAIN}"
+    read -p "请输入起始端口: " sp
+    read -p "请输入结束端口: " ep
+    read -p "请输入目标落地 IP/域名: " rip
+    read -p "请输入目标落地基准端口: " rbp
 
-    [ "$sp" -ge "$ep" ] && { echo -e "${RED}起始必须小于结束${PLAIN}"; return; }
-
-    # 自动生成节点名称前缀
     get_public_ip
-    read -e -p "请输入此转发的底层协议 (如 VLESS, Hy2，直接回车默认填写 Realm): " protocol
+    read -p "请输入转发协议名称(如 VLESS, Hy2，回车默认Realm): " protocol
     protocol=${protocol:-Realm}
 
-    echo "生成中..."
     local rp=$rbp
     for ((p=$sp; p<=$ep; p++)); do
-        if ! grep -q "listen = \"[::]:$p\"" "$CONFIG_FILE"; then
-            cat <<EOF >> "$CONFIG_FILE"
+        if ! grep -q "listen = \"[::]:$p\"" "$REALM_CONF_FILE"; then
+            cat <<EOF >> "$REALM_CONF_FILE"
 
 # 节点名称: ${PUBLIC_IP}-${protocol}-端口${p}
 [[endpoints]]
@@ -293,229 +627,153 @@ EOF
         fi
         ((rp++))
     done
-    restart_service
-
-    echo ""
-    echo -e "${GREEN}==============================================${PLAIN}"
-    echo -e "${GREEN}✅ 端口段转发添加成功！${PLAIN}"
-    echo -e "${YELLOW}您的节点命名参考前缀 : ${GREEN}${PUBLIC_IP}-${protocol}${PLAIN}"
-    echo -e "${YELLOW}客户端连接统一IP     : ${GREEN}${PUBLIC_IP}${PLAIN}"
-    echo -e "${GREEN}==============================================${PLAIN}"
+    systemctl restart realm
+    echo -e "${GREEN}✔ 端口段转发规则添加成功！${PLAIN}"
+    sleep 2
 }
 
-delete_forward() {
-    [ ! -f "$CONFIG_FILE" ] && return
-    local listens=($(grep "listen =" "$CONFIG_FILE" | awk -F'"' '{print $2}'))
-    local remotes=($(grep "remote =" "$CONFIG_FILE" | awk -F'"' '{print $2}'))
-    # 尝试提取注释的节点名称
-    local remarks=($(grep -B 1 "listen =" "$CONFIG_FILE" | grep "^#" | awk -F': ' '{print $2}'))
+realm_delete_forward() {
+    if [ ! -f "$REALM_CONF_FILE" ]; then echo "没有找到配置文件！"; sleep 2; return; fi
+    local listens=($(grep "listen =" "$REALM_CONF_FILE" | awk -F'"' '{print $2}'))
+    local remotes=($(grep "remote =" "$REALM_CONF_FILE" | awk -F'"' '{print $2}'))
+    local remarks=($(grep -B 1 "listen =" "$REALM_CONF_FILE" | grep "^#" | awk -F': ' '{print $2}'))
 
-    [ ${#listens[@]} -eq 0 ] && { echo "无规则"; return; }
+    if [ ${#listens[@]} -eq 0 ]; then echo "当前没有任何转发规则。"; sleep 2; return; fi
 
-    echo "==============="
+    clear
+    echo -e "${CYAN}=== 当前 Realm 转发规则 ===${PLAIN}"
     for ((i=0; i<${#listens[@]}; i++)); do
         local d_remark=${remarks[i]:-"未命名节点"}
         echo -e "${GREEN}$((i+1)).${PLAIN} [${YELLOW}${d_remark}${PLAIN}] ${listens[i]} -> ${remotes[i]}"
     done
-    echo "==============="
-    read -p "删除序号(0取消): " c
-    [[ "$c" == "0" || -z "$c" ]] && return
-    if ! [[ "$c" =~ ^[0-9]+$ ]] || [ "$c" -lt 1 ] || [ "$c" -gt "${#listens[@]}" ]; then
-        echo -e "${RED}无效序号${PLAIN}"; return
-    fi
-    
-    cp "$CONFIG_FILE" "${CONFIG_FILE}.bak"; write_config_header
-    local del_idx=$((c-1))
-    for ((i=0; i<${#listens[@]}; i++)); do
-        if [ $i -ne $del_idx ]; then
-            local p_remark=${remarks[i]:-"自动重写节点"}
-            cat <<EOF >> "$CONFIG_FILE"
+    echo "==========================="
+    read -p "请输入要删除的规则序号 (输入 0 取消): " c
+    if [[ "$c" =~ ^[0-9]+$ ]] && [ "$c" -ge 1 ] && [ "$c" -le "${#listens[@]}" ]; then
+        cp "$REALM_CONF_FILE" "${REALM_CONF_FILE}.bak"
+        cat <<EOF > "$REALM_CONF_FILE"
+[network]
+no_tcp = false
+use_udp = true
+
+EOF
+        local del_idx=$((c-1))
+        for ((i=0; i<${#listens[@]}; i++)); do
+            if [ $i -ne $del_idx ]; then
+                local p_remark=${remarks[i]:-"自动重写节点"}
+                cat <<EOF >> "$REALM_CONF_FILE"
 
 # 节点名称: ${p_remark}
 [[endpoints]]
 listen = "${listens[i]}"
 remote = "${remotes[i]}"
 EOF
-        fi
-    done
-    restart_service
+            fi
+        done
+        systemctl restart realm
+        echo -e "${GREEN}删除成功！${PLAIN}"
+    fi
+    sleep 2
 }
 
-# --- 服务控制 ---
-start_service() { systemctl start realm; echo "已启动"; }
-stop_service() { systemctl stop realm; echo "已停止"; }
-restart_service() { 
-    systemctl daemon-reload; systemctl restart realm; sleep 1
-    systemctl is-active --quiet realm && echo -e "${GREEN}重启成功${PLAIN}" || echo -e "${RED}重启失败${PLAIN}"
-}
-
-# --- 面板管理 ---
-panel_management() {
+realm_menu() {
     while true; do
         clear
-        echo "=== Realm 面板管理 ($panel_ver) ==="
-        echo -e "面板状态: $(get_panel_status)"
-        echo "============================="
-        echo "1. 安装面板"
-        echo "2. 启动面板"
-        echo "3. 停止面板"
-        echo "4. 卸载面板"
-        echo "0. 返回上级"
-        read -p "选择: " pc
-        case $pc in
-            1) install_panel ;;
-            2) systemctl start realm-panel; echo "尝试启动..." ;;
-            3) systemctl stop realm-panel; echo "已停止" ;;
-            4) uninstall_panel ;;
+        echo -e "${CYAN}==========================================${PLAIN}"
+        echo -e "${CYAN}        端口转发管理 (基于 Realm)         ${PLAIN}"
+        echo -e "${CYAN}==========================================${PLAIN}"
+        if [ -f "$REALM_BIN" ]; then
+            echo -e "Realm 转发状态: $(get_realm_status)"
+            echo -e "------------------------------------------"
+            echo -e "${GREEN}1.${PLAIN} 添加单端口转发"
+            echo -e "${GREEN}2.${PLAIN} 添加端口段转发"
+            echo -e "${GREEN}3.${PLAIN} 查看/删除转发规则"
+            echo -e "${GREEN}4.${PLAIN} 卸载 Realm 转发服务"
+        else
+            echo -e "Realm 转发状态: ${YELLOW}未安装${PLAIN}"
+            echo -e "------------------------------------------"
+            echo -e "${GREEN}1.${PLAIN} 安装 Realm 并添加转发规则"
+        fi
+        echo -e "${GREEN}0.${PLAIN} 返回主菜单"
+        echo -e "${CYAN}==========================================${PLAIN}"
+        read -p "请输入选项: " RMENU_CHOICE
+
+        case "$RMENU_CHOICE" in
+            1) if [ ! -f "$REALM_BIN" ]; then install_realm; fi; realm_add_forward ;;
+            2) realm_add_range ;;
+            3) realm_delete_forward ;;
+            4) 
+               systemctl stop realm >/dev/null 2>&1; systemctl disable realm >/dev/null 2>&1
+               rm -f "$REALM_SERVICE_FILE"; systemctl daemon-reload
+               rm -rf "$REALM_DIR" "$REALM_CONF_DIR"
+               echo -e "${GREEN}Realm 已卸载！${PLAIN}"; sleep 2 ;;
             0) break ;;
-            *) echo "无效选择" ;;
+            *) echo -e "${RED}选择无效！${PLAIN}"; sleep 1 ;;
         esac
-        read -p "按回车继续..."
     done
+    start_menu
 }
 
-install_panel() {
-    check_dependencies
-    local arch=$(uname -m)
-    local p_file=""
-    case "$arch" in
-        x86_64) p_file="realm-panel-linux-amd64.zip" ;;
-        aarch64|arm64) p_file="realm-panel-linux-arm64.zip" ;;
-        *) echo "不支持架构: $arch"; return ;;
-    esac
+# ================= 主菜单 =================
 
-    mkdir -p "$PANEL_DIR"
-    local url="https://github.com/wcwq98/realm/releases/download/${panel_ver}/${p_file}"
-    local tmp_zip="/tmp/${p_file}"
-    local tmp_dir="/tmp/realm_panel_$$"
-
-    if ! wget -O "$tmp_zip" "$url"; then
-        echo -e "${RED}下载失败${PLAIN}"
-        rm -f "$tmp_zip"
-        return 1
-    fi
-
-    mkdir -p "$tmp_dir"
-    unzip -o "$tmp_zip" -d "$tmp_dir"
-    rm -f "$tmp_zip"
-
-    # 无论 zip 内部目录结构如何，都能找到 realm_web 二进制
-    local found_bin
-    found_bin=$(find "$tmp_dir" -name "realm_web" -type f 2>/dev/null | head -1)
-    if [ -z "$found_bin" ]; then
-        # 兜底：找第一个非文本可执行文件
-        found_bin=$(find "$tmp_dir" -maxdepth 3 -type f ! -name "*.txt" ! -name "*.md" 2>/dev/null | head -1)
-    fi
-
-    if [ -z "$found_bin" ]; then
-        echo -e "${RED}解压后未找到可执行文件，请手动安装${PLAIN}"
-        rm -rf "$tmp_dir"
-        return 1
-    fi
-
-    cp "$found_bin" "$PANEL_BIN"
-    chmod +x "$PANEL_BIN"
-
-    # 复制静态资源和模板
-    [ -d "$tmp_dir/static" ]    && cp -r "$tmp_dir/static"    "$PANEL_DIR/"
-    [ -d "$tmp_dir/templates" ] && cp -r "$tmp_dir/templates" "$PANEL_DIR/"
-    # 兼容 zip 内有子目录的情况
-    local sub_dir
-    sub_dir=$(find "$tmp_dir" -mindepth 1 -maxdepth 1 -type d | head -1)
-    if [ -n "$sub_dir" ]; then
-        [ -d "$sub_dir/static" ]    && cp -r "$sub_dir/static"    "$PANEL_DIR/"
-        [ -d "$sub_dir/templates" ] && cp -r "$sub_dir/templates" "$PANEL_DIR/"
-    fi
-    # 复制默认配置（不覆盖已有配置）
-    [ -f "$tmp_dir/config.toml" ] && [ ! -f "$PANEL_DIR/config.toml" ] && cp "$tmp_dir/config.toml" "$PANEL_DIR/"
-
-    rm -rf "$tmp_dir"
-
-    cat <<EOF > /etc/systemd/system/realm-panel.service
-[Unit]
-Description=Realm Web Panel
-After=network.target
-
-[Service]
-Type=simple
-User=root
-WorkingDirectory=${PANEL_DIR}
-ExecStart=${PANEL_BIN}
-Restart=on-failure
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    systemctl daemon-reload; systemctl enable realm-panel; systemctl start realm-panel
-    echo -e "${GREEN}面板安装成功!${PLAIN}"
-}
-
-uninstall_panel() {
-    systemctl stop realm-panel; systemctl disable realm-panel
-    rm -f /etc/systemd/system/realm-panel.service; systemctl daemon-reload
-    rm -rf "$PANEL_DIR"
-    echo "已卸载"
-}
-
-# --- 脚本更新 ---
-Update_Shell() {
-    local url="https://raw.githubusercontent.com/wcwq98/realm/main/realm.sh"
-    local new_ver=$(wget -qO- "$url" | grep 'sh_ver="' | awk -F "=" '{print $NF}' | tr -d '"' | head -1)
-    [[ -z "$new_ver" ]] && { echo -e "${RED}检测失败${PLAIN}"; return; }
-    [[ "$new_ver" == "$sh_ver" ]] && { echo "已是最新"; return; }
-    read -p "更新到 $new_ver? [y/N]: " yn
-    [[ "$yn" =~ ^[Yy]$ ]] && wget -N --no-check-certificate "$url" -O realm.sh && chmod +x realm.sh && echo "已更新" && exit 0
-}
-
-# --- 主菜单 ---
-show_menu() {
+start_menu() {
     clear
-    echo "################################################"
-    echo "#        Realm 一键转发脚本 (v${sh_ver})         #"
-    echo "################################################"
-    echo -e " Realm 状态: $(get_status)"
-    echo -e " 面板 状态: $(get_panel_status)"
-    echo "------------------------------------------------"
-    echo "  1. 安装 / 重置 Realm"
-    echo "  2. 卸载 Realm"
-    echo "------------------------------------------------"
-    echo "  3. 添加转发规则"
-    echo "  4. 添加端口段转发"
-    echo "  5. 删除转发规则"
-    echo "  6. 查看当前配置"
-    echo "------------------------------------------------"
-    echo "  7. 启动服务"
-    echo "  8. 停止服务"
-    echo "  9. 重启服务"
-    echo "------------------------------------------------"
-    echo "  10. 更新脚本"
-    echo "  11. 面板管理"
-    echo "  0. 退出脚本"
-    echo "################################################"
-}
-
-main() {
-    check_dependencies; init_env
-    while true; do
-        show_menu
-        read -p "选择 [0-11]: " opt
-        case $opt in
-            1) install_realm ;;
-            2) uninstall_realm ;;
-            3) add_forward ;;
-            4) add_range_forward ;;
-            5) delete_forward ;;
-            6) cat "$CONFIG_FILE" ;;
-            7) start_service ;;
-            8) stop_service ;;
-            9) restart_service ;;
-            10) Update_Shell ;;
-            11) panel_management ;;
+    echo -e "${CYAN}==========================================${PLAIN}"
+    echo -e "${CYAN}     Sing-box 五协议终极版管理脚本 (SBA)   ${PLAIN}"
+    echo -e "${CYAN}==========================================${PLAIN}"
+    
+    BBR_TXT=$(check_bbr_status)
+    if [ -f "$CONF_FILE" ]; then
+        echo -e "系统状态: ${GREEN}已安装${PLAIN}   |   BBR加速状态: ${BBR_TXT}"
+        echo -e "------------------------------------------"
+        echo -e "${YELLOW}[ 更新与重装 ]${PLAIN}"
+        echo -e "${GREEN}1.${PLAIN} 一键升级 SBA 管理脚本"
+        echo -e "${GREEN}2.${PLAIN} 一键无损更新 Sing-box 核心 (保留配置)"
+        echo -e "${GREEN}3.${PLAIN} 强制彻底重装 Sing-box"
+        echo -e "------------------------------------------"
+        echo -e "${YELLOW}[ 配置与管理 ]${PLAIN}"
+        echo -e "${GREEN}4.${PLAIN} 动态修改端口、中转IP、伪装域名等参数"
+        echo -e "${GREEN}5.${PLAIN} 独立申请或修复安全证书"
+        echo -e "${GREEN}6.${PLAIN} 查看所有节点并生成终端二维码"
+        echo -e "${GREEN}7.${PLAIN} 一键开启 BBR 网络加速机制"
+        echo -e "${GREEN}8.${PLAIN} 彻底卸载 Sing-box"
+    else
+        echo -e "系统状态: ${YELLOW}未安装${PLAIN}   |   BBR加速状态: ${BBR_TXT}"
+        echo -e "------------------------------------------"
+        echo -e "${GREEN}3.${PLAIN} 全新安装 Sing-box"
+        echo -e "${GREEN}7.${PLAIN} 一键开启 BBR 网络加速机制"
+        echo -e "${GREEN}8.${PLAIN} 彻底卸载 Sing-box"
+    fi
+    echo -e "------------------------------------------"
+    echo -e "${YELLOW}[ 高级扩展功能 ]${PLAIN}"
+    echo -e "${GREEN}9.${PLAIN} ${YELLOW}端口转发管理 (按需配置 Realm)${PLAIN}"
+    echo -e "${GREEN}0.${PLAIN} 退出脚本"
+    echo -e "${CYAN}==========================================${PLAIN}"
+    read -p "请输入选项: " MENU_CHOICE
+    
+    if [ -f "$CONF_FILE" ]; then
+        case "$MENU_CHOICE" in
+            1) update_script ;;
+            2) silent_update_core ;;
+            3) fresh_install ;;
+            4) modify_parameters ;;
+            5) standalone_cert_manager ;;
+            6) show_links ;;
+            7) enable_bbr ;;
+            8) uninstall_singbox ;;
+            9) realm_menu ;;
             0) exit 0 ;;
-            *) echo "无效" ;;
+            *) echo -e "${RED}选择无效！${PLAIN}"; sleep 1; start_menu ;;
         esac
-        [ "$opt" != "0" ] && read -p "按回车返回..."
-    done
+    else
+        case "$MENU_CHOICE" in
+            3) fresh_install ;;
+            7) enable_bbr ;;
+            8) uninstall_singbox ;;
+            9) realm_menu ;;
+            0) exit 0 ;;
+            *) echo -e "${RED}选择无效！${PLAIN}"; sleep 1; start_menu ;;
+        esac
+    fi
 }
 
-main
+start_menu
