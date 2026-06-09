@@ -3,11 +3,11 @@
 # ==========================================
 # Sing-box 五协议终极版 (动态分区面板)
 # 包含: VLESS-REALITY, AnyTLS, Any-Reality, Hy2, TUIC
-# 特性: 一键脚本升级 / 随机端口 / 证书双模 / 分区菜单
-# 增强: 内置 REALITY 伪装域名无损修改 / 终端高清晰二维码生成
+# 特性: 一键脚本升级 / 随机端口 / 证书双模 / 分区菜单 / 中转支持
+# 增强: 内置 REALITY 伪装域名无损修改 / 终端高清晰二维码生成 / 动态节点命名
 # ==========================================
 
-SCRIPT_URL="https://raw.githubusercontent.com/JBl9527/singbox-all/main/install.sh"
+SCRIPT_URL="https://raw.githubusercontent.com/JBl9527/sing-box-all/main/install.sh"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -114,6 +114,7 @@ REALITY_PRIVATE="${REALITY_PRIVATE}"
 REALITY_PUBLIC="${REALITY_PUBLIC}"
 REALITY_SHORT_ID="${REALITY_SHORT_ID}"
 REALITY_DEST="${REALITY_DEST}"
+RELAY_IP="${RELAY_IP}"
 EOF
 }
 
@@ -199,6 +200,14 @@ fresh_install() {
         PADDING_SCHEME_JSON='"stop=8", "0=30-30", "1=100-400", "2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000", "3=9-9,500-1000", "4=500-1000", "5=500-1000", "6=500-1000", "7=500-1000"'
     else PADDING_SCHEME_JSON="$CUSTOM_PADDING"; fi
     
+    echo -e "\n${YELLOW}=== 5. 中转节点(Relay)配置 ===${PLAIN}"
+    read -p "是否使用国内/其他中转机接入本节点？(y/N): " USE_RELAY
+    if [[ "$USE_RELAY" =~ ^[Yy]$ ]]; then
+        read -p "请输入中转机的 IP 地址或域名: " RELAY_IP
+    else
+        RELAY_IP=""
+    fi
+
     echo -e "\n${GREEN}正在安装基础依赖组件...${PLAIN}\n"
     apt-get update -y > /dev/null 2>&1
     apt-get install -y curl wget jq openssl socat uuid-runtime cron iptables qrencode > /dev/null 2>&1
@@ -373,8 +382,8 @@ After=network.target nss-lookup.target
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 ExecStart=$SING_BOX_BIN run -c $CONFIG_DIR/config.json
-\${IPTABLES_START}
-\${IPTABLES_STOP}
+${IPTABLES_START}
+${IPTABLES_STOP}
 Restart=on-failure
 RestartSec=10s
 LimitNOFILE=infinity
@@ -413,8 +422,9 @@ modify_parameters() {
     echo -e "5. 修改 TUIC v5 端口 (当前: $PORT_TUIC)"
     echo -e "6. 修改 AnyTLS/Any-Reality Padding Scheme"
     echo -e "7. ${YELLOW}修改 REALITY 伪装域名 (当前: $REALITY_DEST)${PLAIN}"
+    echo -e "8. ${YELLOW}修改 中转 IP 地址 (当前: ${RELAY_IP:-未设置})${PLAIN}"
     echo -e "0. 返回主菜单"
-    read -p "请选择 [0-7]: " MOD_CHOICE
+    read -p "请选择 [0-8]: " MOD_CHOICE
 
     case "$MOD_CHOICE" in
         1) read -p "新 REALITY 端口: " NEW_PORT; [ -n "$NEW_PORT" ] && PORT_REALITY=$NEW_PORT ;;
@@ -431,6 +441,7 @@ modify_parameters() {
            else
                echo -e "${RED}无效输入，保持原样。${PLAIN}"; sleep 1; modify_parameters; return
            fi ;;
+        8) read -p "请输入新的中转 IP (留空则清除): " NEW_RELAY; RELAY_IP=$NEW_RELAY ;;
         0) start_menu; return ;;
         *) echo -e "${RED}无效！${PLAIN}"; sleep 1; modify_parameters; return ;;
     esac
@@ -448,21 +459,36 @@ show_links() {
     check_deps_extra
     get_public_ip
 
+    # 自动检测判定：如果用户设置了中转 IP 则使用中转，否则使用 VPS 直连 IP
+    if [ -n "$RELAY_IP" ]; then
+        DISPLAY_IP="$RELAY_IP"
+    else
+        DISPLAY_IP="$PUBLIC_IP"
+    fi
+
     local FINAL_DEST=${REALITY_DEST:-"www.microsoft.com"}
     INSECURE_FLAG="0"
     if [ "$CERT_CHOICE" == "1" ]; then INSECURE_FLAG="1"; fi
 
-    VLESS_LINK="vless://${UUID_REALITY}@${PUBLIC_IP}:${PORT_REALITY}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${FINAL_DEST}&fp=chrome&pbk=${REALITY_PUBLIC}&sid=${REALITY_SHORT_ID}&type=tcp&headerType=none#SBA-REALITY"
+    VLESS_LINK="vless://${UUID_REALITY}@${DISPLAY_IP}:${PORT_REALITY}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${FINAL_DEST}&fp=chrome&pbk=${REALITY_PUBLIC}&sid=${REALITY_SHORT_ID}&type=tcp&headerType=none#${DISPLAY_IP}-VLESS-REALITY"
+    
     HY2_PORT_DISPLAY=${PORT_HY2}
     if [ -n "$PORT_HY2_RANGE" ]; then HY2_PORT_DISPLAY=${PORT_HY2_RANGE/-/:}; fi
-    HY2_LINK="hy2://${PASS_HY2}@${PUBLIC_IP}:${HY2_PORT_DISPLAY}?insecure=${INSECURE_FLAG}&sni=${DOMAIN}#SBA-Hy2"
-    TUIC_LINK="tuic://${UUID_TUIC}:${PASS_TUIC}@${PUBLIC_IP}:${PORT_TUIC}?sni=${DOMAIN}&alpn=h3&allow_insecure=${INSECURE_FLAG}#SBA-TUIC"
-    ANYTLS_LINK="anytls://${PASS_ANYTLS}@${PUBLIC_IP}:${PORT_ANYTLS}?security=tls&sni=${DOMAIN}&fp=chrome&alpn=http%2F1.1&insecure=${INSECURE_FLAG}&allowInsecure=${INSECURE_FLAG}&type=tcp&headerType=none#SBA-AnyTLS"
-    ANYREALITY_LINK="anytls://${PASS_ANYREALITY}@${PUBLIC_IP}:${PORT_ANYREALITY}?security=reality&sni=${FINAL_DEST}&fp=chrome&pbk=${REALITY_PUBLIC}&sid=${REALITY_SHORT_ID}&type=tcp&headerType=none#SBA-AnyReality"
+    HY2_LINK="hy2://${PASS_HY2}@${DISPLAY_IP}:${HY2_PORT_DISPLAY}?insecure=${INSECURE_FLAG}&sni=${DOMAIN}#${DISPLAY_IP}-Hysteria2"
+    
+    TUIC_LINK="tuic://${UUID_TUIC}:${PASS_TUIC}@${DISPLAY_IP}:${PORT_TUIC}?sni=${DOMAIN}&alpn=h3&allow_insecure=${INSECURE_FLAG}#${DISPLAY_IP}-TUIC"
+    
+    ANYTLS_LINK="anytls://${PASS_ANYTLS}@${DISPLAY_IP}:${PORT_ANYTLS}?security=tls&sni=${DOMAIN}&fp=chrome&alpn=http%2F1.1&insecure=${INSECURE_FLAG}&allowInsecure=${INSECURE_FLAG}&type=tcp&headerType=none#${DISPLAY_IP}-AnyTLS"
+    
+    ANYREALITY_LINK="anytls://${PASS_ANYREALITY}@${DISPLAY_IP}:${PORT_ANYREALITY}?security=reality&sni=${FINAL_DEST}&fp=chrome&pbk=${REALITY_PUBLIC}&sid=${REALITY_SHORT_ID}&type=tcp&headerType=none#${DISPLAY_IP}-AnyReality"
 
     clear
     echo -e "${CYAN}===========================================${PLAIN}"
     echo -e "${YELLOW}↓↓↓ 您的当前核心节点一键分享链接 ↓↓↓${PLAIN}\n"
+    
+    if [ -n "$RELAY_IP" ]; then
+        echo -e "${YELLOW}>>> 当前已开启中转模式，流量将通过: $RELAY_IP 转发 <<<${PLAIN}\n"
+    fi
     
     echo -e "${GREEN}[1] VLESS + REALITY (常规抗封锁):${PLAIN}\n${VLESS_LINK}\n"
     echo -e "${GREEN}[2] 标准 AnyTLS (需真实域名):${PLAIN}\n${ANYTLS_LINK}\n"
@@ -529,7 +555,7 @@ start_menu() {
         echo -e "${GREEN}3.${PLAIN} 强制彻底重装 Sing-box (清空并重新配置)"
         echo -e "------------------------------------------"
         echo -e "${YELLOW}[ 配置与管理 ]${PLAIN}"
-        echo -e "${GREEN}4.${PLAIN} 动态修改端口、${YELLOW}REALITY伪装域名${PLAIN}等高级参数"
+        echo -e "${GREEN}4.${PLAIN} 动态修改端口、${YELLOW}中转IP${PLAIN}、伪装域名等高级参数"
         echo -e "${GREEN}5.${PLAIN} 独立申请或修复安全证书"
         echo -e "${GREEN}6.${PLAIN} 查看所有节点并${YELLOW}一键生成终端二维码${PLAIN}"
         echo -e "${GREEN}7.${PLAIN} 一键开启 BBR 网络加速机制"
