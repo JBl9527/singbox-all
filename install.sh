@@ -140,14 +140,11 @@ update_script() {
     start_menu
 }
 
-# 【修复二】快捷命令生成，直接复制本地脚本，不再从 Github 拉取原版
-# 【修复二】快捷命令生成，直接复制本地脚本，不再从 Github 拉取原版
+# 【修复二】快捷命令生成，直接复制本地脚本，不再从 Github 拉取原版 (已修复匹配逻辑)
 install_sba_shortcut() {
-    # 修复：去掉了星号通配符，只排除纯粹的 bash/sh 进程，不再误杀 .sh 结尾的文件
     if [ -f "$0" ] && [ "$0" != "bash" ] && [ "$0" != "sh" ]; then
         cp -f "$0" /usr/bin/sba
         chmod +x /usr/bin/sba
-        echo -e "${GREEN}✔ 已自动配置快捷命令！以后随时输入 sba 即可呼出菜单。${PLAIN}"
     else
         echo -e "${YELLOW}提示：建议将本脚本文件直接保存到 /usr/bin/sba 以实现快捷呼出。${PLAIN}"
     fi
@@ -761,4 +758,6 @@ start_menu() {
     fi
 }
 
+# 脚本底部：先生成快捷命令，再启动菜单
+install_sba_shortcut
 start_menu
