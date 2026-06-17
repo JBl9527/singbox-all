@@ -1,3 +1,4 @@
+cat > /usr/bin/sba << 'EOF'
 #!/bin/bash
 
 # ==========================================
@@ -140,13 +141,10 @@ update_script() {
     start_menu
 }
 
-# 【修复二】快捷命令生成，直接复制本地脚本，不再从 Github 拉取原版 (已修复匹配逻辑)
+# 【修复二】简化快捷命令生成逻辑，因为现在强制写入 /usr/bin/sba
 install_sba_shortcut() {
-    if [ -f "$0" ] && [ "$0" != "bash" ] && [ "$0" != "sh" ]; then
-        cp -f "$0" /usr/bin/sba
-        chmod +x /usr/bin/sba
-    else
-        echo -e "${YELLOW}提示：建议将本脚本文件直接保存到 /usr/bin/sba 以实现快捷呼出。${PLAIN}"
+    if [ ! -x "/usr/bin/sba" ]; then
+        chmod +x /usr/bin/sba 2>/dev/null
     fi
 }
 
@@ -167,7 +165,6 @@ silent_update_core() {
     rm -rf sing-box.tar.gz sing-box-${LATEST_VERSION}-linux-${DL_ARCH}
     systemctl restart sing-box
     echo -e "${GREEN}✔ Sing-box 核心已成功更新至 v${LATEST_VERSION}！${PLAIN}"
-    install_sba_shortcut
     sleep 3
     start_menu
 }
@@ -265,7 +262,6 @@ fresh_install() {
     save_config
     generate_config_json
     configure_systemd
-    install_sba_shortcut
     show_links
 }
 
@@ -506,7 +502,6 @@ uninstall_singbox() {
     fi
     start_menu
 }
-
 
 # ================= Realm 端口转发独立模块 =================
 
@@ -758,6 +753,8 @@ start_menu() {
     fi
 }
 
-# 脚本底部：先生成快捷命令，再启动菜单
 install_sba_shortcut
 start_menu
+EOF
+chmod +x /usr/bin/sba
+sba
