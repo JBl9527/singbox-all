@@ -150,6 +150,7 @@ install_sba_shortcut() {
 
 silent_update_core() {
     clear
+    check_deps_extra # 修复：加入依赖检查，防止 jq 缺失导致获取版本号失败
     echo -e "${YELLOW}正在检测并下载最新版 Sing-box 核心...${PLAIN}"
     LATEST_VERSION=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r .tag_name | sed 's/v//')
     ARCH=$(uname -m)
@@ -367,10 +368,15 @@ EOF
 }
 
 configure_systemd() {
-    IPTABLES_START=""; IPTABLES_STOP=""
+    IPTABLES_START=""
+    IPTABLES_STOP=""
+    # 修复：Systemd 配置文件不支持 \n 转义，必须使用物理换行。
     if [ -n "$PORT_HY2_RANGE" ]; then
-        IPTABLES_START="ExecStartPost=-/sbin/iptables -t nat -A PREROUTING -p udp --dport $PORT_HY2_RANGE -j REDIRECT --to-ports $PORT_HY2\nExecStartPost=-/sbin/ip6tables -t nat -A PREROUTING -p udp --dport $PORT_HY2_RANGE -j REDIRECT --to-ports $PORT_HY2"
-        IPTABLES_STOP="ExecStopPost=-/sbin/iptables -t nat -D PREROUTING -p udp --dport $PORT_HY2_RANGE -j REDIRECT --to-ports $PORT_HY2\nExecStopPost=-/sbin/ip6tables -t nat -D PREROUTING -p udp --dport $PORT_HY2_RANGE -j REDIRECT --to-ports $PORT_HY2"
+        IPTABLES_START="ExecStartPost=-/sbin/iptables -t nat -A PREROUTING -p udp --dport $PORT_HY2_RANGE -j REDIRECT --to-ports $PORT_HY2
+ExecStartPost=-/sbin/ip6tables -t nat -A PREROUTING -p udp --dport $PORT_HY2_RANGE -j REDIRECT --to-ports $PORT_HY2"
+        
+        IPTABLES_STOP="ExecStopPost=-/sbin/iptables -t nat -D PREROUTING -p udp --dport $PORT_HY2_RANGE -j REDIRECT --to-ports $PORT_HY2
+ExecStopPost=-/sbin/ip6tables -t nat -D PREROUTING -p udp --dport $PORT_HY2_RANGE -j REDIRECT --to-ports $PORT_HY2"
     fi
 
     cat > /etc/systemd/system/sing-box.service <<EOF
