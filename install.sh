@@ -131,7 +131,6 @@ REALITY_DEST="${REALITY_DEST}"
 EOF
 }
 
-# 【修复一】禁用官方更新，防止覆盖丢失融合版脚本
 update_script() {
     clear
     echo -e "${RED}⚠️ 注意：当前为您定制的 Sing-box + Realm 终极融合版！${PLAIN}"
@@ -141,7 +140,6 @@ update_script() {
     start_menu
 }
 
-# 【修复二】简化快捷命令生成逻辑，因为现在强制写入 /usr/bin/sba
 install_sba_shortcut() {
     if [ ! -x "/usr/bin/sba" ]; then
         chmod +x /usr/bin/sba 2>/dev/null
@@ -150,7 +148,7 @@ install_sba_shortcut() {
 
 silent_update_core() {
     clear
-    check_deps_extra # 修复：加入依赖检查，防止 jq 缺失导致获取版本号失败
+    check_deps_extra
     echo -e "${YELLOW}正在检测并下载最新版 Sing-box 核心...${PLAIN}"
     LATEST_VERSION=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r .tag_name | sed 's/v//')
     ARCH=$(uname -m)
@@ -370,7 +368,6 @@ EOF
 configure_systemd() {
     IPTABLES_START=""
     IPTABLES_STOP=""
-    # 修复：Systemd 配置文件不支持 \n 转义，必须使用物理换行。
     if [ -n "$PORT_HY2_RANGE" ]; then
         IPTABLES_START="ExecStartPost=-/sbin/iptables -t nat -A PREROUTING -p udp --dport $PORT_HY2_RANGE -j REDIRECT --to-ports $PORT_HY2
 ExecStartPost=-/sbin/ip6tables -t nat -A PREROUTING -p udp --dport $PORT_HY2_RANGE -j REDIRECT --to-ports $PORT_HY2"
