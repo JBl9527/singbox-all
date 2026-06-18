@@ -1,4 +1,3 @@
-cat > /usr/bin/sba << 'EOF'
 #!/bin/bash
 
 # ==========================================
@@ -105,7 +104,8 @@ generate_random_ports() {
 }
 
 save_config() {
-    cat > "$CONF_FILE" <<EOF
+    # 修复：使用专用的唯一结束标记 EOF_SBA_CONF，防止嵌套截断
+    cat > "$CONF_FILE" << EOF_SBA_CONF
 CERT_CHOICE="${CERT_CHOICE}"
 DOMAIN="${DOMAIN}"
 ACME_EMAIL="${ACME_EMAIL}"
@@ -128,7 +128,7 @@ REALITY_PRIVATE="${REALITY_PRIVATE}"
 REALITY_PUBLIC="${REALITY_PUBLIC}"
 REALITY_SHORT_ID="${REALITY_SHORT_ID}"
 REALITY_DEST="${REALITY_DEST}"
-EOF
+EOF_SBA_CONF
 }
 
 update_script() {
@@ -325,7 +325,7 @@ standalone_cert_manager() {
 
 generate_config_json() {
     local FINAL_DEST=${REALITY_DEST:-"www.microsoft.com"}
-    cat > "$CONFIG_DIR/config.json" <<EOF
+    cat > "$CONFIG_DIR/config.json" << EOF_SINGBOX_JSON
 {
   "log": { "level": "info", "timestamp": true },
   "inbounds": [
@@ -362,7 +362,7 @@ generate_config_json() {
   ],
   "outbounds": [ { "type": "direct", "tag": "direct" }, { "type": "block", "tag": "block" } ]
 }
-EOF
+EOF_SINGBOX_JSON
 }
 
 configure_systemd() {
@@ -376,7 +376,7 @@ ExecStartPost=-/sbin/ip6tables -t nat -A PREROUTING -p udp --dport $PORT_HY2_RAN
 ExecStopPost=-/sbin/ip6tables -t nat -D PREROUTING -p udp --dport $PORT_HY2_RANGE -j REDIRECT --to-ports $PORT_HY2"
     fi
 
-    cat > /etc/systemd/system/sing-box.service <<EOF
+    cat > /etc/systemd/system/sing-box.service << EOF_SINGBOX_SERVICE
 [Unit]
 Description=Sing-box Service
 After=network.target nss-lookup.target
@@ -393,7 +393,7 @@ LimitNOFILE=infinity
 
 [Install]
 WantedBy=multi-user.target
-EOF
+EOF_SINGBOX_SERVICE
 
     systemctl daemon-reload
     systemctl enable sing-box > /dev/null 2>&1
@@ -515,12 +515,12 @@ get_realm_status() {
 install_realm() {
     echo -e "${YELLOW}>>> 正在部署 Realm 转发服务...${PLAIN}"
     mkdir -p "$REALM_DIR" "$REALM_CONF_DIR"
-    [ ! -f "$REALM_CONF_FILE" ] && cat <<EOF > "$REALM_CONF_FILE"
+    [ ! -f "$REALM_CONF_FILE" ] && cat << EOF_REALM_BASE > "$REALM_CONF_FILE"
 [network]
 no_tcp = false
 use_udp = true
 
-EOF
+EOF_REALM_BASE
 
     local version=$(curl -s https://api.github.com/repos/zhboner/realm/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
     [ -z "$version" ] && version="v2.6.0"
@@ -536,7 +536,7 @@ EOF
     tar -xzf /tmp/realm.tar.gz -C "$REALM_DIR" && rm -f /tmp/realm.tar.gz
     chmod +x "$REALM_BIN"
 
-    cat <<EOF > "$REALM_SERVICE_FILE"
+    cat << EOF_REALM_SERVICE > "$REALM_SERVICE_FILE"
 [Unit]
 Description=Realm Forwarding Service
 After=network-online.target
@@ -551,7 +551,7 @@ ExecStart=${REALM_BIN} -c ${REALM_CONF_FILE}
 
 [Install]
 WantedBy=multi-user.target
-EOF
+EOF_REALM_SERVICE
     systemctl daemon-reload; systemctl enable realm >/dev/null 2>&1; systemctl restart realm
     echo -e "${GREEN}✔ Realm 转发服务安装完成并已启动！${PLAIN}"
     sleep 2
@@ -570,13 +570,13 @@ realm_add_forward() {
     protocol=${protocol:-Realm}
     node_name="${PUBLIC_IP}-${protocol}"
 
-    cat <<EOF >> "$REALM_CONF_FILE"
+    cat << EOF_REALM_ADD >> "$REALM_CONF_FILE"
 
 # 节点名称: $node_name
 [[endpoints]]
 listen = "[::]:$lp"
 remote = "$rip:$rp"
-EOF
+EOF_REALM_ADD
     systemctl restart realm
     echo -e "${GREEN}✔ 转发规则添加成功！${PLAIN}"
     echo -e "自动命名节点: ${YELLOW}${node_name}${PLAIN}  |  本机中转端口: ${YELLOW}${lp}${PLAIN}"
@@ -599,13 +599,13 @@ realm_add_range() {
     local rp=$rbp
     for ((p=$sp; p<=$ep; p++)); do
         if ! grep -q "listen = \"[::]:$p\"" "$REALM_CONF_FILE"; then
-            cat <<EOF >> "$REALM_CONF_FILE"
+            cat << EOF_REALM_RANGE >> "$REALM_CONF_FILE"
 
 # 节点名称: ${PUBLIC_IP}-${protocol}-端口${p}
 [[endpoints]]
 listen = "[::]:$p"
 remote = "$rip:$rp"
-EOF
+EOF_REALM_RANGE
         fi
         ((rp++))
     done
@@ -632,23 +632,23 @@ realm_delete_forward() {
     read -p "请输入要删除的规则序号 (输入 0 取消): " c
     if [[ "$c" =~ ^[0-9]+$ ]] && [ "$c" -ge 1 ] && [ "$c" -le "${#listens[@]}" ]; then
         cp "$REALM_CONF_FILE" "${REALM_CONF_FILE}.bak"
-        cat <<EOF > "$REALM_CONF_FILE"
+        cat << EOF_REALM_DEL_BASE > "$REALM_CONF_FILE"
 [network]
 no_tcp = false
 use_udp = true
 
-EOF
+EOF_REALM_DEL_BASE
         local del_idx=$((c-1))
         for ((i=0; i<${#listens[@]}; i++)); do
             if [ $i -ne $del_idx ]; then
                 local p_remark=${remarks[i]:-"自动重写节点"}
-                cat <<EOF >> "$REALM_CONF_FILE"
+                cat << EOF_REALM_DEL_LOOP >> "$REALM_CONF_FILE"
 
 # 节点名称: ${p_remark}
 [[endpoints]]
 listen = "${listens[i]}"
 remote = "${remotes[i]}"
-EOF
+EOF_REALM_DEL_LOOP
             fi
         done
         systemctl restart realm
@@ -758,6 +758,3 @@ start_menu() {
 
 install_sba_shortcut
 start_menu
-EOF
-chmod +x /usr/bin/sba
-sba
