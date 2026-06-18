@@ -129,7 +129,6 @@ REALITY_PUBLIC="${REALITY_PUBLIC}"
 REALITY_SHORT_ID="${REALITY_SHORT_ID}"
 REALITY_DEST="${REALITY_DEST}"
 EOF
-}
 
 # 【修复一】禁用官方更新，防止覆盖丢失融合版脚本
 update_script() {
