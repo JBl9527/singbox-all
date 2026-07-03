@@ -183,8 +183,8 @@ fresh_install() {
     PORT_TUIC=${PORT_TUIC:-$RND_TUIC}
 
     echo -e "\n${YELLOW}=== 3. REALITY 伪装域名配置 ===${PLAIN}"
-    read -p "请输入 REALITY 伪装目标域名 [默认: www.microsoft.com]: " INPUT_DEST
-    REALITY_DEST=${INPUT_DEST:-"www.microsoft.com"}
+    read -p "请输入 REALITY 伪装目标域名 [默认: addons.mozilla.org]: " INPUT_DEST
+    REALITY_DEST=${INPUT_DEST:-"addons.mozilla.org"}
 
     echo -e "\n${YELLOW}=== 4. AnyTLS Padding 设置 ===${PLAIN}"
     read -p "请输入自定义 padding (直接回车使用内置配置): " CUSTOM_PADDING
