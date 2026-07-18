@@ -25,7 +25,7 @@ fi
 
 # --- 核心：自动生成 sba 本地快捷指令 ---
 # 当你用 bash <(curl...) 执行时，脚本会自动把最新代码下载到本地
-if [ ! -f "/usr/bin/sba" ] || [[ "$0" != "/usr/bin/sba" && "$0" != "-bash" ]]; then
+if [ ! -f "/usr/bin/sba" ] || [[ "$0" != "/usr/bin/sba" && "$0" != "-bash" && "$0" != "bash" ]]; then
     curl -fsSL -o /usr/bin/sba "https://raw.githubusercontent.com/JBl9527/singbox-all/main/install.sh"
     chmod +x /usr/bin/sba
 fi
@@ -134,7 +134,7 @@ silent_update_core() {
     
     systemctl stop sing-box > /dev/null 2>&1
     tar -xzf sing-box.tar.gz
-    mv sing-box-${LATEST_VERSION}-linux-${DL_ARCH}/sing-box $SING_BOX_BIN
+    mv sing-box-${LATEST_VERSION}-linux-${DL_ARCH}/sing-box$SING_BOX_BIN
     chmod +x $SING_BOX_BIN
     rm -rf sing-box.tar.gz sing-box-${LATEST_VERSION}-linux-${DL_ARCH}
     systemctl restart sing-box
@@ -202,7 +202,7 @@ fresh_install() {
     case "$ARCH" in x86_64) DL_ARCH="amd64" ;; aarch64) DL_ARCH="arm64" ;; *) exit 1 ;; esac
     wget -qO sing-box.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v${LATEST_VERSION}/sing-box-${LATEST_VERSION}-linux-${DL_ARCH}.tar.gz"
     tar -xzf sing-box.tar.gz
-    mv sing-box-${LATEST_VERSION}-linux-${DL_ARCH}/sing-box $SING_BOX_BIN
+    mv sing-box-${LATEST_VERSION}-linux-${DL_ARCH}/sing-box$SING_BOX_BIN
     chmod +x $SING_BOX_BIN
     rm -rf sing-box.tar.gz sing-box-${LATEST_VERSION}-linux-${DL_ARCH}
 
@@ -337,8 +337,8 @@ configure_systemd() {
     IPTABLES_START=""
     IPTABLES_STOP=""
     if [ -n "$PORT_HY2_RANGE" ]; then
-        IPTABLES_START="ExecStartPost=-/sbin/iptables -t nat -A PREROUTING -p udp --dport $PORT_HY2_RANGE -j REDIRECT --to-ports $PORT_HY2\nExecStartPost=-/sbin/ip6tables -t nat -A PREROUTING -p udp --dport $PORT_HY2_RANGE -j REDIRECT --to-ports $PORT_HY2"
-        IPTABLES_STOP="ExecStopPost=-/sbin/iptables -t nat -D PREROUTING -p udp --dport $PORT_HY2_RANGE -j REDIRECT --to-ports $PORT_HY2\nExecStopPost=-/sbin/ip6tables -t nat -D PREROUTING -p udp --dport $PORT_HY2_RANGE -j REDIRECT --to-ports $PORT_HY2"
+        IPTABLES_START="ExecStartPost=-/sbin/iptables -t nat -A PREROUTING -p udp --dport $PORT_HY2_RANGE -j REDIRECT --to-ports$PORT_HY2\nExecStartPost=-/sbin/ip6tables -t nat -A PREROUTING -p udp --dport $PORT_HY2_RANGE -j REDIRECT --to-ports$PORT_HY2"
+        IPTABLES_STOP="ExecStopPost=-/sbin/iptables -t nat -D PREROUTING -p udp --dport $PORT_HY2_RANGE -j REDIRECT --to-ports$PORT_HY2\nExecStopPost=-/sbin/ip6tables -t nat -D PREROUTING -p udp --dport $PORT_HY2_RANGE -j REDIRECT --to-ports$PORT_HY2"
     fi
 
     # 替换实际物理换行来解决 systemd 不支持 \n 的问题
@@ -353,9 +353,8 @@ After=network.target nss-lookup.target
 [Service]
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-ExecStart=$SING_BOX_BIN run -c $CONFIG_DIR/config.json
-${IPTABLES_START}
-${IPTABLES_STOP}
+ExecStart=$SING_BOX_BIN run -c$CONFIG_DIR/config.json
+${IPTABLES_START}${IPTABLES_STOP}
 Restart=on-failure
 RestartSec=10s
 LimitNOFILE=infinity
@@ -417,7 +416,7 @@ show_links() {
     HY2_PORT_DISPLAY=${PORT_HY2}; if [ -n "$PORT_HY2_RANGE" ]; then HY2_PORT_DISPLAY=${PORT_HY2_RANGE/-/:}; fi
     HY2_LINK="hy2://${PASS_HY2}@${PUBLIC_IP}:${HY2_PORT_DISPLAY}?insecure=${INSECURE_FLAG}&sni=${DOMAIN}#${PUBLIC_IP}-Hysteria2"
     TUIC_LINK="tuic://${UUID_TUIC}:${PASS_TUIC}@${PUBLIC_IP}:${PORT_TUIC}?sni=${DOMAIN}&alpn=h3&allow_insecure=${INSECURE_FLAG}#${PUBLIC_IP}-TUIC"
-    ANYTLS_LINK="anytls://${PASS_ANYTLS}@${PUBLIC_IP}:${PORT_ANYTLS}?security=tls&sni=${DOMAIN}&fp=chrome&alpn=http%2F1.1&insecure=${INSECURE_FLAG}&allowInsecure=${INSECURE_FLAG}&type=tcp&headerType=none#${PUBLIC_IP}-AnyTLS"
+    ANYTLS_LINK="anytls://${PASS_ANYTLS}@${PUBLIC_IP}:${PORT_ANYTLS}?security=tls&sni=${DOMAIN}&fp=chrome&alpn=http\%2F1.1&insecure=${INSECURE_FLAG}&allowInsecure=${INSECURE_FLAG}&type=tcp&headerType=none#${PUBLIC_IP}-AnyTLS"
     ANYREALITY_LINK="anytls://${PASS_ANYREALITY}@${PUBLIC_IP}:${PORT_ANYREALITY}?security=reality&sni=${FINAL_DEST}&fp=chrome&pbk=${REALITY_PUBLIC}&sid=${REALITY_SHORT_ID}&type=tcp&headerType=none#${PUBLIC_IP}-AnyReality"
 
     clear
@@ -453,6 +452,41 @@ uninstall_singbox() {
     start_menu
 }
 
+# ================= 脚本更新模块 =================
+update_script() {
+    clear
+    echo -e "${YELLOW}正在从 GitHub 拉取最新版主脚本...${PLAIN}"
+    
+    # 获取脚本的实际路径
+    local SCRIPT_PATH=$(readlink -f "$0")
+    
+    # 如果是通过 bash <(curl ...) 直接执行，可能获取不到真实路径，降级覆盖 /usr/bin/sba
+    if [[ "$SCRIPT_PATH" == *"/bash" ]] || [[ "$SCRIPT_PATH" == *"-bash" ]]; then
+        SCRIPT_PATH="/usr/bin/sba"
+    fi
+
+    # 下载新版本到临时文件
+    if curl -fsSL -o "/tmp/sba_update.sh" "https://raw.githubusercontent.com/JBl9527/singbox-all/main/install.sh"; then
+        chmod +x "/tmp/sba_update.sh"
+        mv -f "/tmp/sba_update.sh" "$SCRIPT_PATH"
+        
+        # 确保系统快捷命令也同时更新
+        if [[ "$SCRIPT_PATH" != "/usr/bin/sba" ]]; then
+            cp -f "$SCRIPT_PATH" "/usr/bin/sba"
+            chmod +x "/usr/bin/sba"
+        fi
+        
+        echo -e "${GREEN}✅ 主脚本升级成功！正在重新加载...${PLAIN}"
+        sleep 2
+        # 使用 exec 替换当前 bash 进程，实现无缝重启菜单
+        exec bash "$SCRIPT_PATH"
+    else
+        echo -e "${RED}❌ 升级失败！请检查网络或确认 GitHub RAW 链接是否可访问。${PLAIN}"
+        sleep 2
+        start_menu
+    fi
+}
+
 # ================= 首页主菜单 =================
 start_menu() {
     clear
@@ -467,51 +501,4 @@ start_menu() {
         echo -e "${YELLOW}[ Sing-box 节点选项 ]${PLAIN}"
         echo -e "${GREEN}1.${PLAIN} 一键无损更新 Sing-box 核心"
         echo -e "${GREEN}2.${PLAIN} 强制彻底重装 Sing-box"
-        echo -e "${GREEN}3.${PLAIN} 动态修改端口、伪装域名等参数"
-        echo -e "${GREEN}4.${PLAIN} 独立申请或修复安全证书"
-        echo -e "${GREEN}5.${PLAIN} 查看所有节点并生成终端二维码"
-        echo -e "${GREEN}6.${PLAIN} 一键开启 BBR 网络加速机制"
-        echo -e "${GREEN}7.${PLAIN} 彻底卸载 Sing-box"
-    else
-        echo -e "系统状态: ${YELLOW}未安装${PLAIN}   |   BBR加速状态: ${BBR_TXT}"
-        echo -e "------------------------------------------"
-        echo -e "${YELLOW}[ Sing-box 节点选项 ]${PLAIN}"
-        echo -e "${GREEN}2.${PLAIN} 全新安装 Sing-box"
-        echo -e "${GREEN}6.${PLAIN} 一键开启 BBR 网络加速机制"
-        echo -e "${GREEN}7.${PLAIN} 彻底卸载 Sing-box"
-    fi
-    echo -e "------------------------------------------"
-    echo -e "${YELLOW}[ 高级扩展模块 ]${PLAIN}"
-    echo -e "${GREEN}9.${PLAIN} ➡️ ${YELLOW}端口转发管理 (远程动态调用 Realm)${PLAIN}"
-    echo -e "${GREEN}0.${PLAIN} 退出脚本"
-    echo -e "${CYAN}==========================================${PLAIN}"
-    read -p "请输入选项: " MENU_CHOICE
-    
-    case "$MENU_CHOICE" in
-        1) [ -f "$CONF_FILE" ] && silent_update_core || start_menu ;;
-        2) fresh_install ;;
-        3) [ -f "$CONF_FILE" ] && modify_parameters || start_menu ;;
-        4) [ -f "$CONF_FILE" ] && standalone_cert_manager || start_menu ;;
-        5) [ -f "$CONF_FILE" ] && show_links || start_menu ;;
-        6) enable_bbr ;;
-        7) uninstall_singbox ;;
-        9) 
-           # --- 核心：动态调用独立的 Realm 模块 ---
-           clear
-           echo -e "${YELLOW}正在从 GitHub 拉取最新的端口转发(Realm)模块...${PLAIN}"
-           curl -fsSL -o /tmp/realm.sh "https://raw.githubusercontent.com/JBl9527/singbox-all/main/realm.sh"
-           if [ -f "/tmp/realm.sh" ]; then
-               chmod +x /tmp/realm.sh
-               bash /tmp/realm.sh
-           else
-               echo -e "${RED}拉取失败！请检查网络或 GitHub 仓库地址是否正确。${PLAIN}"
-               sleep 2
-           fi
-           start_menu 
-           ;;
-        0) exit 0 ;;
-        *) start_menu ;;
-    esac
-}
-
-start_menu
+        echo -e "${GREEN}3.${PLAIN}
