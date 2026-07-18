@@ -25,7 +25,7 @@ fi
 
 # --- 核心：自动生成 sba 本地快捷指令 ---
 if [ ! -f "/usr/bin/sba" ] || [[ "$0" != "/usr/bin/sba" && "$0" != *"-bash"* && "$0" != *"bash"* ]]; then
-    curl -fsSL -o /usr/bin/sba "https://raw.githubusercontent.com/JBl9527/singbox-all/main/install.sh"
+    curl -fsSL -o /usr/bin/sba "https://raw.githubusercontent.com/JBl9527/singbox-all/main/install.sh?t=$(date +%s)"
     chmod +x /usr/bin/sba
 fi
 
@@ -512,7 +512,8 @@ update_script() {
         SCRIPT_PATH="/usr/bin/sba"
     fi
 
-    if curl -fsSL -o "/tmp/sba_update.sh" "https://raw.githubusercontent.com/JBl9527/singbox-all/main/install.sh"; then
+    # 加上时间戳绕过缓存
+    if curl -fsSL -o "/tmp/sba_update.sh" "https://raw.githubusercontent.com/JBl9527/singbox-all/main/install.sh?t=$(date +%s)"; then
         chmod +x "/tmp/sba_update.sh"
         mv -f "/tmp/sba_update.sh" "$SCRIPT_PATH"
         
@@ -580,10 +581,16 @@ start_menu() {
         9) 
            clear
            echo -e "${YELLOW}正在从 GitHub 拉取最新的端口转发(Realm)模块...${PLAIN}"
-           curl -fsSL -o /tmp/realm.sh "https://raw.githubusercontent.com/JBl9527/singbox-all/main/realm.sh"
+           # 强制绕过缓存拉取
+           curl -fsSL -o /tmp/realm.sh "https://raw.githubusercontent.com/JBl9527/singbox-all/main/realm.sh?t=$(date +%s)"
            if [ -f "/tmp/realm.sh" ]; then
                chmod +x /tmp/realm.sh
                bash /tmp/realm.sh
+               # 如果模块异常退出，暂停提示
+               if [ $? -ne 0 ]; then
+                   echo -e "\n${RED}⚠️ Realm模块异常退出，请检查上方报错！${PLAIN}"
+                   read -n 1 -s -r -p "按任意键返回主菜单..."
+               fi
            else
                echo -e "${RED}拉取失败！请检查网络或 GitHub 仓库地址是否正确。${PLAIN}"
                sleep 2
@@ -593,10 +600,16 @@ start_menu() {
         10) 
            clear
            echo -e "${YELLOW}正在从 GitHub 拉取最新的家宽接管(ISP)模块...${PLAIN}"
-           curl -fsSL -o /tmp/isp.sh "https://raw.githubusercontent.com/JBl9527/singbox-all/main/isp.sh"
+           # 强制绕过缓存拉取
+           curl -fsSL -o /tmp/isp.sh "https://raw.githubusercontent.com/JBl9527/singbox-all/main/isp.sh?t=$(date +%s)"
            if [ -f "/tmp/isp.sh" ]; then
                chmod +x /tmp/isp.sh
                bash /tmp/isp.sh
+               # 如果模块异常退出，暂停提示
+               if [ $? -ne 0 ]; then
+                   echo -e "\n${RED}⚠️ ISP接管模块异常退出，请检查上方报错！${PLAIN}"
+                   read -n 1 -s -r -p "按任意键返回主菜单..."
+               fi
            else
                echo -e "${RED}拉取失败！请确保你已将家宽接管脚本命名为 isp.sh 并上传到了 Github。${PLAIN}"
                sleep 2
@@ -609,5 +622,3 @@ start_menu() {
 }
 
 start_menu
-
-# === 脚本结束 ===
