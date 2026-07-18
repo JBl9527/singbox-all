@@ -24,8 +24,7 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 # --- 核心：自动生成 sba 本地快捷指令 ---
-# 当你用 bash <(curl...) 执行时，脚本会自动把最新代码下载到本地
-if [ ! -f "/usr/bin/sba" ] || [[ "$0" != "/usr/bin/sba" && "$0" != "-bash" && "$0" != "bash" ]]; then
+if [ ! -f "/usr/bin/sba" ] || [[ "$0" != "/usr/bin/sba" && "$0" != *"-bash"* && "$0" != *"bash"* ]]; then
     curl -fsSL -o /usr/bin/sba "https://raw.githubusercontent.com/JBl9527/singbox-all/main/install.sh"
     chmod +x /usr/bin/sba
 fi
@@ -95,7 +94,7 @@ generate_random_ports() {
 }
 
 save_config() {
-    cat > "$CONF_FILE" << EOF_SBA_CONF
+    cat > "$CONF_FILE" <<-EOF_SBA_CONF
 CERT_CHOICE="${CERT_CHOICE}"
 DOMAIN="${DOMAIN}"
 ACME_EMAIL="${ACME_EMAIL}"
@@ -194,7 +193,7 @@ fresh_install() {
     echo -e "\n${YELLOW}=== 4. AnyTLS Padding 设置 ===${PLAIN}"
     read -p "请输入自定义 padding (直接回车使用内置配置): " CUSTOM_PADDING
     if [ -z "$CUSTOM_PADDING" ]; then
-        PADDING_SCHEME_JSON='"stop=8", "0=30-30", "1=100-400", "2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000", "3=9-9,500-1000", "4=500-1000", "5=500-1000", "6=500-1000", "7=500-1000"'
+        PADDING_SCHEME_JSON="\"stop=8\", \"0=30-30\", \"1=100-400\", \"2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000\", \"3=9-9,500-1000\", \"4=500-1000\", \"5=500-1000\", \"6=500-1000\", \"7=500-1000\""
     else 
         PADDING_SCHEME_JSON="$CUSTOM_PADDING"
     fi
@@ -323,7 +322,7 @@ standalone_cert_manager() {
 
 generate_config_json() {
     local FINAL_DEST=${REALITY_DEST:-"www.microsoft.com"}
-    cat > "$CONFIG_DIR/config.json" << EOF_SINGBOX_JSON
+    cat > "$CONFIG_DIR/config.json" <<-EOF_SINGBOX_JSON
 {
   "log": { "level": "info", "timestamp": true },
   "inbounds": [
@@ -368,11 +367,10 @@ configure_systemd() {
         IPTABLES_STOP="ExecStopPost=-/sbin/iptables -t nat -D PREROUTING -p udp --dport $PORT_HY2_RANGE -j REDIRECT --to-ports $PORT_HY2\nExecStopPost=-/sbin/ip6tables -t nat -D PREROUTING -p udp --dport $PORT_HY2_RANGE -j REDIRECT --to-ports $PORT_HY2"
     fi
 
-    # 替换实际物理换行来解决 systemd 不支持 \n 的问题
     IPTABLES_START=$(echo -e "$IPTABLES_START")
     IPTABLES_STOP=$(echo -e "$IPTABLES_STOP")
 
-    cat > /etc/systemd/system/sing-box.service << EOF_SINGBOX_SERVICE
+    cat > /etc/systemd/system/sing-box.service <<-EOF_SINGBOX_SERVICE
 [Unit]
 Description=Sing-box Service
 After=network.target nss-lookup.target
@@ -508,20 +506,16 @@ update_script() {
     clear
     echo -e "${YELLOW}正在从 GitHub 拉取最新版主脚本...${PLAIN}"
     
-    # 获取脚本的实际路径
     local SCRIPT_PATH=$(readlink -f "$0")
     
-    # 如果是通过 bash <(curl ...) 直接执行，可能获取不到真实路径，降级覆盖 /usr/bin/sba
-    if [[ "$SCRIPT_PATH" == *"/bash" ]] || [[ "$SCRIPT_PATH" == *"-bash" ]]; then
+    if [[ "$SCRIPT_PATH" == *"/bash"* ]] || [[ "$SCRIPT_PATH" == *"-bash"* ]]; then
         SCRIPT_PATH="/usr/bin/sba"
     fi
 
-    # 下载新版本到临时文件
     if curl -fsSL -o "/tmp/sba_update.sh" "https://raw.githubusercontent.com/JBl9527/singbox-all/main/install.sh"; then
         chmod +x "/tmp/sba_update.sh"
         mv -f "/tmp/sba_update.sh" "$SCRIPT_PATH"
         
-        # 确保系统快捷命令也同时更新
         if [[ "$SCRIPT_PATH" != "/usr/bin/sba" ]]; then
             cp -f "$SCRIPT_PATH" "/usr/bin/sba"
             chmod +x "/usr/bin/sba"
@@ -529,10 +523,9 @@ update_script() {
         
         echo -e "${GREEN}✅ 主脚本升级成功！正在重新加载...${PLAIN}"
         sleep 2
-        # 使用 exec 替换当前 bash 进程，实现无缝重启菜单
         exec bash "$SCRIPT_PATH"
     else
-        echo -e "${RED}❌ 升级失败！请检查网络或确认 GitHub RAW 链接是否可访问。${PLAIN}"
+        echo -e "${RED}❌ 升级失败！请检查网络或确认 GitHub 链接是否可访问。${PLAIN}"
         sleep 2
         start_menu
     fi
@@ -585,7 +578,6 @@ start_menu() {
         7) uninstall_singbox ;;
         8) update_script ;;
         9) 
-           # --- 核心：动态调用独立的 Realm 模块 ---
            clear
            echo -e "${YELLOW}正在从 GitHub 拉取最新的端口转发(Realm)模块...${PLAIN}"
            curl -fsSL -o /tmp/realm.sh "https://raw.githubusercontent.com/JBl9527/singbox-all/main/realm.sh"
@@ -599,10 +591,8 @@ start_menu() {
            start_menu 
            ;;
         10) 
-           # --- 核心：动态调用独立的 家宽接管 模块 ---
            clear
            echo -e "${YELLOW}正在从 GitHub 拉取最新的家宽接管(ISP)模块...${PLAIN}"
-           # 注意：请确保你把家宽接管脚本保存为 isp.sh 并上传到了 Github
            curl -fsSL -o /tmp/isp.sh "https://raw.githubusercontent.com/JBl9527/singbox-all/main/isp.sh"
            if [ -f "/tmp/isp.sh" ]; then
                chmod +x /tmp/isp.sh
@@ -619,3 +609,5 @@ start_menu() {
 }
 
 start_menu
+
+# === 脚本结束 ===
