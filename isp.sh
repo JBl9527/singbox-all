@@ -106,7 +106,6 @@ enable_takeover() {
     
     if [ "$mode_choice" == "1" ]; then
         echo -e "\n${YELLOW}已识别到以下本机节点 (Inbounds)：${PLAIN}"
-        # 使用 jq 提取所有的 tag 并存入数组 (排除默认的 direct/block)
         mapfile -t INBOUND_TAGS < <(jq -r '.inbounds[]? | select(.tag != null and .type != "direct" and .type != "block") | .tag' "$CONFIG_FILE")
         
         if [ ${#INBOUND_TAGS[@]} -eq 0 ]; then
@@ -115,15 +114,14 @@ enable_takeover() {
             return
         fi
 
-        # 遍历数组并打印带端口的菜单
         for i in "${!INBOUND_TAGS[@]}"; do
             local pt=$(jq -r ".inbounds[] | select(.tag == \"${INBOUND_TAGS[$i]}\") | .listen_port // \"未知\"" "$CONFIG_FILE")
-            echo " [$((i+1))] ${GREEN}${INBOUND_TAGS[$i]}${PLAIN} (端口: $pt)"
+            # 【修复点1】补上 -e，让终端正常渲染颜色，而不是显示乱码
+            echo -e " [$((i+1))] ${GREEN}${INBOUND_TAGS[$i]}${PLAIN} (端口: $pt)"
         done
         
         read -p "请输入对应数字选择接管目标 [1-${#INBOUND_TAGS[@]}]: " tag_idx
         
-        # 校验输入
         if [[ ! "$tag_idx" =~ ^[0-9]+$ ]] || [ "$tag_idx" -lt 1 ] || [ "$tag_idx" -gt "${#INBOUND_TAGS[@]}" ]; then
              echo -e "${RED}输入错误，操作取消。${PLAIN}"
              sleep 2
@@ -146,17 +144,24 @@ enable_takeover() {
         return
     fi
 
-    # 备份并写入
     cp "$CONFIG_FILE" "${CONFIG_FILE}.bak_$(date +%s)"
     echo -e "\n${YELLOW}正在修改并重载 Sing-box 配置...${PLAIN}"
 
-    jq --arg tag "$RESIDENTIAL_TAG" \
+    # 【修复点2】使用 // [] 兼容处理没有 route.rules 数组的情况，避免 null 报错
+    if ! jq --arg tag "$RESIDENTIAL_TAG" \
        --argjson new_out "$outbound_json" \
        --argjson new_rule "$rule_json" \
     '
-    .outbounds = (.outbounds | map(select(.tag != $tag))) + [$new_out] |
-    .route.rules = [$new_rule] + (.route.rules | map(select(.outbound != $tag)))
-    ' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+    .outbounds = ((.outbounds // []) | map(select(.tag != $tag))) + [$new_out] |
+    .route.rules = [$new_rule] + ((.route.rules // []) | map(select(.outbound != $tag)))
+    ' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp"; then
+        echo -e "${RED}❌ jq 写入配置失败，请检查上面是否有报错信息！${PLAIN}"
+        rm -f "${CONFIG_FILE}.tmp"
+        read -n 1 -s -r -p "按任意键返回子菜单..."
+        return
+    fi
+    
+    mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
     
     if sing-box check -c "$CONFIG_FILE"; then
         systemctl restart sing-box
@@ -186,11 +191,11 @@ view_status() {
         echo -e "\n${YELLOW}当前未开启任何家宽接管配置。${PLAIN}\n"
     else
         echo -e "${GREEN}【已绑定的家宽节点信息】${PLAIN}"
-        jq -r '.outbounds[] | select(.tag == "'$RESIDENTIAL_TAG'") | 
+        jq -r '.outbounds[]? | select(.tag == "'$RESIDENTIAL_TAG'") | 
         " - 协议类型: \(.type) \n - 节点地址: \(.server):\(.server_port)"' "$CONFIG_FILE"
 
         echo -e "\n${GREEN}【被接管的本机流量】${PLAIN}"
-        jq -r '.route.rules[] | select(.outbound == "'$RESIDENTIAL_TAG'") |
+        jq -r '(.route.rules // [])[] | select(.outbound == "'$RESIDENTIAL_TAG'") |
         if .inbound then " - 已接管节点标签 (Tag): \(.inbound | join(\", \"))" else empty end,
         if .inbound_port then " - 已接管入站端口 (Port): \(.inbound_port | join(\", \"))" else empty end' "$CONFIG_FILE"
         echo ""
@@ -212,11 +217,19 @@ disable_takeover() {
 
     cp "$CONFIG_FILE" "${CONFIG_FILE}.bak_$(date +%s)"
 
-    jq --arg tag "$RESIDENTIAL_TAG" \
+    # 【修复点3】同理，移除时也增加容错处理
+    if ! jq --arg tag "$RESIDENTIAL_TAG" \
     '
-    .outbounds = (.outbounds | map(select(.tag != $tag))) |
-    .route.rules = (.route.rules | map(select(.outbound != $tag)))
-    ' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+    .outbounds = ((.outbounds // []) | map(select(.tag != $tag))) |
+    .route.rules = ((.route.rules // []) | map(select(.outbound != $tag)))
+    ' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp"; then
+         echo -e "${RED}❌ 清理配置失败。${PLAIN}"
+         rm -f "${CONFIG_FILE}.tmp"
+         read -n 1 -s -r -p "按任意键返回子菜单..."
+         return
+    fi
+    
+    mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
 
     systemctl restart sing-box
     echo -e "${GREEN}✅ 家宽接管规则已移除，Sing-box 已重启。${PLAIN}"
