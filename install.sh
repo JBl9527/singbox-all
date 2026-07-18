@@ -127,16 +127,20 @@ silent_update_core() {
     echo -e "${YELLOW}正在检测并下载最新版 Sing-box 核心...${PLAIN}"
     LATEST_VERSION=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r .tag_name | sed 's/v//')
     ARCH=$(uname -m)
-    case "$ARCH" in x86_64) DL_ARCH="amd64" ;; aarch64) DL_ARCH="arm64" ;; *) echo -e "${RED}不支持的架构${PLAIN}"; exit 1 ;; esac
+    case "$ARCH" in 
+        x86_64) DL_ARCH="amd64" ;; 
+        aarch64) DL_ARCH="arm64" ;; 
+        *) echo -e "${RED}不支持的架构${PLAIN}"; exit 1 ;; 
+    esac
     
     wget -qO sing-box.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v${LATEST_VERSION}/sing-box-${LATEST_VERSION}-linux-${DL_ARCH}.tar.gz"
     if [ $? -ne 0 ]; then echo -e "${RED}下载失败！${PLAIN}"; sleep 2; start_menu; return; fi
     
     systemctl stop sing-box > /dev/null 2>&1
     tar -xzf sing-box.tar.gz
-    mv sing-box-${LATEST_VERSION}-linux-${DL_ARCH}/sing-box$SING_BOX_BIN
-    chmod +x $SING_BOX_BIN
-    rm -rf sing-box.tar.gz sing-box-${LATEST_VERSION}-linux-${DL_ARCH}
+    mv "sing-box-${LATEST_VERSION}-linux-${DL_ARCH}/sing-box" "$SING_BOX_BIN"
+    chmod +x "$SING_BOX_BIN"
+    rm -rf sing-box.tar.gz "sing-box-${LATEST_VERSION}-linux-${DL_ARCH}"
     systemctl restart sing-box
     echo -e "${GREEN}✔ Sing-box 核心已成功更新至 v${LATEST_VERSION}！${PLAIN}"
     sleep 3
@@ -163,7 +167,8 @@ fresh_install() {
         read -p "请输入 CF 账号的登录邮箱: " CF_EMAIL
         read -p "请输入 CF Global API Key: " CF_KEY
     else
-        CERT_CHOICE="1"; DOMAIN="bing.com"
+        CERT_CHOICE="1"
+        DOMAIN="bing.com"
     fi
 
     generate_random_ports
@@ -190,7 +195,9 @@ fresh_install() {
     read -p "请输入自定义 padding (直接回车使用内置配置): " CUSTOM_PADDING
     if [ -z "$CUSTOM_PADDING" ]; then
         PADDING_SCHEME_JSON='"stop=8", "0=30-30", "1=100-400", "2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000", "3=9-9,500-1000", "4=500-1000", "5=500-1000", "6=500-1000", "7=500-1000"'
-    else PADDING_SCHEME_JSON="$CUSTOM_PADDING"; fi
+    else 
+        PADDING_SCHEME_JSON="$CUSTOM_PADDING"
+    fi
     
     echo -e "\n${GREEN}正在安装基础依赖组件...${PLAIN}\n"
     apt-get update -y > /dev/null 2>&1
@@ -199,12 +206,17 @@ fresh_install() {
 
     LATEST_VERSION=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r .tag_name | sed 's/v//')
     ARCH=$(uname -m)
-    case "$ARCH" in x86_64) DL_ARCH="amd64" ;; aarch64) DL_ARCH="arm64" ;; *) exit 1 ;; esac
+    case "$ARCH" in 
+        x86_64) DL_ARCH="amd64" ;; 
+        aarch64) DL_ARCH="arm64" ;; 
+        *) exit 1 ;; 
+    esac
+    
     wget -qO sing-box.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v${LATEST_VERSION}/sing-box-${LATEST_VERSION}-linux-${DL_ARCH}.tar.gz"
     tar -xzf sing-box.tar.gz
-    mv sing-box-${LATEST_VERSION}-linux-${DL_ARCH}/sing-box$SING_BOX_BIN
-    chmod +x $SING_BOX_BIN
-    rm -rf sing-box.tar.gz sing-box-${LATEST_VERSION}-linux-${DL_ARCH}
+    mv "sing-box-${LATEST_VERSION}-linux-${DL_ARCH}/sing-box" "$SING_BOX_BIN"
+    chmod +x "$SING_BOX_BIN"
+    rm -rf sing-box.tar.gz "sing-box-${LATEST_VERSION}-linux-${DL_ARCH}"
 
     if [ "$CERT_CHOICE" == "1" ]; then
         openssl req -x509 -nodes -days 3650 -newkey rsa:2048 -keyout "$CERT_DIR/server.key" -out "$CERT_DIR/server.crt" -subj "/C=US/ST=State/L=City/O=Organization/CN=$DOMAIN"
@@ -224,14 +236,17 @@ fresh_install() {
         ~/.acme.sh/acme.sh --installcert -d "$DOMAIN" --ecc --fullchain-file "$CERT_DIR/server.crt" --key-file "$CERT_DIR/server.key"
     fi
 
-    UUID_REALITY=$(uuidgen); PASS_ANYTLS=$(openssl rand -base64 12)
-    PASS_ANYREALITY=$(openssl rand -base64 12); PASS_HY2=$(openssl rand -base64 12)
-    UUID_TUIC=$(uuidgen); PASS_TUIC=$(openssl rand -base64 12)
+    UUID_REALITY=$(uuidgen)
+    PASS_ANYTLS=$(openssl rand -base64 12)
+    PASS_ANYREALITY=$(openssl rand -base64 12)
+    PASS_HY2=$(openssl rand -base64 12)
+    UUID_TUIC=$(uuidgen)
+    PASS_TUIC=$(openssl rand -base64 12)
     
-    REALITY_KEYPAIR=$($SING_BOX_BIN generate reality-keypair)
+    REALITY_KEYPAIR=$("$SING_BOX_BIN" generate reality-keypair)
     REALITY_PRIVATE=$(echo "$REALITY_KEYPAIR" | grep PrivateKey | awk '{print $2}')
     REALITY_PUBLIC=$(echo "$REALITY_KEYPAIR" | grep PublicKey | awk '{print $2}')
-    REALITY_SHORT_ID=$($SING_BOX_BIN generate rand --hex 8)
+    REALITY_SHORT_ID=$("$SING_BOX_BIN" generate rand --hex 8)
 
     save_config
     generate_config_json
@@ -258,18 +273,25 @@ standalone_cert_manager() {
     if [ "$RE_CERT_CHOICE" == "0" ]; then start_menu; return; fi
 
     if [ "$RE_CERT_CHOICE" == "2" ]; then
-        read -p "请输入域名: " NEW_DOMAIN; DOMAIN=${NEW_DOMAIN:-$DOMAIN}
-        read -p "请输入接收通知邮箱: " NEW_EMAIL; ACME_EMAIL=${NEW_EMAIL:-$ACME_EMAIL}
+        read -p "请输入域名: " NEW_DOMAIN
+        DOMAIN=${NEW_DOMAIN:-$DOMAIN}
+        read -p "请输入接收通知邮箱: " NEW_EMAIL
+        ACME_EMAIL=${NEW_EMAIL:-$ACME_EMAIL}
         CERT_CHOICE="2"
     elif [ "$RE_CERT_CHOICE" == "3" ]; then
-        read -p "请输入域名: " NEW_DOMAIN; DOMAIN=${NEW_DOMAIN:-$DOMAIN}
-        read -p "请输入 CF 账号邮箱: " NEW_CF_EMAIL; CF_EMAIL=${NEW_CF_EMAIL:-$CF_EMAIL}
-        read -p "请输入 CF API Key: " NEW_CF_KEY; CF_KEY=${NEW_CF_KEY:-$CF_KEY}
+        read -p "请输入域名: " NEW_DOMAIN
+        DOMAIN=${NEW_DOMAIN:-$DOMAIN}
+        read -p "请输入 CF 账号邮箱: " NEW_CF_EMAIL
+        CF_EMAIL=${NEW_CF_EMAIL:-$CF_EMAIL}
+        read -p "请输入 CF API Key: " NEW_CF_KEY
+        CF_KEY=${NEW_CF_KEY:-$CF_KEY}
         CERT_CHOICE="3"
     elif [ "$RE_CERT_CHOICE" == "1" ]; then
-        CERT_CHOICE="1"; DOMAIN="bing.com"
+        CERT_CHOICE="1"
+        DOMAIN="bing.com"
     else
-        start_menu; return
+        start_menu
+        return
     fi
 
     save_config
@@ -279,19 +301,24 @@ standalone_cert_manager() {
     if [ "$CERT_CHOICE" == "1" ]; then
         openssl req -x509 -nodes -days 3650 -newkey rsa:2048 -keyout "$CERT_DIR/server.key" -out "$CERT_DIR/server.crt" -subj "/C=US/ST=State/L=City/O=Organization/CN=$DOMAIN"
     elif [ "$CERT_CHOICE" == "2" ]; then
-        rm -rf ~/.acme.sh; curl -s https://get.acme.sh | sh -s email="sba_cert_${RANDOM}@gmail.com"
+        rm -rf ~/.acme.sh
+        curl -s https://get.acme.sh | sh -s email="sba_cert_${RANDOM}@gmail.com"
         ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt
         ~/.acme.sh/acme.sh --issue -d "$DOMAIN" --standalone -k ec-256 --force
         ~/.acme.sh/acme.sh --installcert -d "$DOMAIN" --ecc --fullchain-file "$CERT_DIR/server.crt" --key-file "$CERT_DIR/server.key"
     elif [ "$CERT_CHOICE" == "3" ]; then
-        rm -rf ~/.acme.sh; curl -s https://get.acme.sh | sh -s email="sba_cert_${RANDOM}@gmail.com"
+        rm -rf ~/.acme.sh
+        curl -s https://get.acme.sh | sh -s email="sba_cert_${RANDOM}@gmail.com"
         ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt
-        export CF_Key="$CF_KEY"; export CF_Email="$CF_EMAIL"
+        export CF_Key="$CF_KEY"
+        export CF_Email="$CF_EMAIL"
         ~/.acme.sh/acme.sh --issue --dns dns_cf -d "$DOMAIN" -k ec-256 --force
         ~/.acme.sh/acme.sh --installcert -d "$DOMAIN" --ecc --fullchain-file "$CERT_DIR/server.crt" --key-file "$CERT_DIR/server.key"
     fi
 
-    systemctl restart sing-box; sleep 1; show_links
+    systemctl restart sing-box
+    sleep 1
+    show_links
 }
 
 generate_config_json() {
@@ -337,8 +364,8 @@ configure_systemd() {
     IPTABLES_START=""
     IPTABLES_STOP=""
     if [ -n "$PORT_HY2_RANGE" ]; then
-        IPTABLES_START="ExecStartPost=-/sbin/iptables -t nat -A PREROUTING -p udp --dport $PORT_HY2_RANGE -j REDIRECT --to-ports$PORT_HY2\nExecStartPost=-/sbin/ip6tables -t nat -A PREROUTING -p udp --dport $PORT_HY2_RANGE -j REDIRECT --to-ports$PORT_HY2"
-        IPTABLES_STOP="ExecStopPost=-/sbin/iptables -t nat -D PREROUTING -p udp --dport $PORT_HY2_RANGE -j REDIRECT --to-ports$PORT_HY2\nExecStopPost=-/sbin/ip6tables -t nat -D PREROUTING -p udp --dport $PORT_HY2_RANGE -j REDIRECT --to-ports$PORT_HY2"
+        IPTABLES_START="ExecStartPost=-/sbin/iptables -t nat -A PREROUTING -p udp --dport $PORT_HY2_RANGE -j REDIRECT --to-ports $PORT_HY2\nExecStartPost=-/sbin/ip6tables -t nat -A PREROUTING -p udp --dport $PORT_HY2_RANGE -j REDIRECT --to-ports $PORT_HY2"
+        IPTABLES_STOP="ExecStopPost=-/sbin/iptables -t nat -D PREROUTING -p udp --dport $PORT_HY2_RANGE -j REDIRECT --to-ports $PORT_HY2\nExecStopPost=-/sbin/ip6tables -t nat -D PREROUTING -p udp --dport $PORT_HY2_RANGE -j REDIRECT --to-ports $PORT_HY2"
     fi
 
     # 替换实际物理换行来解决 systemd 不支持 \n 的问题
@@ -353,8 +380,9 @@ After=network.target nss-lookup.target
 [Service]
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-ExecStart=$SING_BOX_BIN run -c$CONFIG_DIR/config.json
-${IPTABLES_START}${IPTABLES_STOP}
+ExecStart=$SING_BOX_BIN run -c $CONFIG_DIR/config.json
+${IPTABLES_START}
+${IPTABLES_STOP}
 Restart=on-failure
 RestartSec=10s
 LimitNOFILE=infinity
@@ -363,7 +391,9 @@ LimitNOFILE=infinity
 WantedBy=multi-user.target
 EOF_SINGBOX_SERVICE
 
-    systemctl daemon-reload; systemctl enable sing-box > /dev/null 2>&1; systemctl restart sing-box
+    systemctl daemon-reload
+    systemctl enable sing-box > /dev/null 2>&1
+    systemctl restart sing-box
 }
 
 modify_parameters() {
@@ -389,9 +419,15 @@ modify_parameters() {
         1) read -p "新 REALITY 端口: " NEW_PORT; [ -n "$NEW_PORT" ] && PORT_REALITY=$NEW_PORT ;;
         2) read -p "新 AnyTLS 端口: " NEW_PORT; [ -n "$NEW_PORT" ] && PORT_ANYTLS=$NEW_PORT ;;
         3) read -p "新 Any-Reality 端口: " NEW_PORT; [ -n "$NEW_PORT" ] && PORT_ANYREALITY=$NEW_PORT ;;
-        4) read -p "新 Hy2 主监听端口: " NEW_PORT; [ -n "$NEW_PORT" ] && PORT_HY2=$NEW_PORT
+        4) 
+           read -p "新 Hy2 主监听端口: " NEW_PORT; [ -n "$NEW_PORT" ] && PORT_HY2=$NEW_PORT
            read -p "新 Hy2 跳跃段(清空填none): " NEW_RANGE
-           if [ "$NEW_RANGE" == "none" ]; then PORT_HY2_RANGE=""; elif [ -n "$NEW_RANGE" ]; then PORT_HY2_RANGE=$(echo "$NEW_RANGE" | tr '-' ':'); fi ;;
+           if [ "$NEW_RANGE" == "none" ]; then 
+               PORT_HY2_RANGE=""
+           elif [ -n "$NEW_RANGE" ]; then 
+               PORT_HY2_RANGE=$(echo "$NEW_RANGE" | tr '-' ':')
+           fi 
+           ;;
         5) read -p "新 TUIC 端口: " NEW_PORT; [ -n "$NEW_PORT" ] && PORT_TUIC=$NEW_PORT ;;
         6) read -p "新 Padding: " NEW_PAD; [ -n "$NEW_PAD" ] && PADDING_SCHEME_JSON=$NEW_PAD ;;
         7) read -p "新 REALITY 伪装域名: " NEW_DEST; [ -n "$NEW_DEST" ] && REALITY_DEST=$NEW_DEST ;;
@@ -399,24 +435,35 @@ modify_parameters() {
         *) start_menu; return ;;
     esac
 
-    systemctl stop sing-box; save_config; generate_config_json; configure_systemd
-    echo -e "${GREEN}修改成功！参数已联动全套协议。${PLAIN}"; sleep 1; show_links
+    systemctl stop sing-box
+    save_config
+    generate_config_json
+    configure_systemd
+    echo -e "${GREEN}修改成功！参数已联动全套协议。${PLAIN}"
+    sleep 1
+    show_links
 }
 
 show_links() {
     if [ ! -f "$CONF_FILE" ]; then echo "未找到配置！"; sleep 1; return; fi
     source "$CONF_FILE"
-    check_deps_extra; get_public_ip
+    check_deps_extra
+    get_public_ip
 
     local FINAL_DEST=${REALITY_DEST:-"www.microsoft.com"}
     INSECURE_FLAG="0"
     if [ "$CERT_CHOICE" == "1" ]; then INSECURE_FLAG="1"; fi
 
     VLESS_LINK="vless://${UUID_REALITY}@${PUBLIC_IP}:${PORT_REALITY}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${FINAL_DEST}&fp=chrome&pbk=${REALITY_PUBLIC}&sid=${REALITY_SHORT_ID}&type=tcp&headerType=none#${PUBLIC_IP}-VLESS-REALITY"
-    HY2_PORT_DISPLAY=${PORT_HY2}; if [ -n "$PORT_HY2_RANGE" ]; then HY2_PORT_DISPLAY=${PORT_HY2_RANGE/-/:}; fi
+    
+    HY2_PORT_DISPLAY=${PORT_HY2}
+    if [ -n "$PORT_HY2_RANGE" ]; then HY2_PORT_DISPLAY=${PORT_HY2_RANGE/-/:}; fi
     HY2_LINK="hy2://${PASS_HY2}@${PUBLIC_IP}:${HY2_PORT_DISPLAY}?insecure=${INSECURE_FLAG}&sni=${DOMAIN}#${PUBLIC_IP}-Hysteria2"
+    
     TUIC_LINK="tuic://${UUID_TUIC}:${PASS_TUIC}@${PUBLIC_IP}:${PORT_TUIC}?sni=${DOMAIN}&alpn=h3&allow_insecure=${INSECURE_FLAG}#${PUBLIC_IP}-TUIC"
-    ANYTLS_LINK="anytls://${PASS_ANYTLS}@${PUBLIC_IP}:${PORT_ANYTLS}?security=tls&sni=${DOMAIN}&fp=chrome&alpn=http\%2F1.1&insecure=${INSECURE_FLAG}&allowInsecure=${INSECURE_FLAG}&type=tcp&headerType=none#${PUBLIC_IP}-AnyTLS"
+    
+    ANYTLS_LINK="anytls://${PASS_ANYTLS}@${PUBLIC_IP}:${PORT_ANYTLS}?security=tls&sni=${DOMAIN}&fp=chrome&alpn=http%2F1.1&insecure=${INSECURE_FLAG}&allowInsecure=${INSECURE_FLAG}&type=tcp&headerType=none#${PUBLIC_IP}-AnyTLS"
+    
     ANYREALITY_LINK="anytls://${PASS_ANYREALITY}@${PUBLIC_IP}:${PORT_ANYREALITY}?security=reality&sni=${FINAL_DEST}&fp=chrome&pbk=${REALITY_PUBLIC}&sid=${REALITY_SHORT_ID}&type=tcp&headerType=none#${PUBLIC_IP}-AnyReality"
 
     clear
@@ -436,7 +483,9 @@ show_links() {
         5) qrencode -t ANSIUTF8 "$TUIC_LINK" ;;
         *) start_menu; return ;;
     esac
-    echo ""; read -n 1 -s -r -p "扫码完毕？按任意键返回主菜单..."; start_menu
+    echo ""
+    read -n 1 -s -r -p "扫码完毕？按任意键返回主菜单..."
+    start_menu
 }
 
 uninstall_singbox() {
@@ -446,8 +495,10 @@ uninstall_singbox() {
         systemctl stop sing-box > /dev/null 2>&1
         systemctl disable sing-box > /dev/null 2>&1
         rm -f /etc/systemd/system/sing-box.service
-        systemctl daemon-reload; rm -rf "$CONFIG_DIR" "$SING_BOX_BIN"
-        echo -e "${GREEN}卸载完成！${PLAIN}"; sleep 2
+        systemctl daemon-reload
+        rm -rf "$CONFIG_DIR" "$SING_BOX_BIN"
+        echo -e "${GREEN}卸载完成！${PLAIN}"
+        sleep 2
     fi
     start_menu
 }
@@ -501,4 +552,70 @@ start_menu() {
         echo -e "${YELLOW}[ Sing-box 节点选项 ]${PLAIN}"
         echo -e "${GREEN}1.${PLAIN} 一键无损更新 Sing-box 核心"
         echo -e "${GREEN}2.${PLAIN} 强制彻底重装 Sing-box"
-        echo -e "${GREEN}3.${PLAIN}
+        echo -e "${GREEN}3.${PLAIN} 动态修改端口、伪装域名等参数"
+        echo -e "${GREEN}4.${PLAIN} 独立申请或修复安全证书"
+        echo -e "${GREEN}5.${PLAIN} 查看所有节点并生成终端二维码"
+        echo -e "${GREEN}6.${PLAIN} 一键开启 BBR 网络加速机制"
+        echo -e "${GREEN}7.${PLAIN} 彻底卸载 Sing-box"
+        echo -e "${GREEN}8.${PLAIN} 🔄 更新主管理脚本 (SBA)"
+    else
+        echo -e "系统状态: ${YELLOW}未安装${PLAIN}   |   BBR加速状态: ${BBR_TXT}"
+        echo -e "------------------------------------------"
+        echo -e "${YELLOW}[ Sing-box 节点选项 ]${PLAIN}"
+        echo -e "${GREEN}2.${PLAIN} 全新安装 Sing-box"
+        echo -e "${GREEN}6.${PLAIN} 一键开启 BBR 网络加速机制"
+        echo -e "${GREEN}7.${PLAIN} 彻底卸载 Sing-box"
+        echo -e "${GREEN}8.${PLAIN} 🔄 更新主管理脚本 (SBA)"
+    fi
+    echo -e "------------------------------------------"
+    echo -e "${YELLOW}[ 高级扩展模块 ]${PLAIN}"
+    echo -e "${GREEN}9.${PLAIN}  ➡️ ${YELLOW}端口转发管理 (远程动态调用 Realm)${PLAIN}"
+    echo -e "${GREEN}10.${PLAIN} ➡️ ${YELLOW}家宽流量接管 (远程动态调用 ISP分流)${PLAIN}"
+    echo -e "${GREEN}0.${PLAIN} 退出脚本"
+    echo -e "${CYAN}==========================================${PLAIN}"
+    read -p "请输入选项: " MENU_CHOICE
+    
+    case "$MENU_CHOICE" in
+        1) [ -f "$CONF_FILE" ] && silent_update_core || start_menu ;;
+        2) fresh_install ;;
+        3) [ -f "$CONF_FILE" ] && modify_parameters || start_menu ;;
+        4) [ -f "$CONF_FILE" ] && standalone_cert_manager || start_menu ;;
+        5) [ -f "$CONF_FILE" ] && show_links || start_menu ;;
+        6) enable_bbr ;;
+        7) uninstall_singbox ;;
+        8) update_script ;;
+        9) 
+           # --- 核心：动态调用独立的 Realm 模块 ---
+           clear
+           echo -e "${YELLOW}正在从 GitHub 拉取最新的端口转发(Realm)模块...${PLAIN}"
+           curl -fsSL -o /tmp/realm.sh "https://raw.githubusercontent.com/JBl9527/singbox-all/main/realm.sh"
+           if [ -f "/tmp/realm.sh" ]; then
+               chmod +x /tmp/realm.sh
+               bash /tmp/realm.sh
+           else
+               echo -e "${RED}拉取失败！请检查网络或 GitHub 仓库地址是否正确。${PLAIN}"
+               sleep 2
+           fi
+           start_menu 
+           ;;
+        10) 
+           # --- 核心：动态调用独立的 家宽接管 模块 ---
+           clear
+           echo -e "${YELLOW}正在从 GitHub 拉取最新的家宽接管(ISP)模块...${PLAIN}"
+           # 注意：请确保你把家宽接管脚本保存为 isp.sh 并上传到了 Github
+           curl -fsSL -o /tmp/isp.sh "https://raw.githubusercontent.com/JBl9527/singbox-all/main/isp.sh"
+           if [ -f "/tmp/isp.sh" ]; then
+               chmod +x /tmp/isp.sh
+               bash /tmp/isp.sh
+           else
+               echo -e "${RED}拉取失败！请确保你已将家宽接管脚本命名为 isp.sh 并上传到了 Github。${PLAIN}"
+               sleep 2
+           fi
+           start_menu 
+           ;;
+        0) exit 0 ;;
+        *) start_menu ;;
+    esac
+}
+
+start_menu
