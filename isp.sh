@@ -2,7 +2,6 @@
 
 # ==========================================
 # Sing-box 独立家宽流量接管模块 (SBA ISP)
-# 适用场景：台湾/美国家宽节点分流接管
 # ==========================================
 
 RED='\033[0;31m'
@@ -52,7 +51,6 @@ enable_takeover() {
 
     local outbound_json=""
 
-    # 构建协议 JSON
     case "$proto_choice" in
         1)
             read -p "用户名 (留空则无认证): " isp_user
@@ -106,7 +104,9 @@ enable_takeover() {
     
     if [ "$mode_choice" == "1" ]; then
         echo -e "\n${YELLOW}已识别到以下本机节点 (Inbounds)：${PLAIN}"
-        mapfile -t INBOUND_TAGS < <(jq -r '.inbounds[]? | select(.tag != null and .type != "direct" and .type != "block") | .tag' "$CONFIG_FILE")
+        
+        # 安全读取 Inbounds 标签
+        mapfile -t INBOUND_TAGS < <(jq -r 'if .inbounds != null then .inbounds[] | select(.tag != null and .type != "direct" and .type != "block") | .tag else empty end' "$CONFIG_FILE")
         
         if [ ${#INBOUND_TAGS[@]} -eq 0 ]; then
             echo -e "${RED}未在配置文件中找到任何有效节点！${PLAIN}"
@@ -115,8 +115,8 @@ enable_takeover() {
         fi
 
         for i in "${!INBOUND_TAGS[@]}"; do
-            local pt=$(jq -r ".inbounds[] | select(.tag == \"${INBOUND_TAGS[$i]}\") | .listen_port // \"未知\"" "$CONFIG_FILE")
-            # 【修复点1】补上 -e，让终端正常渲染颜色，而不是显示乱码
+            # 安全读取端口号
+            local pt=$(jq -r "if .inbounds != null then [.inbounds[] | select(.tag == \"${INBOUND_TAGS[$i]}\")][0] | if .listen_port != null then .listen_port else \"未知\" end else \"未知\" end" "$CONFIG_FILE")
             echo -e " [$((i+1))] ${GREEN}${INBOUND_TAGS[$i]}${PLAIN} (端口: $pt)"
         done
         
@@ -147,15 +147,16 @@ enable_takeover() {
     cp "$CONFIG_FILE" "${CONFIG_FILE}.bak_$(date +%s)"
     echo -e "\n${YELLOW}正在修改并重载 Sing-box 配置...${PLAIN}"
 
-    # 【修复点2】使用 // [] 兼容处理没有 route.rules 数组的情况，避免 null 报错
+    # 【终极修复区】：极度强健的 jq 语法，自动判断和创建缺失对象，无视旧版报错
     if ! jq --arg tag "$RESIDENTIAL_TAG" \
        --argjson new_out "$outbound_json" \
        --argjson new_rule "$rule_json" \
     '
-    .outbounds = ((.outbounds // []) | map(select(.tag != $tag))) + [$new_out] |
-    .route.rules = [$new_rule] + ((.route.rules // []) | map(select(.outbound != $tag)))
+    .outbounds = (if .outbounds != null then [.outbounds[] | select(.tag != $tag)] else [] end) + [$new_out] |
+    .route = (if .route != null then .route else {} end) |
+    .route.rules = [$new_rule] + (if .route.rules != null then [.route.rules[] | select(.outbound != $tag)] else [] end)
     ' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp"; then
-        echo -e "${RED}❌ jq 写入配置失败，请检查上面是否有报错信息！${PLAIN}"
+        echo -e "${RED}❌ 写入配置失败，请检查上面是否有报错信息！${PLAIN}"
         rm -f "${CONFIG_FILE}.tmp"
         read -n 1 -s -r -p "按任意键返回子菜单..."
         return
@@ -191,13 +192,15 @@ view_status() {
         echo -e "\n${YELLOW}当前未开启任何家宽接管配置。${PLAIN}\n"
     else
         echo -e "${GREEN}【已绑定的家宽节点信息】${PLAIN}"
-        jq -r '.outbounds[]? | select(.tag == "'$RESIDENTIAL_TAG'") | 
-        " - 协议类型: \(.type) \n - 节点地址: \(.server):\(.server_port)"' "$CONFIG_FILE"
+        jq -r 'if .outbounds != null then .outbounds[] | select(.tag == "'$RESIDENTIAL_TAG'") | 
+        " - 协议类型: \(.type) \n - 节点地址: \(.server):\(.server_port)" else empty end' "$CONFIG_FILE"
 
         echo -e "\n${GREEN}【被接管的本机流量】${PLAIN}"
-        jq -r '(.route.rules // [])[] | select(.outbound == "'$RESIDENTIAL_TAG'") |
-        if .inbound then " - 已接管节点标签 (Tag): \(.inbound | join(\", \"))" else empty end,
-        if .inbound_port then " - 已接管入站端口 (Port): \(.inbound_port | join(\", \"))" else empty end' "$CONFIG_FILE"
+        jq -r 'if .route != null and .route.rules != null then
+        .route.rules[] | select(.outbound == "'$RESIDENTIAL_TAG'") |
+        (if .inbound then " - 已接管节点标签 (Tag): \(.inbound | join(\", \"))" else empty end),
+        (if .inbound_port then " - 已接管入站端口 (Port): \(.inbound_port | join(\", \"))" else empty end)
+        else empty end' "$CONFIG_FILE"
         echo ""
     fi
     echo -e "${CYAN}==========================================${PLAIN}"
@@ -217,11 +220,15 @@ disable_takeover() {
 
     cp "$CONFIG_FILE" "${CONFIG_FILE}.bak_$(date +%s)"
 
-    # 【修复点3】同理，移除时也增加容错处理
+    # 安全移除规则
     if ! jq --arg tag "$RESIDENTIAL_TAG" \
     '
-    .outbounds = ((.outbounds // []) | map(select(.tag != $tag))) |
-    .route.rules = ((.route.rules // []) | map(select(.outbound != $tag)))
+    .outbounds = (if .outbounds != null then [.outbounds[] | select(.tag != $tag)] else [] end) |
+    if .route != null and .route.rules != null then
+        .route.rules = [.route.rules[] | select(.outbound != $tag)]
+    else
+        .
+    end
     ' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp"; then
          echo -e "${RED}❌ 清理配置失败。${PLAIN}"
          rm -f "${CONFIG_FILE}.tmp"
