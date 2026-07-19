@@ -105,7 +105,6 @@ enable_takeover() {
     if [ "$mode_choice" == "1" ]; then
         echo -e "\n${YELLOW}已识别到以下本机节点 (Inbounds)：${PLAIN}"
         
-        # 安全读取 Inbounds 标签
         mapfile -t INBOUND_TAGS < <(jq -r 'if .inbounds != null then .inbounds[] | select(.tag != null and .type != "direct" and .type != "block") | .tag else empty end' "$CONFIG_FILE")
         
         if [ ${#INBOUND_TAGS[@]} -eq 0 ]; then
@@ -115,7 +114,6 @@ enable_takeover() {
         fi
 
         for i in "${!INBOUND_TAGS[@]}"; do
-            # 安全读取端口号
             local pt=$(jq -r "if .inbounds != null then [.inbounds[] | select(.tag == \"${INBOUND_TAGS[$i]}\")][0] | if .listen_port != null then .listen_port else \"未知\" end else \"未知\" end" "$CONFIG_FILE")
             echo -e " [$((i+1))] ${GREEN}${INBOUND_TAGS[$i]}${PLAIN} (端口: $pt)"
         done
@@ -147,14 +145,13 @@ enable_takeover() {
     cp "$CONFIG_FILE" "${CONFIG_FILE}.bak_$(date +%s)"
     echo -e "\n${YELLOW}正在修改并重载 Sing-box 配置...${PLAIN}"
 
-    # 【终极修复区】：极度强健的 jq 语法，自动判断和创建缺失对象，无视旧版报错
     if ! jq --arg tag "$RESIDENTIAL_TAG" \
        --argjson new_out "$outbound_json" \
        --argjson new_rule "$rule_json" \
     '
     .outbounds = (if .outbounds != null then [.outbounds[] | select(.tag != $tag)] else [] end) + [$new_out] |
     .route = (if .route != null then .route else {} end) |
-    .route.rules = [$new_rule] + (if .route.rules != null then [.route.rules[] | select(.outbound != $tag)] else [] end)
+    .route.rules = [$new_rule] + (if .route.rules != null then [.route.rules[] | select(.outbound != $tag and . != $new_rule)] else [] end)
     ' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp"; then
         echo -e "${RED}❌ 写入配置失败，请检查上面是否有报错信息！${PLAIN}"
         rm -f "${CONFIG_FILE}.tmp"
@@ -192,65 +189,127 @@ view_status() {
         echo -e "\n${YELLOW}当前未开启任何家宽接管配置。${PLAIN}\n"
     else
         echo -e "${GREEN}【已绑定的家宽节点信息】${PLAIN}"
-        jq -r 'if .outbounds != null then .outbounds[] | select(.tag == "'$RESIDENTIAL_TAG'") | 
-        " - 协议类型: \(.type) \n - 节点地址: \(.server):\(.server_port)" else empty end' "$CONFIG_FILE"
+        jq -r '.outbounds[]? | select(.tag == "'"$RESIDENTIAL_TAG"'") | 
+        " - 协议类型: \(.type) \n - 节点地址: \(.server):\(.server_port)"' "$CONFIG_FILE"
 
-        echo -e "\n${GREEN}【被接管的本机流量】${PLAIN}"
-        jq -r '
-if .route != null and .route.rules != null then
-    .route.rules[]
-    | select(.outbound == "'$RESIDENTIAL_TAG'")
-    | (if .inbound
-        then " - 已接管节点标签 (Tag): \(.inbound | join(", "))"
-        else empty
-       end),
-      (if .inbound_port
-        then " - 已接管入站端口 (Port): \(.inbound_port | join(", "))"
-        else empty
-       end)
-else
-    empty
-end
-' "$CONFIG_FILE"
+        echo -e "\n${GREEN}【当前被接管的流量规则】${PLAIN}"
+        jq -r '(.route.rules // [])[] | select(.outbound == "'"$RESIDENTIAL_TAG"'") | 
+        " - " + 
+        (if .inbound then "节点标签: \(.inbound | join(\", \"))" else "" end) + 
+        (if .inbound_port then "入站端口: \(.inbound_port | join(\", \"))" else "" end)' "$CONFIG_FILE"
         echo ""
     fi
     echo -e "${CYAN}==========================================${PLAIN}"
     read -n 1 -s -r -p "按任意键返回菜单..."
 }
 
-# ================= 3. 移除接管 =================
+# ================= 3. 选择性移除接管 =================
 
 disable_takeover() {
-    echo -e "${YELLOW}正在移除家宽接管规则...${PLAIN}"
+    clear
+    echo -e "${YELLOW}正在读取当前接管规则...${PLAIN}"
     
     if ! grep -q "$RESIDENTIAL_TAG" "$CONFIG_FILE"; then
-         echo -e "${GREEN}未发现家宽接管规则，无需清理。${PLAIN}"
+         echo -e "${GREEN}当前未发现任何家宽接管配置，无需清理。${PLAIN}"
          sleep 2
          return
     fi
 
-    cp "$CONFIG_FILE" "${CONFIG_FILE}.bak_$(date +%s)"
+    # 提取所有包含目标 outbound 的规则，存为 JSON 字符串数组
+    mapfile -t ACTIVE_RULES < <(jq -c 'if .route != null and .route.rules != null then .route.rules[] | select(.outbound == "'$RESIDENTIAL_TAG'") else empty end' "$CONFIG_FILE")
 
-    # 安全移除规则
-    if ! jq --arg tag "$RESIDENTIAL_TAG" \
-    '
-    .outbounds = (if .outbounds != null then [.outbounds[] | select(.tag != $tag)] else [] end) |
-    if .route != null and .route.rules != null then
-        .route.rules = [.route.rules[] | select(.outbound != $tag)]
+    if [ ${#ACTIVE_RULES[@]} -eq 0 ]; then
+        echo -e "${YELLOW}检测到失效的家宽节点，正在自动清理...${PLAIN}"
+        cp "$CONFIG_FILE" "${CONFIG_FILE}.bak_$(date +%s)"
+        jq --arg tag "$RESIDENTIAL_TAG" '
+            .outbounds = (if .outbounds != null then [.outbounds[] | select(.tag != $tag)] else [] end)
+        ' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+        systemctl restart sing-box
+        echo -e "${GREEN}✅ 残留配置清理完毕！${PLAIN}"
+        sleep 2
+        return
+    fi
+
+    echo -e "\n${CYAN}==========================================${PLAIN}"
+    echo -e "${CYAN}             选择要移除的接管规则         ${PLAIN}"
+    echo -e "${CYAN}==========================================${PLAIN}"
+    
+    for i in "${!ACTIVE_RULES[@]}"; do
+        local rule_str="${ACTIVE_RULES[$i]}"
+        local display_text=""
+        
+        # 使用 jq 解析提取标签或端口信息展示给用户
+        local in_tag=$(echo "$rule_str" | jq -r 'if .inbound then .inbound | join(", ") else empty end')
+        local in_port=$(echo "$rule_str" | jq -r 'if .inbound_port then .inbound_port | join(", ") else empty end')
+        
+        if [ -n "$in_tag" ]; then
+            display_text="接管的节点标签: ${GREEN}$in_tag${PLAIN}"
+        elif [ -n "$in_port" ]; then
+            display_text="接管的入站端口: ${GREEN}$in_port${PLAIN}"
+        else
+            display_text="未知类型接管规则"
+        fi
+        
+        echo -e " [$((i+1))] 取消 -> $display_text"
+    done
+    echo -e " [0] 返回上级菜单"
+    echo -e " [99] ${RED}一键移除所有接管规则 (全部清理)${PLAIN}"
+    
+    echo -e "${CYAN}==========================================${PLAIN}"
+    read -p "请输入对应的数字进行删除: " del_choice
+    
+    if [ "$del_choice" == "0" ]; then
+        return
+    elif [ "$del_choice" == "99" ]; then
+        # 彻底移除
+        cp "$CONFIG_FILE" "${CONFIG_FILE}.bak_$(date +%s)"
+        if ! jq --arg tag "$RESIDENTIAL_TAG" '
+            .outbounds = (if .outbounds != null then [.outbounds[] | select(.tag != $tag)] else [] end) |
+            if .route != null and .route.rules != null then
+                .route.rules = [.route.rules[] | select(.outbound != $tag)]
+            else
+                .
+            end
+        ' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp"; then
+             echo -e "${RED}❌ 清理配置失败。${PLAIN}"
+             rm -f "${CONFIG_FILE}.tmp"
+             read -n 1 -s -r -p "按任意键返回子菜单..."
+             return
+        fi
+        mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+        systemctl restart sing-box
+        echo -e "${GREEN}✅ 所有家宽接管规则已全部移除！${PLAIN}"
+
+    elif [[ "$del_choice" =~ ^[0-9]+$ ]] && [ "$del_choice" -ge 1 ] && [ "$del_choice" -le "${#ACTIVE_RULES[@]}" ]; then
+        # 单独删除一条规则
+        local target_del_rule="${ACTIVE_RULES[$((del_choice-1))]}"
+        cp "$CONFIG_FILE" "${CONFIG_FILE}.bak_$(date +%s)"
+        
+        echo -e "${YELLOW}正在移除选中的接管规则...${PLAIN}"
+        if ! jq --argjson del_rule "$target_del_rule" --arg tag "$RESIDENTIAL_TAG" '
+            # 1. 移除精确匹配的那一条规则
+            .route.rules = [.route.rules[] | select(. != $del_rule)] |
+            # 2. 检查是否还有指向家宽节点的其他规则，如果没有，顺手把家宽节点 outbound 删掉
+            if ([.route.rules[] | select(.outbound == $tag)] | length) == 0 then
+                .outbounds = [.outbounds[] | select(.tag != $tag)]
+            else
+                .
+            end
+        ' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp"; then
+            echo -e "${RED}❌ 移除特定规则失败。${PLAIN}"
+            rm -f "${CONFIG_FILE}.tmp"
+            read -n 1 -s -r -p "按任意键返回子菜单..."
+            return
+        fi
+        mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+        systemctl restart sing-box
+        echo -e "${GREEN}✅ 指定的接管规则已成功移除！${PLAIN}"
     else
-        .
-    end
-    ' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp"; then
-         echo -e "${RED}❌ 清理配置失败。${PLAIN}"
-         rm -f "${CONFIG_FILE}.tmp"
-         read -n 1 -s -r -p "按任意键返回子菜单..."
-         return
+        echo -e "${RED}输入错误，操作取消。${PLAIN}"
+        sleep 2
+        return
     fi
     
-    mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
-
-    systemctl restart sing-box
-    echo -e "${GREEN}✅ 家宽接管规则已移除，Sing-box 已重启。${PLAIN}"
     echo ""
     read -n 1 -s -r -p "按任意键返回子菜单..."
 }
@@ -263,7 +322,7 @@ show_menu() {
     echo -e "${GREEN}===========================================${PLAIN}"
     echo -e " 1. ${GREEN}开启/修改${PLAIN} 家宽流量接管 (接管本机节点流量)"
     echo -e " 2. ${CYAN}查看当前${PLAIN} 流量接管状态"
-    echo -e " 3. ${RED}关闭/移除${PLAIN} 家宽流量接管"
+    echo -e " 3. ${RED}删除/取消${PLAIN} 某一个流量接管配置"
     echo -e " 0. 返回主菜单"
     echo -e "${GREEN}===========================================${PLAIN}"
     read -p "请输入选项 [0-3]: " choice
