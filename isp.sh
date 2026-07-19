@@ -193,10 +193,22 @@ view_status() {
         " - 协议类型: \(.type) \n - 节点地址: \(.server):\(.server_port)"' "$CONFIG_FILE"
 
         echo -e "\n${GREEN}【当前被接管的流量规则】${PLAIN}"
-        jq -r '(.route.rules // [])[] | select(.outbound == "'"$RESIDENTIAL_TAG"'") | 
-        " - " + 
-        (if .inbound then "节点标签: \(.inbound | join(\", \"))" else "" end) + 
-        (if .inbound_port then "入站端口: \(.inbound_port | join(\", \"))" else "" end)' "$CONFIG_FILE"
+        jq -r '
+if .route != null and .route.rules != null then
+    .route.rules[]
+    | select(.outbound == "'$RESIDENTIAL_TAG'")
+    | (if .inbound
+        then " - 已接管节点标签 (Tag): \(.inbound | join(", "))"
+        else empty
+       end),
+      (if .inbound_port
+        then " - 已接管入站端口 (Port): \(.inbound_port | join(", "))"
+        else empty
+       end)
+else
+    empty
+end
+' "$CONFIG_FILE"
         echo ""
     fi
     echo -e "${CYAN}==========================================${PLAIN}"
