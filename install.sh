@@ -1,61 +1,111 @@
 #!/bin/bash
 
 # ==========================================
-# Sing-box 五协议管理脚本 (SBA)
+# Sing-box 全协议一键管理脚本 (SBA v2)
 #
-# 支持协议:
-#   1. VLESS + REALITY
-#   2. AnyTLS
-#   3. Any-Reality
-#   4. Hysteria2
-#   5. TUIC v5
+# 覆盖 sing-box 能对外提供的全部代理协议节点:
+#   VLESS / VMess / Trojan (REALITY、TLS、WS、gRPC、HTTPUpgrade、明文)
+#   AnyTLS / AnyTLS-REALITY / Hysteria2 / Hysteria v1 / TUIC v5
+#   Shadowsocks 2022 / Shadowsocks / ShadowTLS v3 / Snell / NaiveProxy
+#   SOCKS5 / HTTP / Mixed
+#   Argo (Cloudflare Tunnel) 免域名节点
 #
-# 新增协议节点:
-#   可为同一协议增加多个节点
-#   每个节点可单独设置端口和 SNI 域名
+# 数据源: /usr/local/etc/sing-box/nodes.json
+#   config.json 每次由 nodes.json + isp.json 重新生成，
+#   因此家宽接管配置不会因为重装/改参数而丢失。
 #
 # GitHub 直连不通时先执行：
 #   export GH_PROXY="https://你的加速前缀/"
 # 再运行本脚本。
 # ==========================================
 
+SBA_VERSION="2.0.0"
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 CYAN='\033[0;36m'
+BLUE='\033[0;34m'
 PLAIN='\033[0m'
 
 CONFIG_DIR="/usr/local/etc/sing-box"
 CERT_DIR="${CONFIG_DIR}/cert"
+CONFIG_FILE="${CONFIG_DIR}/config.json"
+NODES_FILE="${CONFIG_DIR}/nodes.json"
+ISP_FILE="${CONFIG_DIR}/isp.json"
+ARGO_FILE="${CONFIG_DIR}/argo.json"
 CONF_FILE="${CONFIG_DIR}/sba.conf"
 EXTRA_NODES_FILE="${CONFIG_DIR}/extra_nodes.conf"
+
 SING_BOX_BIN="/usr/local/bin/sing-box"
+CLOUDFLARED_BIN="/usr/local/bin/cloudflared"
 SERVICE_FILE="/etc/systemd/system/sing-box.service"
+ARGO_SERVICE_FILE="/etc/systemd/system/sba-argo.service"
+ARGO_LOG="/var/log/sba-argo.log"
 
 GH_PROXY="${GH_PROXY:-}"
-if [ -n "$GH_PROXY" ] && [[ "$GH_PROXY" != */ ]]; then
-    GH_PROXY="${GH_PROXY}/"
-fi
+[ -n "$GH_PROXY" ] && [[ "$GH_PROXY" != */ ]] && GH_PROXY="${GH_PROXY}/"
 
 REPO_RAW="${GH_PROXY}https://raw.githubusercontent.com/JBl9527/singbox-all/main"
-GH_API="https://api.github.com/repos/SagerNet/sing-box/releases/latest"
-GH_DL="${GH_PROXY}https://github.com/SagerNet/sing-box/releases/download"
+SB_REPO="SagerNet/sing-box"
+SB_FALLBACK_VERSION="1.14.0"
 
 DEFAULT_REALITY_DEST="addons.mozilla.org"
-DEFAULT_PADDING='"stop=8", "0=30-30", "1=100-400", "2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000", "3=9-9,500-1000", "4=500-1000", "5=500-1000", "6=500-1000", "7=500-1000"'
+DEFAULT_PADDING='["stop=8","0=30-30","1=100-400","2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000","3=9-9,500-1000","4=500-1000","5=500-1000","6=500-1000","7=500-1000"]'
 
 CURL_OPTS=(-fsSL --connect-timeout 8 --max-time 30)
-
 PUBLIC_IP=""
-USED_PORTS=()
-CHOSEN_PORTS=()
+PUBLIC_IP6=""
 
-[[ $EUID -ne 0 ]] && {
+# ==========================================
+# 协议注册表
+#   key | 显示名 | 加密方式(none/tls/reality) | 传输(tcp/ws/grpc/hu/-) | 旧版兼容 tag
+# ==========================================
+PROTO_DB=(
+    "vless-reality|VLESS + REALITY + Vision|reality|tcp|reality-in"
+    "vless-reality-grpc|VLESS + REALITY + gRPC|reality|grpc|"
+    "vless-tcp-tls|VLESS + TCP + TLS|tls|tcp|"
+    "vless-ws-tls|VLESS + WS + TLS|tls|ws|"
+    "vless-grpc-tls|VLESS + gRPC + TLS|tls|grpc|"
+    "vless-hu-tls|VLESS + HTTPUpgrade + TLS|tls|hu|"
+    "vless-ws|VLESS + WS 明文 (套 CDN 用)|none|ws|"
+    "vmess-reality|VMess + REALITY|reality|tcp|"
+    "vmess-tcp|VMess + TCP 明文|none|tcp|"
+    "vmess-tcp-tls|VMess + TCP + TLS|tls|tcp|"
+    "vmess-ws|VMess + WS 明文 (套 CDN 用)|none|ws|"
+    "vmess-ws-tls|VMess + WS + TLS|tls|ws|"
+    "vmess-grpc-tls|VMess + gRPC + TLS|tls|grpc|"
+    "trojan-reality|Trojan + REALITY|reality|tcp|"
+    "trojan-tcp-tls|Trojan + TCP + TLS|tls|tcp|"
+    "trojan-ws-tls|Trojan + WS + TLS|tls|ws|"
+    "trojan-grpc-tls|Trojan + gRPC + TLS|tls|grpc|"
+    "anytls|AnyTLS|tls|-|anytls-in"
+    "anytls-reality|AnyTLS + REALITY|reality|-|any-reality-in"
+    "hysteria2|Hysteria2 (含端口跳跃)|tls|-|hy2-in"
+    "hysteria|Hysteria v1|tls|-|"
+    "tuic|TUIC v5|tls|-|tuic-in"
+    "shadowtls|ShadowTLS v3 + SS2022|none|-|"
+    "ss-2022|Shadowsocks 2022|none|-|"
+    "ss-aes|Shadowsocks aes-256-gcm|none|-|"
+    "snell|Snell v5|none|-|"
+    "naive|NaiveProxy (需真实证书)|tls|-|"
+    "socks5|SOCKS5|none|-|"
+    "http|HTTP 代理|none|-|"
+    "mixed|Mixed (SOCKS5 + HTTP)|none|-|"
+)
+
+[[ $EUID -ne 0 && "${SBA_SOURCE_ONLY:-0}" != "1" ]] && {
     echo -e "${RED}错误: 必须使用 root 用户运行此脚本！${PLAIN}"
     exit 1
 }
 
-# ================= 小工具 =================
+# ================= 基础小工具 =================
+
+msg() { echo -e "$1"; }
+ok() { echo -e "${GREEN}✔ $1${PLAIN}"; }
+warn() { echo -e "${YELLOW}! $1${PLAIN}"; }
+err() { echo -e "${RED}✘ $1${PLAIN}"; }
+line() { echo -e "${CYAN}------------------------------------------${PLAIN}"; }
 
 pause() {
     echo ""
@@ -63,451 +113,387 @@ pause() {
     echo ""
 }
 
-install_shortcut() {
-    [ -f /usr/bin/sba ] && return 0
-    command -v curl >/dev/null 2>&1 || return 0
-
-    local self
-    self=$(readlink -f "$0" 2>/dev/null)
-
-    if [ -n "$self" ] && [ -f "$self" ] && [[ "$self" != "/bin/bash" && "$self" != "/usr/bin/bash" ]]; then
-        cp "$self" /usr/bin/sba 2>/dev/null &&
-            chmod +x /usr/bin/sba &&
+proto_field() {
+    # $1=key $2=字段序号(2显示名 3加密 4传输 5旧tag)
+    local e
+    for e in "${PROTO_DB[@]}"; do
+        [ "${e%%|*}" == "$1" ] && {
+            echo "$e" | cut -d'|' -f"$2"
             return 0
-    fi
-
-    curl "${CURL_OPTS[@]}" \
-        -o /usr/bin/sba \
-        "${REPO_RAW}/install.sh" 2>/dev/null &&
-        chmod +x /usr/bin/sba
-
-    return 0
+        }
+    done
+    return 1
 }
 
-apt_install() {
-    if ! command -v apt-get >/dev/null 2>&1; then
-        echo -e "${RED}本脚本仅支持 Debian/Ubuntu apt 系统。${PLAIN}"
-        return 1
-    fi
+proto_label() { proto_field "$1" 2; }
+proto_tls() { proto_field "$1" 3; }
+proto_trans() { proto_field "$1" 4; }
+proto_legacy_tag() { proto_field "$1" 5; }
 
-    DEBIAN_FRONTEND=noninteractive apt-get update -y >/dev/null 2>&1 || {
-        echo -e "${RED}apt-get update 失败。${PLAIN}"
-        return 1
-    }
+proto_exists() { proto_field "$1" 1 >/dev/null 2>&1; }
 
-    DEBIAN_FRONTEND=noninteractive apt-get install -y "$@" >/dev/null 2>&1 || {
-        echo -e "${RED}依赖安装失败: $*${PLAIN}"
-        return 1
-    }
-
-    return 0
+proto_keys() {
+    local e
+    for e in "${PROTO_DB[@]}"; do echo "${e%%|*}"; done
 }
 
-check_deps_extra() {
+default_tag() {
+    local lt
+    lt=$(proto_legacy_tag "$1")
+    [ -n "$lt" ] && { echo "$lt"; return 0; }
+    echo "$1-in"
+}
+
+pkg_install() {
+    local pm=""
+    command -v apt-get >/dev/null 2>&1 && pm="apt"
+    [ -z "$pm" ] && command -v dnf >/dev/null 2>&1 && pm="dnf"
+    [ -z "$pm" ] && command -v yum >/dev/null 2>&1 && pm="yum"
+    [ -z "$pm" ] && command -v apk >/dev/null 2>&1 && pm="apk"
+
+    case "$pm" in
+        apt)
+            DEBIAN_FRONTEND=noninteractive apt-get update -y >/dev/null 2>&1
+            DEBIAN_FRONTEND=noninteractive apt-get install -y "$@" >/dev/null 2>&1
+            ;;
+        dnf) dnf install -y "$@" >/dev/null 2>&1 ;;
+        yum) yum install -y "$@" >/dev/null 2>&1 ;;
+        apk) apk add --no-cache "$@" >/dev/null 2>&1 ;;
+        *)
+            err "未识别的包管理器，请手动安装: $*"
+            return 1
+            ;;
+    esac
+}
+
+check_deps() {
     local missing=()
-
+    command -v curl >/dev/null 2>&1 || missing+=(curl)
     command -v jq >/dev/null 2>&1 || missing+=(jq)
     command -v qrencode >/dev/null 2>&1 || missing+=(qrencode)
-    command -v base64 >/dev/null 2>&1 || missing+=(coreutils)
+    command -v openssl >/dev/null 2>&1 || missing+=(openssl)
+    command -v tar >/dev/null 2>&1 || missing+=(tar)
     command -v ss >/dev/null 2>&1 || missing+=(iproute2)
 
     if [ ${#missing[@]} -gt 0 ]; then
-        echo -e "${YELLOW}⟳ 安装扩展组件: ${missing[*]} ...${PLAIN}"
-        apt_install "${missing[@]}" || return 1
+        warn "安装依赖: ${missing[*]} ..."
+        pkg_install "${missing[@]}" || true
     fi
 
+    local fatal=()
+    command -v curl >/dev/null 2>&1 || fatal+=(curl)
+    command -v jq >/dev/null 2>&1 || fatal+=(jq)
+    command -v openssl >/dev/null 2>&1 || fatal+=(openssl)
+
+    if [ ${#fatal[@]} -gt 0 ]; then
+        err "缺少关键依赖: ${fatal[*]}，请手动安装后重试。"
+        return 1
+    fi
     return 0
 }
 
 b64_encode() {
-    printf '%s' "$1" | base64 -w 0 2>/dev/null ||
-        printf '%s' "$1" | base64 | tr -d '\n'
+    printf '%s' "$1" | base64 -w 0 2>/dev/null || printf '%s' "$1" | base64 | tr -d '\n'
 }
 
-b64_decode() {
-    printf '%s' "$1" | base64 -d 2>/dev/null
+b64_url() {
+    b64_encode "$1" | tr '+/' '-_' | tr -d '='
 }
 
-# ================= 校验类函数 =================
+urlenc() {
+    local s="$1" out="" i c
+    for ((i = 0; i < ${#s}; i++)); do
+        c="${s:i:1}"
+        case "$c" in
+            [a-zA-Z0-9.~_-]) out+="$c" ;;
+            *) out+=$(printf '%%%02X' "'$c") ;;
+        esac
+    done
+    printf '%s' "$out"
+}
+
+rand_str() {
+    local n="${1:-8}"
+    tr -dc 'a-z0-9' </dev/urandom 2>/dev/null | head -c "$n"
+}
+
+rand_hex() {
+    openssl rand -hex "${1:-4}" 2>/dev/null | tr -d '\n'
+}
+
+gen_uuid() {
+    if [ -x "$SING_BOX_BIN" ]; then
+        "$SING_BOX_BIN" generate uuid 2>/dev/null && return 0
+    fi
+    if [ -r /proc/sys/kernel/random/uuid ]; then
+        cat /proc/sys/kernel/random/uuid
+        return 0
+    fi
+    python3 -c 'import uuid;print(uuid.uuid4())' 2>/dev/null
+}
+
+gen_pass() { rand_hex "${1:-12}"; }
+
+gen_ss_key() {
+    if [ -x "$SING_BOX_BIN" ]; then
+        "$SING_BOX_BIN" generate rand --base64 "${1:-16}" 2>/dev/null && return 0
+    fi
+    openssl rand -base64 "${1:-16}" 2>/dev/null | tr -d '\n'
+}
 
 valid_port() {
-    [[ "$1" =~ ^[0-9]+$ ]] &&
-        [ "$1" -ge 1 ] &&
-        [ "$1" -le 65535 ]
+    [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
 }
 
 valid_range() {
-    [[ "$1" =~ ^[0-9]+[:-][0-9]+$ ]] || return 1
-
-    local a b
-    a="${1%%[:-]*}"
-    b="${1##*[:-]}"
-
-    valid_port "$a" &&
-        valid_port "$b" &&
-        [ "$a" -lt "$b" ]
+    [[ "$1" =~ ^([0-9]+):([0-9]+)$ ]] || return 1
+    local a="${BASH_REMATCH[1]}" b="${BASH_REMATCH[2]}"
+    valid_port "$a" && valid_port "$b" && [ "$a" -lt "$b" ]
 }
 
 valid_domain() {
-    [[ "$1" =~ ^([A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?\.)+[A-Za-z]{2,}$ ]]
+    [[ "$1" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)+$ ]]
 }
 
 valid_ipv4() {
     [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
-
-    local part
-    IFS='.' read -r -a parts <<< "$1"
-
-    for part in "${parts[@]}"; do
-        [ "$part" -le 255 ] || return 1
-    done
-
+    local IFS='.' p
+    read -ra p <<<"$1"
+    for i in "${p[@]}"; do [ "$i" -le 255 ] || return 1; done
     return 0
 }
 
 port_in_use() {
-    command -v ss >/dev/null 2>&1 || return 1
-
-    ss -lntuH 2>/dev/null |
-        awk '{print $5}' |
-        grep -Eq "(^|[.:])${1}$"
+    ss -lnutH 2>/dev/null | awk '{print $5}' | grep -qE "[:.]$1\$"
 }
 
-# ================= 端口分配 =================
+used_ports() {
+    # nodes.json 中已占用的端口 + 端口跳跃区间起止
+    [ -f "$NODES_FILE" ] || return 0
+    jq -r '.nodes[]? | (.port|tostring), (if (.hop//"")!="" then (.hop|split(":")|.[]) else empty end)' \
+        "$NODES_FILE" 2>/dev/null
+}
 
-get_unique_port() {
-    local p
-
-    while true; do
-        p=$(shuf -i 10000-65535 -n 1)
-
-        [[ " ${USED_PORTS[*]} " == *" $p "* ]] && continue
+pick_port() {
+    # 随机取一个未被占用端口 (可选段: $1=起 $2=止)
+    local lo="${1:-20000}" hi="${2:-60000}" p tries=0 taken
+    taken=$(used_ports | tr '\n' ' ')
+    while [ $tries -lt 200 ]; do
+        p=$((RANDOM % (hi - lo) + lo))
+        tries=$((tries + 1))
+        [[ " $taken " == *" $p "* ]] && continue
         port_in_use "$p" && continue
-
-        USED_PORTS+=("$p")
-        REPLY="$p"
+        echo "$p"
         return 0
     done
-}
-
-generate_random_ports() {
-    USED_PORTS=()
-
-    get_unique_port
-    RND_REALITY="$REPLY"
-
-    get_unique_port
-    RND_ANYTLS="$REPLY"
-
-    get_unique_port
-    RND_ANYREALITY="$REPLY"
-
-    get_unique_port
-    RND_HY2="$REPLY"
-
-    get_unique_port
-    RND_TUIC="$REPLY"
-}
-
-get_extra_ports() {
-    [ -f "$EXTRA_NODES_FILE" ] || return 0
-
-    local encoded decoded proto port sni id pass
-
-    while IFS= read -r encoded || [ -n "$encoded" ]; do
-        [ -z "$encoded" ] && continue
-
-        decoded=$(b64_decode "$encoded" 2>/dev/null) || continue
-
-        IFS=$'\t' read -r proto port sni id pass <<< "$decoded"
-
-        valid_port "$port" && echo "$port"
-    done < "$EXTRA_NODES_FILE"
-}
-
-collect_all_ports() {
-    USED_PORTS=()
-
-    [ -n "${PORT_REALITY:-}" ] && USED_PORTS+=("$PORT_REALITY")
-    [ -n "${PORT_ANYTLS:-}" ] && USED_PORTS+=("$PORT_ANYTLS")
-    [ -n "${PORT_ANYREALITY:-}" ] && USED_PORTS+=("$PORT_ANYREALITY")
-    [ -n "${PORT_HY2:-}" ] && USED_PORTS+=("$PORT_HY2")
-    [ -n "${PORT_TUIC:-}" ] && USED_PORTS+=("$PORT_TUIC")
-
-    local p
-    while read -r p; do
-        [ -n "$p" ] && USED_PORTS+=("$p")
-    done < <(get_extra_ports)
+    echo "$((RANDOM % 20000 + 30000))"
 }
 
 ask_port() {
-    local prompt="$1"
-    local default="$2"
-    local p c
-
+    # $1=提示 $2=默认值 -> 结果写入 ASK_PORT
+    local tip="$1" def="$2" input
     while true; do
-        read -r -p "${prompt} [默认 ${default}]: " p
-        p=${p:-$default}
-
-        if ! valid_port "$p"; then
-            echo -e "${RED}端口必须是 1-65535 的数字，请重试。${PLAIN}"
+        read -r -p "${tip} [回车=${def}]: " input
+        input="${input:-$def}"
+        if ! valid_port "$input"; then
+            err "端口不合法"
             continue
         fi
-
-        if [[ " ${CHOSEN_PORTS[*]} " == *" $p "* ]]; then
-            echo -e "${RED}端口 $p 已被本次配置中的其他协议使用，请换一个。${PLAIN}"
-            continue
-        fi
-
-        if [ "$p" != "$default" ] && port_in_use "$p"; then
-            echo -e "${YELLOW}警告: 系统上端口 $p 已被占用。${PLAIN}"
+        if [ "$input" != "$def" ] && port_in_use "$input"; then
+            warn "端口 $input 已被系统占用"
+            local c
             read -r -p "仍要使用吗？[y/N]: " c
             [[ "$c" =~ ^[Yy]$ ]] || continue
         fi
-
-        CHOSEN_PORTS+=("$p")
-        REPLY="$p"
+        ASK_PORT="$input"
         return 0
     done
 }
-
-ask_new_node_port() {
-    local p c
-
-    while true; do
-        read -r -p "请输入新增节点端口: " p
-
-        if ! valid_port "$p"; then
-            echo -e "${RED}端口必须是 1-65535 的数字。${PLAIN}"
-            continue
-        fi
-
-        if [[ " ${USED_PORTS[*]} " == *" $p "* ]]; then
-            echo -e "${RED}端口 $p 已被当前 Sing-box 配置使用，请更换。${PLAIN}"
-            continue
-        fi
-
-        if port_in_use "$p"; then
-            echo -e "${YELLOW}警告: 系统上端口 $p 当前已被占用。${PLAIN}"
-            ss -lntupH 2>/dev/null | grep -E "[:.]${p}[[:space:]]" || true
-
-            read -r -p "仍然使用该端口吗？[y/N]: " c
-            [[ "$c" =~ ^[Yy]$ ]] || continue
-        fi
-
-        REPLY="$p"
-        return 0
-    done
-}
-
-# ================= 网络基础 =================
 
 get_public_ip() {
     [ -n "$PUBLIC_IP" ] && return 0
-
     local url
-
     for url in ifconfig.me ipv4.icanhazip.com api.ipify.org; do
-        PUBLIC_IP=$(
-            curl -s4 \
-                --connect-timeout 5 \
-                --max-time 8 \
-                "https://${url}" 2>/dev/null |
-                tr -d '[:space:]'
-        )
-
-        if valid_ipv4 "$PUBLIC_IP"; then
-            return 0
-        fi
-
+        PUBLIC_IP=$(curl -s4 --connect-timeout 5 --max-time 8 "https://${url}" 2>/dev/null | tr -d '[:space:]')
+        valid_ipv4 "$PUBLIC_IP" && return 0
         PUBLIC_IP=""
     done
-
-    echo -e "${YELLOW}自动获取公网 IPv4 失败。${PLAIN}"
-
+    warn "自动获取公网 IPv4 失败。"
     while true; do
         read -r -p "请手动输入本机公网 IP: " PUBLIC_IP
-
-        if valid_ipv4 "$PUBLIC_IP"; then
-            return 0
-        fi
-
-        echo -e "${RED}IPv4 地址格式不正确，请重试。${PLAIN}"
+        valid_ipv4 "$PUBLIC_IP" && return 0
+        err "IPv4 地址格式不正确"
     done
 }
 
+get_public_ip6() {
+    [ -n "$PUBLIC_IP6" ] && return 0
+    PUBLIC_IP6=$(curl -s6 --connect-timeout 5 --max-time 8 https://ipv6.icanhazip.com 2>/dev/null | tr -d '[:space:]')
+    [[ "$PUBLIC_IP6" == *:* ]] || PUBLIC_IP6=""
+}
+
 check_bbr_status() {
-    if sysctl net.ipv4.tcp_congestion_control 2>/dev/null |
-        grep -q "bbr"; then
+    if sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q bbr; then
         echo -e "${GREEN}已开启${PLAIN}"
     else
-        echo -e "${RED}未开启${PLAIN}"
+        echo -e "${YELLOW}未开启${PLAIN}"
     fi
 }
 
 enable_bbr() {
     clear
-
-    local kver kmaj kmin
-    kver=$(uname -r)
-    kmaj=${kver%%.*}
-    kmin=$(echo "$kver" | cut -d. -f2)
-
-    if [ "$kmaj" -lt 4 ] ||
-        {
-            [ "$kmaj" -eq 4 ] &&
-                [ "$kmin" -lt 9 ]
-        }; then
-        echo -e "${RED}内核 $kver 低于 4.9，不支持 BBR，请先升级内核。${PLAIN}"
+    if sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q bbr; then
+        ok "BBR 已经处于开启状态。"
         pause
         return
     fi
-
-    if sysctl net.ipv4.tcp_congestion_control 2>/dev/null |
-        grep -q "bbr"; then
-        echo -e "${GREEN}系统已开启 BBR。${PLAIN}"
+    sed -i '/net.core.default_qdisc/d;/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
+    {
+        echo "net.core.default_qdisc=fq"
+        echo "net.ipv4.tcp_congestion_control=bbr"
+    } >>/etc/sysctl.conf
+    sysctl -p >/dev/null 2>&1
+    if sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q bbr; then
+        ok "BBR 已开启。"
     else
-        sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf
-        sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
-
-        echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
-        echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
-
-        if sysctl -p >/dev/null 2>&1 &&
-            sysctl net.ipv4.tcp_congestion_control | grep -q bbr; then
-            echo -e "${GREEN}✔ BBR 开启成功！${PLAIN}"
-        else
-            echo -e "${RED}BBR 开启失败，请检查内核模块 tcp_bbr。${PLAIN}"
-        fi
+        err "开启失败，内核可能不支持 BBR (需要 4.9+)。"
     fi
-
     pause
 }
 
-# ================= Sing-box 核心 =================
-
-get_latest_version() {
-    LATEST_VERSION=$(
-        curl "${CURL_OPTS[@]}" \
-            "${GH_PROXY}${GH_API}" 2>/dev/null |
-            jq -r '.tag_name // empty' |
-            sed 's/^v//'
-    )
-
-    [[ "$LATEST_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
-        LATEST_VERSION=""
-}
-
-download_core() {
-    check_deps_extra || return 1
-
-    get_latest_version
-
-    if [ -z "$LATEST_VERSION" ]; then
-        echo -e "${RED}获取 sing-box 最新版本号失败（GitHub API 不可达或被限流）。${PLAIN}"
-        echo -e "${YELLOW}如处于受限网络，请设置 GH_PROXY 后重试。${PLAIN}"
-        return 1
+install_shortcut() {
+    [ -f /usr/bin/sba ] && return 0
+    local self
+    self=$(readlink -f "$0" 2>/dev/null)
+    if [ -n "$self" ] && [ -f "$self" ] && [[ "$self" != /bin/bash && "$self" != /usr/bin/bash ]]; then
+        cp "$self" /usr/bin/sba 2>/dev/null && chmod +x /usr/bin/sba && return 0
     fi
-
-    local arch dl_arch tmpdir
-
-    arch=$(uname -m)
-
-    case "$arch" in
-        x86_64)
-            dl_arch="amd64"
-            ;;
-        aarch64)
-            dl_arch="arm64"
-            ;;
-        *)
-            echo -e "${RED}不支持的架构: $arch${PLAIN}"
-            return 1
-            ;;
-    esac
-
-    tmpdir=$(mktemp -d) || return 1
-
-    echo -e "${YELLOW}下载 sing-box v${LATEST_VERSION} (linux-${dl_arch})...${PLAIN}"
-
-    if ! curl "${CURL_OPTS[@]}" \
-        --max-time 180 \
-        -o "$tmpdir/sb.tgz" \
-        "${GH_DL}/v${LATEST_VERSION}/sing-box-${LATEST_VERSION}-linux-${dl_arch}.tar.gz"; then
-        echo -e "${RED}核心下载失败！${PLAIN}"
-        rm -rf "$tmpdir"
-        return 1
-    fi
-
-    if ! tar -xzf "$tmpdir/sb.tgz" -C "$tmpdir"; then
-        echo -e "${RED}解压失败，安装包可能已损坏。${PLAIN}"
-        rm -rf "$tmpdir"
-        return 1
-    fi
-
-    if [ ! -x "$tmpdir/sing-box-${LATEST_VERSION}-linux-${dl_arch}/sing-box" ]; then
-        echo -e "${RED}解压后未找到 sing-box 可执行文件。${PLAIN}"
-        rm -rf "$tmpdir"
-        return 1
-    fi
-
-    # 先写入 .new，再 mv，避免覆盖运行中的二进制导致 ETXTBSY
-    install -m 755 \
-        "$tmpdir/sing-box-${LATEST_VERSION}-linux-${dl_arch}/sing-box" \
-        "${SING_BOX_BIN}.new" || {
-        rm -rf "$tmpdir"
-        return 1
-    }
-
-    mv -f "${SING_BOX_BIN}.new" "$SING_BOX_BIN"
-    rm -rf "$tmpdir"
-
-    echo -e "${GREEN}✔ 核心已就绪: v${LATEST_VERSION}${PLAIN}"
+    command -v curl >/dev/null 2>&1 || return 0
+    curl "${CURL_OPTS[@]}" -o /usr/bin/sba "${REPO_RAW}/install.sh" 2>/dev/null && chmod +x /usr/bin/sba
     return 0
 }
 
-validate_config() {
-    [ -x "$SING_BOX_BIN" ] || return 1
-    [ -f "$CONFIG_DIR/config.json" ] || return 1
+# ================= 内核安装 =================
 
-    if "$SING_BOX_BIN" check -c "$CONFIG_DIR/config.json" >/dev/null 2>&1; then
+sys_arch() {
+    case "$(uname -m)" in
+        x86_64 | amd64) echo "amd64" ;;
+        aarch64 | arm64) echo "arm64" ;;
+        armv7l) echo "armv7" ;;
+        s390x) echo "s390x" ;;
+        *) return 1 ;;
+    esac
+}
+
+resolve_sb_version() {
+    # 家宽/CGNAT 上 api.github.com 常被限流 403，所以优先用 releases/latest 的 302 跳转
+    local url tag
+    url=$(curl -fsSLI -o /dev/null -w '%{url_effective}' --connect-timeout 8 --max-time 20 \
+        "https://github.com/${SB_REPO}/releases/latest" 2>/dev/null)
+    tag="${url##*/tag/}"
+    if [[ "$tag" =~ ^v?([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+        echo "${BASH_REMATCH[1]}"
         return 0
     fi
 
-    echo -e "${RED}配置校验失败：${PLAIN}"
-    "$SING_BOX_BIN" check -c "$CONFIG_DIR/config.json" 2>&1 | tail -20
-    return 1
+    tag=$(curl "${CURL_OPTS[@]}" "https://api.github.com/repos/${SB_REPO}/releases/latest" 2>/dev/null |
+        jq -r '.tag_name // empty' | sed 's/^v//')
+    if [[ "$tag" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        echo "$tag"
+        return 0
+    fi
+
+    tag=$(curl "${CURL_OPTS[@]}" "https://github.com/${SB_REPO}/releases.atom" 2>/dev/null |
+        grep -oE 'releases/tag/v[0-9]+\.[0-9]+\.[0-9]+' | head -1 | sed 's#.*/v##')
+    if [[ "$tag" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        echo "$tag"
+        return 0
+    fi
+
+    echo "$SB_FALLBACK_VERSION"
 }
 
-silent_update_core() {
+core_version() {
+    [ -x "$SING_BOX_BIN" ] || return 1
+    "$SING_BOX_BIN" version 2>/dev/null | awk 'NR==1{print $3}'
+}
+
+download_core() {
+    local want="${1:-}" arch tmpdir
+    arch=$(sys_arch) || {
+        err "不支持的 CPU 架构: $(uname -m)"
+        return 1
+    }
+
+    [ -z "$want" ] && want=$(resolve_sb_version)
+    msg "${YELLOW}准备安装 sing-box v${want} (linux-${arch})...${PLAIN}"
+
+    tmpdir=$(mktemp -d) || return 1
+    local pkg="sing-box-${want}-linux-${arch}"
+    if ! curl "${CURL_OPTS[@]}" --max-time 300 -o "$tmpdir/sb.tgz" \
+        "${GH_PROXY}https://github.com/${SB_REPO}/releases/download/v${want}/${pkg}.tar.gz"; then
+        err "核心下载失败（可尝试 export GH_PROXY=加速前缀 后重试）。"
+        rm -rf "$tmpdir"
+        return 1
+    fi
+
+    if ! tar -xzf "$tmpdir/sb.tgz" -C "$tmpdir" 2>/dev/null; then
+        err "解压失败，安装包可能损坏。"
+        rm -rf "$tmpdir"
+        return 1
+    fi
+
+    if [ ! -x "$tmpdir/$pkg/sing-box" ]; then
+        err "压缩包内未找到 sing-box 可执行文件。"
+        rm -rf "$tmpdir"
+        return 1
+    fi
+
+    install -m 755 "$tmpdir/$pkg/sing-box" "${SING_BOX_BIN}.new" || {
+        rm -rf "$tmpdir"
+        return 1
+    }
+    mv -f "${SING_BOX_BIN}.new" "$SING_BOX_BIN"
+    rm -rf "$tmpdir"
+    ok "核心已就绪: $(core_version)"
+    return 0
+}
+
+update_core() {
     clear
+    check_deps || {
+        pause
+        return
+    }
+    local cur new
+    cur=$(core_version)
+    new=$(resolve_sb_version)
+    msg "当前核心: ${GREEN}${cur:-未安装}${PLAIN}   最新版本: ${GREEN}${new}${PLAIN}"
 
-    local current="未安装"
-    [ -x "$SING_BOX_BIN" ] &&
-        current=$("$SING_BOX_BIN" version 2>/dev/null | awk 'NR==1{print $3}')
-
-    echo -e "${YELLOW}当前版本: ${current}${PLAIN}"
-
-    [ -f "$SING_BOX_BIN" ] &&
-        cp -a "$SING_BOX_BIN" "${SING_BOX_BIN}.bak"
-
-    if ! download_core; then
-        [ -f "${SING_BOX_BIN}.bak" ] &&
-            mv -f "${SING_BOX_BIN}.bak" "$SING_BOX_BIN"
+    if [ -n "$cur" ] && [ "$cur" == "$new" ]; then
+        ok "已是最新版本，无需更新。"
         pause
         return
     fi
 
-    if validate_config; then
-        systemctl restart sing-box
-        rm -f "${SING_BOX_BIN}.bak"
-        echo -e "${GREEN}✔ 已更新至 v${LATEST_VERSION} 并重启服务。${PLAIN}"
-    else
-        echo -e "${RED}新核心与现有配置不兼容，已回滚到原版本。${PLAIN}"
-        mv -f "${SING_BOX_BIN}.bak" "$SING_BOX_BIN"
-        systemctl restart sing-box
+    cp -f "$SING_BOX_BIN" "${SING_BOX_BIN}.bak" 2>/dev/null
+    if ! download_core "$new"; then
+        [ -f "${SING_BOX_BIN}.bak" ] && mv -f "${SING_BOX_BIN}.bak" "$SING_BOX_BIN"
+        pause
+        return
     fi
 
+    if [ -f "$CONFIG_FILE" ] && ! "$SING_BOX_BIN" check -c "$CONFIG_FILE" >/dev/null 2>&1; then
+        err "新核心校验旧配置失败，正在回滚..."
+        [ -f "${SING_BOX_BIN}.bak" ] && mv -f "${SING_BOX_BIN}.bak" "$SING_BOX_BIN"
+        systemctl restart sing-box >/dev/null 2>&1
+        pause
+        return
+    fi
+
+    rm -f "${SING_BOX_BIN}.bak"
+    systemctl restart sing-box >/dev/null 2>&1
+    ok "核心已更新到 $(core_version)"
     pause
 }
 
@@ -515,1940 +501,2060 @@ silent_update_core() {
 
 prompt_domain() {
     local d
-
     while true; do
         read -r -p "请输入域名: " d
-
-        if valid_domain "$d"; then
+        valid_domain "$d" && {
             DOMAIN="$d"
             return 0
-        fi
-
-        echo -e "${RED}域名格式不正确，请重试。${PLAIN}"
+        }
+        err "域名格式不正确"
     done
 }
 
 ask_cert_params() {
     local allow_back="${1:-}"
-
     while true; do
-        echo "1. 生成临时自签证书 (有效期10年，适合无域名场景)"
-        echo "2. 申请永久证书 (Standalone，要求域名已解析到本机且 80 端口可用)"
-        echo "3. 申请永久证书 (Cloudflare DNS API)"
-
-        [ -n "$allow_back" ] && echo "0. 返回"
-
+        msg "1. 生成临时自签证书 (有效期 10 年，无域名也能用，客户端需勾选跳过证书验证)"
+        msg "2. 申请永久证书 (Standalone，要求域名已解析到本机且 80 端口空闲)"
+        msg "3. 申请永久证书 (Cloudflare DNS API，无需 80 端口)"
+        [ -n "$allow_back" ] && msg "0. 返回"
         read -r -p "请输入选项: " CERT_CHOICE
-
-        if [ -n "$allow_back" ] && [ "$CERT_CHOICE" == "0" ]; then
-            return 1
-        fi
-
+        [ -n "$allow_back" ] && [ "$CERT_CHOICE" == "0" ] && return 1
         case "$CERT_CHOICE" in
-            1 | 2 | 3)
-                break
-                ;;
-            *)
-                echo -e "${RED}无效选项${PLAIN}"
-                ;;
+            1 | 2 | 3) break ;;
+            *) err "无效选项" ;;
         esac
     done
 
-    case "$CERT_CHOICE" in
-        1)
-            DOMAIN="bing.com"
-            ACME_EMAIL=""
-            CF_EMAIL=""
-            CF_KEY=""
-            CF_TOKEN=""
-            CF_ACCOUNT_ID=""
-            ;;
+    ACME_EMAIL=""
+    CF_EMAIL=""
+    CF_KEY=""
+    CF_TOKEN=""
+    CF_ACCOUNT_ID=""
 
+    case "$CERT_CHOICE" in
+        1) DOMAIN="bing.com" ;;
         2)
             prompt_domain
-            read -r -p "ACME 注册邮箱 [留空则自动生成]: " ACME_EMAIL
-            CF_EMAIL=""
-            CF_KEY=""
-            CF_TOKEN=""
-            CF_ACCOUNT_ID=""
+            read -r -p "ACME 注册邮箱 [留空自动生成]: " ACME_EMAIL
             ;;
-
         3)
             prompt_domain
-
             local use_token
-            read -r -p "使用 CF API Token？(推荐，权限更小) [Y/n]: " use_token
-
+            read -r -p "使用 CF API Token？(推荐) [Y/n]: " use_token
             if [[ ! "$use_token" =~ ^[Nn]$ ]]; then
                 read -r -p "CF API Token: " CF_TOKEN
                 read -r -p "CF Account ID (可留空): " CF_ACCOUNT_ID
-
-                CF_EMAIL=""
-                CF_KEY=""
             else
                 read -r -p "CF 账号邮箱: " CF_EMAIL
                 read -r -p "CF Global API Key: " CF_KEY
-
-                CF_TOKEN=""
-                CF_ACCOUNT_ID=""
             fi
             ;;
     esac
-
     return 0
 }
 
 install_acme() {
-    apt_install socat cron || return 1
-
+    pkg_install socat cron >/dev/null 2>&1
     if [ ! -x "$HOME/.acme.sh/acme.sh" ]; then
         local email="${ACME_EMAIL:-sba_cert_${RANDOM}@gmail.com}"
-
-        echo -e "${YELLOW}安装 acme.sh (注册邮箱: ${email})...${PLAIN}"
-
-        if ! curl -s \
-            --connect-timeout 8 \
-            --max-time 120 \
-            https://get.acme.sh |
-            sh -s email="$email"; then
-            return 1
-        fi
+        warn "安装 acme.sh (注册邮箱: ${email}) ..."
+        curl -s --connect-timeout 8 --max-time 180 https://get.acme.sh | sh -s email="$email" || return 1
     fi
-
     [ -x "$HOME/.acme.sh/acme.sh" ]
 }
 
 precheck_standalone() {
     get_public_ip || return 1
-
     local resolved c
     resolved=$(getent ahostsv4 "$DOMAIN" 2>/dev/null | awk 'NR==1{print $1}')
-
-    if [ -n "$PUBLIC_IP" ] &&
-        [ -n "$resolved" ] &&
-        [ "$resolved" != "$PUBLIC_IP" ]; then
-        echo -e "${YELLOW}警告: $DOMAIN 解析到 $resolved，与本机 $PUBLIC_IP 不一致，申请可能失败。${PLAIN}"
+    if [ -n "$PUBLIC_IP" ] && [ -n "$resolved" ] && [ "$resolved" != "$PUBLIC_IP" ]; then
+        warn "$DOMAIN 解析到 $resolved，与本机 $PUBLIC_IP 不一致，申请可能失败。"
         read -r -p "仍要继续吗？[y/N]: " c
         [[ "$c" =~ ^[Yy]$ ]] || return 1
     fi
-
     if port_in_use 80; then
-        echo -e "${YELLOW}警告: 80 端口已被占用，Standalone 验证需要 80 端口：${PLAIN}"
-        ss -lntupH 2>/dev/null | grep -E '[:.]80[[:space:]]' || true
-
+        warn "80 端口已被占用，Standalone 验证需要 80 端口。"
         read -r -p "仍要继续吗？[y/N]: " c
         [[ "$c" =~ ^[Yy]$ ]] || return 1
     fi
-
     return 0
+}
+
+self_signed_cert() {
+    mkdir -p "$CERT_DIR"
+    openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
+        -keyout "$CERT_DIR/server.key" -out "$CERT_DIR/server.crt" \
+        -subj "/C=US/ST=State/L=City/O=Organization/CN=${1:-bing.com}" >/dev/null 2>&1
 }
 
 issue_cert() {
     mkdir -p "$CERT_DIR" || return 1
-
     case "$CERT_CHOICE" in
         1)
-            openssl req \
-                -x509 \
-                -nodes \
-                -days 3650 \
-                -newkey rsa:2048 \
-                -keyout "$CERT_DIR/server.key" \
-                -out "$CERT_DIR/server.crt" \
-                -subj "/C=US/ST=State/L=City/O=Organization/CN=bing.com" ||
-                return 1
+            self_signed_cert "bing.com" || return 1
             ;;
-
         2 | 3)
             install_acme || {
-                echo -e "${RED}acme.sh 安装失败${PLAIN}"
+                err "acme.sh 安装失败"
                 return 1
             }
-
-            "$HOME/.acme.sh/acme.sh" \
-                --set-default-ca \
-                --server letsencrypt >/dev/null 2>&1
-
+            "$HOME/.acme.sh/acme.sh" --set-default-ca --server letsencrypt >/dev/null 2>&1
             if [ "$CERT_CHOICE" == "2" ]; then
                 precheck_standalone || return 1
-
-                echo -e "${YELLOW}申请证书 (Standalone)...${PLAIN}"
-
-                # 不加 --force，避免已有有效证书时重复触发频率限制
-                "$HOME/.acme.sh/acme.sh" \
-                    --issue \
-                    -d "$DOMAIN" \
-                    --standalone \
-                    -k ec-256 || return 1
+                warn "申请证书 (Standalone) ..."
+                "$HOME/.acme.sh/acme.sh" --issue -d "$DOMAIN" --standalone -k ec-256 || return 1
             else
                 if [ -n "$CF_TOKEN" ]; then
                     export CF_Token="$CF_TOKEN"
-                    [ -n "$CF_ACCOUNT_ID" ] &&
-                        export CF_Account_ID="$CF_ACCOUNT_ID"
+                    [ -n "$CF_ACCOUNT_ID" ] && export CF_Account_ID="$CF_ACCOUNT_ID"
                 else
                     export CF_Key="$CF_KEY"
                     export CF_Email="$CF_EMAIL"
                 fi
-
-                echo -e "${YELLOW}申请证书 (Cloudflare DNS)...${PLAIN}"
-
-                "$HOME/.acme.sh/acme.sh" \
-                    --issue \
-                    --dns dns_cf \
-                    -d "$DOMAIN" \
-                    -k ec-256 || return 1
+                warn "申请证书 (Cloudflare DNS) ..."
+                "$HOME/.acme.sh/acme.sh" --issue --dns dns_cf -d "$DOMAIN" -k ec-256 || return 1
             fi
-
-            # 证书续期后自动重启 sing-box
-            "$HOME/.acme.sh/acme.sh" \
-                --installcert \
-                -d "$DOMAIN" \
-                --ecc \
+            "$HOME/.acme.sh/acme.sh" --installcert -d "$DOMAIN" --ecc \
                 --fullchain-file "$CERT_DIR/server.crt" \
                 --key-file "$CERT_DIR/server.key" \
-                --reloadcmd "systemctl restart sing-box >/dev/null 2>&1 || true" ||
-                return 1
+                --reloadcmd "systemctl restart sing-box >/dev/null 2>&1 || true" || return 1
             ;;
         *)
-            echo -e "${RED}未知证书类型。${PLAIN}"
+            err "未知证书类型"
             return 1
             ;;
     esac
 
-    [ -f "$CERT_DIR/server.crt" ] || return 1
-    [ -f "$CERT_DIR/server.key" ] || return 1
-
+    [ -s "$CERT_DIR/server.crt" ] && [ -s "$CERT_DIR/server.key" ] || return 1
     chmod 600 "$CERT_DIR/server.key"
     chmod 644 "$CERT_DIR/server.crt"
-
     return 0
 }
 
-# ================= 配置保存 =================
+# ================= nodes.json 数据层 =================
 
-save_config() {
+nodes_init() {
     mkdir -p "$CONFIG_DIR"
-
-    {
-        printf 'CERT_CHOICE=%q\n' "${CERT_CHOICE:-}"
-        printf 'DOMAIN=%q\n' "${DOMAIN:-}"
-        printf 'ACME_EMAIL=%q\n' "${ACME_EMAIL:-}"
-        printf 'CF_EMAIL=%q\n' "${CF_EMAIL:-}"
-        printf 'CF_KEY=%q\n' "${CF_KEY:-}"
-        printf 'CF_TOKEN=%q\n' "${CF_TOKEN:-}"
-        printf 'CF_ACCOUNT_ID=%q\n' "${CF_ACCOUNT_ID:-}"
-
-        printf 'PORT_REALITY=%q\n' "${PORT_REALITY:-}"
-        printf 'PORT_ANYTLS=%q\n' "${PORT_ANYTLS:-}"
-        printf 'PORT_ANYREALITY=%q\n' "${PORT_ANYREALITY:-}"
-        printf 'PORT_HY2=%q\n' "${PORT_HY2:-}"
-        printf 'PORT_HY2_RANGE=%q\n' "${PORT_HY2_RANGE:-}"
-        printf 'PORT_TUIC=%q\n' "${PORT_TUIC:-}"
-
-        printf 'PADDING_SCHEME_JSON=%q\n' "${PADDING_SCHEME_JSON:-}"
-
-        printf 'UUID_REALITY=%q\n' "${UUID_REALITY:-}"
-        printf 'PASS_ANYTLS=%q\n' "${PASS_ANYTLS:-}"
-        printf 'PASS_ANYREALITY=%q\n' "${PASS_ANYREALITY:-}"
-        printf 'PASS_HY2=%q\n' "${PASS_HY2:-}"
-        printf 'UUID_TUIC=%q\n' "${UUID_TUIC:-}"
-        printf 'PASS_TUIC=%q\n' "${PASS_TUIC:-}"
-
-        printf 'REALITY_PRIVATE=%q\n' "${REALITY_PRIVATE:-}"
-        printf 'REALITY_PUBLIC=%q\n' "${REALITY_PUBLIC:-}"
-        printf 'REALITY_SHORT_ID=%q\n' "${REALITY_SHORT_ID:-}"
-        printf 'REALITY_DEST=%q\n' "${REALITY_DEST:-}"
-    } > "$CONF_FILE"
-
-    chmod 600 "$CONF_FILE"
+    [ -f "$NODES_FILE" ] && jq -e . "$NODES_FILE" >/dev/null 2>&1 && return 0
+    jq -n --argjson pad "$DEFAULT_PADDING" --arg dest "$DEFAULT_REALITY_DEST" '{
+        version: 2,
+        cert: {choice:"1", domain:"bing.com", acme_email:"", cf_email:"", cf_key:"", cf_token:"", cf_account_id:""},
+        reality: {private_key:"", public_key:"", short_id:"", dest:$dest},
+        creds: {uuid:"", password:"", ss2022:"", ss_pass:"", snell_psk:"", user:"sba", obfs:"", padding:$pad},
+        nodes: []
+    }' >"$NODES_FILE" || return 1
+    chmod 600 "$NODES_FILE"
 }
 
-padding_as_array() {
-    local raw="${PADDING_SCHEME_JSON:-}"
-
-    [ -n "$raw" ] || raw="$DEFAULT_PADDING"
-
-    # 兼容完整 JSON 数组，例如:
-    # ["stop=8","0=30-30"]
-    if printf '%s\n' "$raw" |
-        jq -e 'type == "array" and all(.[]; type == "string")' >/dev/null 2>&1; then
-        printf '%s\n' "$raw" | jq -c .
-        return 0
-    fi
-
-    # 兼容 JSON 片段，例如:
-    # "stop=8", "0=30-30"
-    if printf '[%s]\n' "$raw" |
-        jq -e 'type == "array" and all(.[]; type == "string")' >/dev/null 2>&1; then
-        printf '[%s]\n' "$raw" | jq -c .
-        return 0
-    fi
-
-    return 1
+nj() {
+    # 只读查询: nj '<filter>' [jq参数...]
+    local f="$1"
+    shift
+    jq -r "$@" "$f" "$NODES_FILE" 2>/dev/null
 }
 
-set_padding_value() {
-    local raw="$1"
-
-    if [ -z "$raw" ]; then
-        PADDING_SCHEME_JSON="$DEFAULT_PADDING"
-        return 0
-    fi
-
-    if printf '%s\n' "$raw" |
-        jq -e 'type == "array" and all(.[]; type == "string")' >/dev/null 2>&1; then
-        PADDING_SCHEME_JSON=$(printf '%s\n' "$raw" | jq -c .)
-        return 0
-    fi
-
-    if printf '[%s]\n' "$raw" |
-        jq -e 'type == "array" and all(.[]; type == "string")' >/dev/null 2>&1; then
-        PADDING_SCHEME_JSON=$(printf '[%s]\n' "$raw" | jq -c .)
-        return 0
-    fi
-
-    return 1
-}
-
-# ================= 节点 JSON 生成 =================
-
-make_inbound_json() {
-    local protocol="$1"
-    local tag="$2"
-    local port="$3"
-    local sni="$4"
-    local identifier="$5"
-    local password="$6"
-
-    local padding_json
-    padding_json=$(padding_as_array) || {
-        echo -e "${RED}Padding 配置不是合法 JSON 数组。${PLAIN}" >&2
+nj_set() {
+    # 原子更新: nj_set '<program>' [jq参数...]
+    local prog="$1"
+    shift
+    local tmp="${NODES_FILE}.tmp"
+    jq "$@" "$prog" "$NODES_FILE" >"$tmp" 2>/dev/null || {
+        rm -f "$tmp"
+        err "写入 nodes.json 失败"
         return 1
     }
+    mv -f "$tmp" "$NODES_FILE"
+    chmod 600 "$NODES_FILE"
+}
 
-    case "$protocol" in
-        1)
-            jq -n \
-                --arg tag "$tag" \
-                --arg port "$port" \
-                --arg sni "$sni" \
-                --arg uuid "$identifier" \
-                --arg private_key "$REALITY_PRIVATE" \
-                --arg short_id "$REALITY_SHORT_ID" \
-                '
-                {
-                    type: "vless",
-                    tag: $tag,
-                    listen: "::",
-                    listen_port: ($port | tonumber),
-                    users: [
-                        {
-                            uuid: $uuid,
-                            flow: "xtls-rprx-vision"
-                        }
-                    ],
-                    tls: {
-                        enabled: true,
-                        server_name: $sni,
-                        reality: {
-                            enabled: true,
-                            handshake: {
-                                server: $sni,
-                                server_port: 443
-                            },
-                            private_key: $private_key,
-                            short_id: [$short_id]
-                        }
-                    }
-                }'
-            ;;
+node_json_by_tag() {
+    jq -c --arg t "$1" '.nodes[] | select(.tag == $t)' "$NODES_FILE" 2>/dev/null
+}
 
-        2)
-            jq -n \
-                --arg tag "$tag" \
-                --arg port "$port" \
-                --arg sni "$sni" \
-                --arg password "$password" \
-                --arg cert "${CERT_DIR}/server.crt" \
-                --arg key "${CERT_DIR}/server.key" \
-                --argjson padding "$padding_json" \
-                '
-                {
-                    type: "anytls",
-                    tag: $tag,
-                    listen: "::",
-                    listen_port: ($port | tonumber),
-                    users: [
-                        {
-                            password: $password
-                        }
-                    ],
-                    padding_scheme: $padding,
-                    tls: {
-                        enabled: true,
-                        server_name: $sni,
-                        certificate_path: $cert,
-                        key_path: $key
-                    }
-                }'
-            ;;
+node_count() { jq -r '.nodes | length' "$NODES_FILE" 2>/dev/null || echo 0; }
 
-        3)
-            jq -n \
-                --arg tag "$tag" \
-                --arg port "$port" \
-                --arg sni "$sni" \
-                --arg password "$password" \
-                --arg private_key "$REALITY_PRIVATE" \
-                --arg short_id "$REALITY_SHORT_ID" \
-                --argjson padding "$padding_json" \
-                '
-                {
-                    type: "anytls",
-                    tag: $tag,
-                    listen: "::",
-                    listen_port: ($port | tonumber),
-                    users: [
-                        {
-                            password: $password
-                        }
-                    ],
-                    padding_scheme: $padding,
-                    tls: {
-                        enabled: true,
-                        server_name: $sni,
-                        reality: {
-                            enabled: true,
-                            handshake: {
-                                server: $sni,
-                                server_port: 443
-                            },
-                            private_key: $private_key,
-                            short_id: [$short_id]
-                        }
-                    }
-                }'
-            ;;
+ensure_creds() {
+    nodes_init || return 1
+    local uuid pass ss2022 sspass psk obfs
+    uuid=$(nj '.creds.uuid // ""')
+    [ -z "$uuid" ] && uuid=$(gen_uuid)
+    pass=$(nj '.creds.password // ""')
+    [ -z "$pass" ] && pass=$(gen_pass 12)
+    ss2022=$(nj '.creds.ss2022 // ""')
+    [ -z "$ss2022" ] && ss2022=$(gen_ss_key 16)
+    sspass=$(nj '.creds.ss_pass // ""')
+    [ -z "$sspass" ] && sspass=$(gen_pass 12)
+    psk=$(nj '.creds.snell_psk // ""')
+    [ -z "$psk" ] && psk=$(gen_pass 12)
+    obfs=$(nj '.creds.obfs // ""')
+    [ -z "$obfs" ] && obfs=$(gen_pass 8)
 
-        4)
-            jq -n \
-                --arg tag "$tag" \
-                --arg port "$port" \
-                --arg sni "$sni" \
-                --arg password "$password" \
-                --arg cert "${CERT_DIR}/server.crt" \
-                --arg key "${CERT_DIR}/server.key" \
-                '
-                {
-                    type: "hysteria2",
-                    tag: $tag,
-                    listen: "::",
-                    listen_port: ($port | tonumber),
-                    users: [
-                        {
-                            password: $password
-                        }
-                    ],
-                    tls: {
-                        enabled: true,
-                        server_name: $sni,
-                        alpn: ["h3"],
-                        certificate_path: $cert,
-                        key_path: $key
-                    }
-                }'
-            ;;
+    nj_set '.creds.uuid=$u | .creds.password=$p | .creds.ss2022=$s2 | .creds.ss_pass=$sp
+            | .creds.snell_psk=$psk | .creds.obfs=$obfs
+            | .creds.user = (.creds.user // "sba" | if . == "" then "sba" else . end)
+            | .creds.padding = (if (.creds.padding // [] | length) > 0 then .creds.padding else $pad end)' \
+        --arg u "$uuid" --arg p "$pass" --arg s2 "$ss2022" --arg sp "$sspass" \
+        --arg psk "$psk" --arg obfs "$obfs" --argjson pad "$DEFAULT_PADDING"
+}
 
-        5)
-            jq -n \
-                --arg tag "$tag" \
-                --arg port "$port" \
-                --arg sni "$sni" \
-                --arg uuid "$identifier" \
-                --arg password "$password" \
-                --arg cert "${CERT_DIR}/server.crt" \
-                --arg key "${CERT_DIR}/server.key" \
-                '
-                {
-                    type: "tuic",
-                    tag: $tag,
-                    listen: "::",
-                    listen_port: ($port | tonumber),
-                    users: [
-                        {
-                            uuid: $uuid,
-                            password: $password
-                        }
-                    ],
-                    tls: {
-                        enabled: true,
-                        server_name: $sni,
-                        alpn: ["h3", "spdy/3.1"],
-                        certificate_path: $cert,
-                        key_path: $key
-                    }
-                }'
-            ;;
+ensure_reality() {
+    local priv pub
+    priv=$(nj '.reality.private_key // ""')
+    pub=$(nj '.reality.public_key // ""')
+    if [ -n "$priv" ] && [ -n "$pub" ]; then return 0; fi
 
-        *)
-            echo -e "${RED}未知协议编号: ${protocol}${PLAIN}" >&2
-            return 1
+    [ -x "$SING_BOX_BIN" ] || {
+        err "缺少 sing-box 核心，无法生成 REALITY 密钥。"
+        return 1
+    }
+    local out
+    out=$("$SING_BOX_BIN" generate reality-keypair 2>/dev/null)
+    priv=$(echo "$out" | awk -F': *' '/PrivateKey/{print $2}')
+    pub=$(echo "$out" | awk -F': *' '/PublicKey/{print $2}')
+    [ -n "$priv" ] && [ -n "$pub" ] || {
+        err "REALITY 密钥生成失败"
+        return 1
+    }
+    nj_set '.reality.private_key=$a | .reality.public_key=$b
+            | .reality.short_id = (if (.reality.short_id // "") == "" then $c else .reality.short_id end)
+            | .reality.dest = (if (.reality.dest // "") == "" then $d else .reality.dest end)' \
+        --arg a "$priv" --arg b "$pub" --arg c "$(rand_hex 4)" --arg d "$DEFAULT_REALITY_DEST"
+}
+
+uniq_tag() {
+    local base="$1" t n=1
+    t="$base"
+    while jq -e --arg t "$t" '.nodes[]? | select(.tag == $t)' "$NODES_FILE" >/dev/null 2>&1; do
+        n=$((n + 1))
+        t="${base}-${n}"
+    done
+    echo "$t"
+}
+
+node_add() {
+    # node_add <key> [port] [tag]
+    local key="$1" port="${2:-}" tag="${3:-}"
+    proto_exists "$key" || {
+        err "未知协议: $key"
+        return 1
+    }
+    [ -z "$port" ] && port=$(pick_port)
+    [ -z "$tag" ] && tag=$(uniq_tag "$(default_tag "$key")")
+
+    local tlsmode trans sni path svc ver method
+    tlsmode=$(proto_tls "$key")
+    trans=$(proto_trans "$key")
+    sni=""
+    path=""
+    svc=""
+    ver=0
+    method=""
+
+    case "$tlsmode" in
+        reality) sni=$(nj '.reality.dest // ""') ;;
+        tls) sni=$(nj '.cert.domain // ""') ;;
+    esac
+    [ "$key" == "shadowtls" ] && sni=$(nj '.reality.dest // ""')
+    [ -z "$sni" ] && [ "$tlsmode" != "none" ] && sni="$DEFAULT_REALITY_DEST"
+
+    case "$trans" in
+        ws | hu) path="/$(rand_str 8)" ;;
+        grpc) svc="$(rand_str 8)" ;;
+    esac
+    [ "$key" == "snell" ] && ver=5
+    [ "$key" == "ss-2022" ] && method="2022-blake3-aes-128-gcm"
+    [ "$key" == "ss-aes" ] && method="aes-256-gcm"
+
+    nj_set '.nodes += [{key:$k, tag:$t, port:($p|tonumber), enabled:true, sni:$sni,
+            path:$path, service_name:$svc, hop:"", version:($v|tonumber), method:$m,
+            obfs:"", uuid:"", password:"", remark:""}]' \
+        --arg k "$key" --arg t "$tag" --arg p "$port" --arg sni "$sni" \
+        --arg path "$path" --arg svc "$svc" --arg v "$ver" --arg m "$method"
+}
+
+node_del() {
+    nj_set '.nodes = [.nodes[] | select(.tag != $t)]' --arg t "$1"
+}
+
+# ================= 入站 JSON 生成 =================
+
+load_state() {
+    R_PRIV=$(nj '.reality.private_key // ""')
+    R_PUB=$(nj '.reality.public_key // ""')
+    R_SID=$(nj '.reality.short_id // ""')
+    R_DEST=$(nj '.reality.dest // ""')
+    CERT_CHOICE_SAVED=$(nj '.cert.choice // "1"')
+    CERT_DOMAIN=$(nj '.cert.domain // ""')
+    CR_UUID=$(nj '.creds.uuid // ""')
+    CR_PASS=$(nj '.creds.password // ""')
+    CR_SS2022=$(nj '.creds.ss2022 // ""')
+    CR_SSPASS=$(nj '.creds.ss_pass // ""')
+    CR_PSK=$(nj '.creds.snell_psk // ""')
+    CR_USER=$(nj '.creds.user // "sba"')
+    CR_OBFS=$(nj '.creds.obfs // ""')
+    CR_PADDING=$(jq -c '.creds.padding // []' "$NODES_FILE" 2>/dev/null)
+    [ -z "$CR_PADDING" ] && CR_PADDING="$DEFAULT_PADDING"
+}
+
+tls_block() {
+    # $1=none|tls|reality  $2=sni  $3=alpn(逗号分隔,可空)
+    case "$1" in
+        reality)
+            jq -n --arg sni "$2" --arg pk "$R_PRIV" --arg sid "$R_SID" \
+                '{enabled:true, server_name:$sni,
+                  reality:{enabled:true, handshake:{server:$sni, server_port:443},
+                           private_key:$pk, short_id:[$sid]}}'
             ;;
+        tls)
+            jq -n --arg sni "$2" --arg alpn "$3" --arg c "$CERT_DIR/server.crt" --arg k "$CERT_DIR/server.key" \
+                '{enabled:true, server_name:$sni, certificate_path:$c, key_path:$k}
+                 + (if $alpn == "" then {} else {alpn:($alpn|split(","))} end)'
+            ;;
+        *) echo "null" ;;
     esac
 }
 
+transport_block() {
+    # $1=tcp|ws|grpc|hu|-  $2=path  $3=service_name
+    case "$1" in
+        ws) jq -n --arg p "$2" '{type:"ws", path:$p, max_early_data:2048, early_data_header_name:"Sec-WebSocket-Protocol"}' ;;
+        grpc) jq -n --arg s "$3" '{type:"grpc", service_name:$s}' ;;
+        hu) jq -n --arg p "$2" '{type:"httpupgrade", path:$p}' ;;
+        *) echo "null" ;;
+    esac
+}
+
+build_inbound() {
+    # 输入: 单个 node 的 JSON；输出: 入站 JSON 数组
+    local nj_obj="$1" key tag port sni path svc ver method obfs base tls trans alpn tlsmode transkind
+    local n_uuid n_pass n_ss
+    key=$(echo "$nj_obj" | jq -r '.key')
+    tag=$(echo "$nj_obj" | jq -r '.tag')
+    port=$(echo "$nj_obj" | jq -r '.port')
+    sni=$(echo "$nj_obj" | jq -r '.sni // ""')
+    path=$(echo "$nj_obj" | jq -r '.path // ""')
+    svc=$(echo "$nj_obj" | jq -r '.service_name // ""')
+    ver=$(echo "$nj_obj" | jq -r '.version // 0')
+    method=$(echo "$nj_obj" | jq -r '.method // ""')
+    obfs=$(echo "$nj_obj" | jq -r '.obfs // ""')
+
+    # 节点级凭据优先，缺省回落到全局凭据 (便于从旧版逐协议密码迁移)
+    n_uuid=$(echo "$nj_obj" | jq -r '.uuid // ""')
+    [ -z "$n_uuid" ] && n_uuid="$CR_UUID"
+    n_pass=$(echo "$nj_obj" | jq -r '.password // ""')
+    [ -z "$n_pass" ] && n_pass="$CR_PASS"
+    n_ss=$(echo "$nj_obj" | jq -r '.password // ""')
+    if [ -z "$n_ss" ]; then
+        case "$key" in
+            ss-2022 | shadowtls) n_ss="$CR_SS2022" ;;
+            ss-aes) n_ss="$CR_SSPASS" ;;
+            snell) n_ss="$CR_PSK" ;;
+        esac
+    fi
+
+    tlsmode=$(proto_tls "$key")
+    transkind=$(proto_trans "$key")
+    alpn=""
+    case "$key" in
+        hysteria2 | hysteria | tuic) alpn="h3" ;;
+        naive) alpn="h2,http/1.1" ;;
+    esac
+    [ "$tlsmode" == "tls" ] && [ -z "$sni" ] && sni="${CERT_DOMAIN:-bing.com}"
+    [ "$tlsmode" == "reality" ] && [ -z "$sni" ] && sni="${R_DEST:-$DEFAULT_REALITY_DEST}"
+
+    tls=$(tls_block "$tlsmode" "$sni" "$alpn")
+    trans=$(transport_block "$transkind" "$path" "$svc")
+
+    case "$key" in
+        vless-reality)
+            base=$(jq -n --arg t "$tag" --arg p "$port" --arg u "$n_uuid" \
+                '{type:"vless", tag:$t, listen:"::", listen_port:($p|tonumber),
+                  users:[{uuid:$u, flow:"xtls-rprx-vision", name:"sba"}]}')
+            ;;
+        vless-*)
+            base=$(jq -n --arg t "$tag" --arg p "$port" --arg u "$n_uuid" \
+                '{type:"vless", tag:$t, listen:"::", listen_port:($p|tonumber),
+                  users:[{uuid:$u, name:"sba"}]}')
+            ;;
+        vmess-*)
+            base=$(jq -n --arg t "$tag" --arg p "$port" --arg u "$n_uuid" \
+                '{type:"vmess", tag:$t, listen:"::", listen_port:($p|tonumber),
+                  users:[{uuid:$u, alterId:0, name:"sba"}]}')
+            ;;
+        trojan-*)
+            base=$(jq -n --arg t "$tag" --arg p "$port" --arg pw "$n_pass" \
+                '{type:"trojan", tag:$t, listen:"::", listen_port:($p|tonumber),
+                  users:[{password:$pw, name:"sba"}]}')
+            ;;
+        anytls | anytls-reality)
+            base=$(jq -n --arg t "$tag" --arg p "$port" --arg pw "$n_pass" --argjson pad "$CR_PADDING" \
+                '{type:"anytls", tag:$t, listen:"::", listen_port:($p|tonumber),
+                  users:[{password:$pw, name:"sba"}], padding_scheme:$pad}')
+            ;;
+        hysteria2)
+            base=$(jq -n --arg t "$tag" --arg p "$port" --arg pw "$n_pass" --arg ob "$obfs" --arg obpw "$CR_OBFS" \
+                '{type:"hysteria2", tag:$t, listen:"::", listen_port:($p|tonumber),
+                  users:[{password:$pw, name:"sba"}]}
+                 + (if $ob == "" then {} else {obfs:{type:$ob, password:$obpw}} end)')
+            ;;
+        hysteria)
+            base=$(jq -n --arg t "$tag" --arg p "$port" --arg pw "$n_pass" \
+                '{type:"hysteria", tag:$t, listen:"::", listen_port:($p|tonumber),
+                  up_mbps:100, down_mbps:500, users:[{auth_str:$pw, name:"sba"}]}')
+            ;;
+        tuic)
+            base=$(jq -n --arg t "$tag" --arg p "$port" --arg u "$n_uuid" --arg pw "$n_pass" \
+                '{type:"tuic", tag:$t, listen:"::", listen_port:($p|tonumber),
+                  users:[{uuid:$u, password:$pw, name:"sba"}], congestion_control:"bbr"}')
+            ;;
+        ss-2022)
+            base=$(jq -n --arg t "$tag" --arg p "$port" --arg m "${method:-2022-blake3-aes-128-gcm}" --arg pw "$n_ss" \
+                '{type:"shadowsocks", tag:$t, listen:"::", listen_port:($p|tonumber), method:$m, password:$pw}')
+            ;;
+        ss-aes)
+            base=$(jq -n --arg t "$tag" --arg p "$port" --arg m "${method:-aes-256-gcm}" --arg pw "$n_ss" \
+                '{type:"shadowsocks", tag:$t, listen:"::", listen_port:($p|tonumber), method:$m, password:$pw}')
+            ;;
+        shadowtls)
+            jq -n --arg t "$tag" --arg p "$port" --arg sni "${sni:-$DEFAULT_REALITY_DEST}" \
+                --arg pw "$n_ss" --arg u "$CR_USER" \
+                '[{type:"shadowtls", tag:$t, listen:"::", listen_port:($p|tonumber), version:3,
+                   users:[{name:$u, password:$pw}],
+                   handshake:{server:$sni, server_port:443}, strict_mode:true,
+                   detour:($t + "-ss")},
+                  {type:"shadowsocks", tag:($t + "-ss"),
+                   method:"2022-blake3-aes-128-gcm", password:$pw}]'
+            return 0
+            ;;
+        snell)
+            base=$(jq -n --arg t "$tag" --arg p "$port" --arg psk "$n_ss" --arg v "${ver:-5}" \
+                '{type:"snell", tag:$t, listen:"::", listen_port:($p|tonumber), psk:$psk, version:($v|tonumber)}
+                 + (if ($v|tonumber) == 6 then {mode:"default"} else {obfs_mode:"none"} end)')
+            ;;
+        naive)
+            base=$(jq -n --arg t "$tag" --arg p "$port" --arg u "$CR_USER" --arg pw "$n_pass" \
+                '{type:"naive", tag:$t, listen:"::", listen_port:($p|tonumber),
+                  users:[{username:$u, password:$pw}]}')
+            ;;
+        socks5)
+            base=$(jq -n --arg t "$tag" --arg p "$port" --arg u "$CR_USER" --arg pw "$n_pass" \
+                '{type:"socks", tag:$t, listen:"::", listen_port:($p|tonumber),
+                  users:[{username:$u, password:$pw}]}')
+            ;;
+        http)
+            base=$(jq -n --arg t "$tag" --arg p "$port" --arg u "$CR_USER" --arg pw "$n_pass" \
+                '{type:"http", tag:$t, listen:"::", listen_port:($p|tonumber),
+                  users:[{username:$u, password:$pw}]}')
+            ;;
+        mixed)
+            base=$(jq -n --arg t "$tag" --arg p "$port" --arg u "$CR_USER" --arg pw "$n_pass" \
+                '{type:"mixed", tag:$t, listen:"::", listen_port:($p|tonumber),
+                  users:[{username:$u, password:$pw}]}')
+            ;;
+        *)
+            err "无法生成未知协议的入站: $key"
+            echo "[]"
+            return 1
+            ;;
+    esac
+
+    # listen_local=true 的节点只监听回环 (Argo 后端等，避免明文端口暴露到公网)
+    local lo
+    lo=$(echo "$nj_obj" | jq -r '.listen_local // false')
+    jq -n --argjson base "$base" --argjson tls "$tls" --argjson trans "$trans" --arg lo "$lo" \
+        '[$base
+          + (if $tls == null then {} else {tls:$tls} end)
+          + (if $trans == null then {} else {transport:$trans} end)
+          + (if $lo == "true" then {listen:"127.0.0.1"} else {} end)]'
+}
+
+# ================= config.json 生成 =================
+
+isp_summary() {
+    [ -f "$ISP_FILE" ] || return 1
+    jq -e '.enabled == true' "$ISP_FILE" >/dev/null 2>&1 || return 1
+    local mode tag info
+    mode=$(jq -r '.mode // "all"' "$ISP_FILE")
+    tag=$(jq -r '.tag // "Residential-ISP-Node"' "$ISP_FILE")
+    info=$(jq -r '(.info.type // "?") + " " + (.info.server // "?") + ":" + ((.info.port // 0)|tostring)' "$ISP_FILE")
+    if [ "$mode" == "all" ]; then
+        echo -e "${GREEN}全量接管${PLAIN} → ${info}"
+    else
+        local n
+        n=$(jq -r '(.targets.tags // []) | length' "$ISP_FILE")
+        echo -e "${YELLOW}按节点接管 (${n} 个)${PLAIN} → ${info}"
+    fi
+}
+
 generate_config_json() {
+    nodes_init || return 1
+    load_state
+
+    local parts inbounds cfg tmp
+    parts=$(mktemp) || return 1
+    while IFS= read -r obj; do
+        [ -z "$obj" ] && continue
+        build_inbound "$obj" >>"$parts" || {
+            rm -f "$parts"
+            return 1
+        }
+    done < <(jq -c '.nodes[]? | select(.enabled != false)' "$NODES_FILE")
+
+    inbounds=$(jq -s 'add // []' "$parts" 2>/dev/null)
+    rm -f "$parts"
+    [ -z "$inbounds" ] && inbounds="[]"
+
+    cfg=$(jq -n --argjson ib "$inbounds" '{
+        log: {level:"info", timestamp:true},
+        inbounds: $ib,
+        outbounds: [{type:"direct", tag:"direct"}],
+        route: {rules: [], final:"direct"}
+    }')
+
+    if [ -f "$ISP_FILE" ] && jq -e '.enabled == true' "$ISP_FILE" >/dev/null 2>&1; then
+        cfg=$(echo "$cfg" | jq --slurpfile isp "$ISP_FILE" '
+            ($isp[0]) as $i
+            | ($i.tag // "Residential-ISP-Node") as $t
+            | .outbounds = ((.outbounds // []) + ($i.outbounds // []))
+            | if ($i.mode // "all") == "all"
+              then .route.final = $t
+              else .route.rules = ((if (($i.targets.tags // []) | length) > 0
+                                    then [{inbound: $i.targets.tags, outbound: $t}]
+                                    else [] end) + (.route.rules // []))
+              end')
+    fi
+
     mkdir -p "$CONFIG_DIR"
-
-    local final_dest="${REALITY_DEST:-$DEFAULT_REALITY_DEST}"
-    local tmp="${CONFIG_DIR}/config.json.tmp"
-    local base config
-    local encoded decoded
-    local proto port sni identifier password
-    local index=0
-    local inbound
-
-    [ -x "$SING_BOX_BIN" ] || {
-        echo -e "${RED}未找到 sing-box 核心。${PLAIN}"
+    tmp="${CONFIG_FILE}.tmp"
+    printf '%s\n' "$cfg" | jq . >"$tmp" 2>/dev/null || {
+        err "生成 config.json 失败"
+        rm -f "$tmp"
         return 1
     }
 
-    [ -n "$UUID_REALITY" ] || return 1
-    [ -n "$REALITY_PRIVATE" ] || return 1
-    [ -n "$REALITY_SHORT_ID" ] || return 1
-
-    base=$(
-        make_inbound_json \
-            1 \
-            "reality-in" \
-            "$PORT_REALITY" \
-            "$final_dest" \
-            "$UUID_REALITY" \
-            ""
-    ) || return 1
-
-    config=$(
-        jq -n \
-            --argjson inbound "$base" \
-            '
-            {
-                log: {
-                    level: "info",
-                    timestamp: true
-                },
-                inbounds: [$inbound],
-                outbounds: [
-                    {
-                        type: "direct",
-                        tag: "direct"
-                    }
-                ]
-            }'
-    ) || return 1
-
-    inbound=$(
-        make_inbound_json \
-            2 \
-            "anytls-in" \
-            "$PORT_ANYTLS" \
-            "${DOMAIN:-$final_dest}" \
-            "" \
-            "$PASS_ANYTLS"
-    ) || return 1
-
-    config=$(jq --argjson inbound "$inbound" '.inbounds += [$inbound]' <<< "$config") || return 1
-
-    inbound=$(
-        make_inbound_json \
-            3 \
-            "any-reality-in" \
-            "$PORT_ANYREALITY" \
-            "$final_dest" \
-            "" \
-            "$PASS_ANYREALITY"
-    ) || return 1
-
-    config=$(jq --argjson inbound "$inbound" '.inbounds += [$inbound]' <<< "$config") || return 1
-
-    inbound=$(
-        make_inbound_json \
-            4 \
-            "hy2-in" \
-            "$PORT_HY2" \
-            "${DOMAIN:-$final_dest}" \
-            "" \
-            "$PASS_HY2"
-    ) || return 1
-
-    config=$(jq --argjson inbound "$inbound" '.inbounds += [$inbound]' <<< "$config") || return 1
-
-    inbound=$(
-        make_inbound_json \
-            5 \
-            "tuic-in" \
-            "$PORT_TUIC" \
-            "${DOMAIN:-$final_dest}" \
-            "$UUID_TUIC" \
-            "$PASS_TUIC"
-    ) || return 1
-
-    config=$(jq --argjson inbound "$inbound" '.inbounds += [$inbound]' <<< "$config") || return 1
-
-    # 加载额外节点
-    if [ -f "$EXTRA_NODES_FILE" ]; then
-        while IFS= read -r encoded || [ -n "$encoded" ]; do
-            [ -z "$encoded" ] && continue
-
-            decoded=$(b64_decode "$encoded" 2>/dev/null) || {
-                echo -e "${YELLOW}警告：跳过一条无法解码的额外节点记录。${PLAIN}"
-                continue
-            }
-
-            IFS=$'\t' read -r proto port sni identifier password <<< "$decoded"
-
-            case "$proto" in
-                1 | 2 | 3 | 4 | 5)
-                    ;;
-                *)
-                    echo -e "${YELLOW}警告：跳过未知协议的额外节点记录。${PLAIN}"
-                    continue
-                    ;;
-            esac
-
-            if ! valid_port "$port" || ! valid_domain "$sni"; then
-                echo -e "${YELLOW}警告：跳过参数不合法的额外节点记录。${PLAIN}"
-                continue
-            fi
-
-            index=$((index + 1))
-
-            inbound=$(
-                make_inbound_json \
-                    "$proto" \
-                    "extra-${proto}-${index}" \
-                    "$port" \
-                    "$sni" \
-                    "$identifier" \
-                    "$password"
-            ) || return 1
-
-            config=$(jq --argjson inbound "$inbound" '.inbounds += [$inbound]' <<< "$config") || return 1
-        done < "$EXTRA_NODES_FILE"
+    if [ -x "$SING_BOX_BIN" ]; then
+        local out
+        out=$("$SING_BOX_BIN" check -c "$tmp" 2>&1)
+        if [ -n "$out" ]; then
+            err "生成的配置未通过 sing-box 校验，已放弃写入："
+            echo "$out" | head -5
+            rm -f "$tmp"
+            return 1
+        fi
     fi
 
-    printf '%s\n' "$config" > "$tmp"
-
-    if "$SING_BOX_BIN" check -c "$tmp" >/dev/null 2>&1; then
-        mv -f "$tmp" "${CONFIG_DIR}/config.json"
-        chmod 600 "${CONFIG_DIR}/config.json"
-        return 0
-    fi
-
-    echo -e "${RED}生成的配置未通过 sing-box 校验：${PLAIN}"
-    "$SING_BOX_BIN" check -c "$tmp" 2>&1 | tail -20
-
-    rm -f "$tmp"
-    return 1
+    [ -f "$CONFIG_FILE" ] && cp -f "$CONFIG_FILE" "${CONFIG_FILE}.bak"
+    mv -f "$tmp" "$CONFIG_FILE"
+    chmod 600 "$CONFIG_FILE"
+    return 0
 }
 
-# ================= systemd =================
-
 configure_systemd() {
-    local ipt ip6t start_lines="" stop_lines=""
+    local ipt ip6t start_lines="" stop_lines="" hop_pairs
+    ipt=$(command -v iptables 2>/dev/null || echo /usr/sbin/iptables)
+    ip6t=$(command -v ip6tables 2>/dev/null || echo /usr/sbin/ip6tables)
 
-    ipt=$(command -v iptables 2>/dev/null || echo "/usr/sbin/iptables")
-    ip6t=$(command -v ip6tables 2>/dev/null || echo "/usr/sbin/ip6tables")
+    # Hysteria2 端口跳跃: 把区间内的 UDP 全部 REDIRECT 到监听端口
+    hop_pairs=$(jq -r '.nodes[]? | select((.hop // "") != "") | "\(.hop) \(.port)"' "$NODES_FILE" 2>/dev/null)
+    while read -r rng p; do
+        [ -z "$rng" ] && continue
+        start_lines+="ExecStartPost=-${ipt} -t nat -A PREROUTING -p udp --dport ${rng} -j REDIRECT --to-ports ${p}"$'\n'
+        start_lines+="ExecStartPost=-${ip6t} -t nat -A PREROUTING -p udp --dport ${rng} -j REDIRECT --to-ports ${p}"$'\n'
+        stop_lines+="ExecStopPost=-${ipt} -t nat -D PREROUTING -p udp --dport ${rng} -j REDIRECT --to-ports ${p}"$'\n'
+        stop_lines+="ExecStopPost=-${ip6t} -t nat -D PREROUTING -p udp --dport ${rng} -j REDIRECT --to-ports ${p}"$'\n'
+    done <<<"$hop_pairs"
 
-    if [ -n "${PORT_HY2_RANGE:-}" ]; then
-        start_lines="ExecStartPost=-${ipt} -t nat -A PREROUTING -p udp --dport ${PORT_HY2_RANGE} -j REDIRECT --to-ports ${PORT_HY2}
-ExecStartPost=-${ip6t} -t nat -A PREROUTING -p udp --dport ${PORT_HY2_RANGE} -j REDIRECT --to-ports ${PORT_HY2}"
-
-        stop_lines="ExecStopPost=-${ipt} -t nat -D PREROUTING -p udp --dport ${PORT_HY2_RANGE} -j REDIRECT --to-ports ${PORT_HY2}
-ExecStopPost=-${ip6t} -t nat -D PREROUTING -p udp --dport ${PORT_HY2_RANGE} -j REDIRECT --to-ports ${PORT_HY2}"
-    fi
-
-    cat > "$SERVICE_FILE" <<EOF_SINGBOX_SERVICE
+    cat >"$SERVICE_FILE" <<EOF_SB
 [Unit]
-Description=Sing-box Service
+Description=Sing-box Service (SBA)
 After=network-online.target nss-lookup.target
 Wants=network-online.target
 
 [Service]
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-ExecStart=${SING_BOX_BIN} run -c ${CONFIG_DIR}/config.json
-${start_lines}
-${stop_lines}
-Restart=on-failure
+ExecStart=${SING_BOX_BIN} run -c ${CONFIG_FILE}
+${start_lines}${stop_lines}Restart=on-failure
 RestartSec=10s
 LimitNOFILE=infinity
 
 [Install]
 WantedBy=multi-user.target
-EOF_SINGBOX_SERVICE
+EOF_SB
 
     systemctl daemon-reload || return 1
     systemctl enable sing-box >/dev/null 2>&1 || true
-    systemctl restart sing-box
+    return 0
 }
 
-# ================= 额外节点管理 =================
+apply_config() {
+    # 重新生成配置并重启服务；失败时自动回滚
+    generate_config_json || return 1
+    configure_systemd || return 1
 
-protocol_name() {
-    case "$1" in
-        1) echo "VLESS + REALITY" ;;
-        2) echo "AnyTLS" ;;
-        3) echo "Any-Reality" ;;
-        4) echo "Hysteria2" ;;
-        5) echo "TUIC v5" ;;
-        *) echo "未知协议" ;;
+    systemctl restart sing-box >/dev/null 2>&1
+    sleep 1
+    if systemctl is-active --quiet sing-box 2>/dev/null; then
+        ok "配置已生效 (节点 $(node_count) 个)"
+        return 0
+    fi
+
+    err "sing-box 启动失败，最近日志："
+    journalctl -u sing-box -n 15 --no-pager 2>/dev/null | tail -15
+    if [ -f "${CONFIG_FILE}.bak" ]; then
+        warn "正在回滚到上一次可用配置..."
+        mv -f "${CONFIG_FILE}.bak" "$CONFIG_FILE"
+        systemctl restart sing-box >/dev/null 2>&1
+    fi
+    return 1
+}
+
+service_state() {
+    if [ ! -f "$NODES_FILE" ]; then
+        echo -e "${YELLOW}未安装${PLAIN}"
+    elif systemctl is-active --quiet sing-box 2>/dev/null; then
+        echo -e "${GREEN}运行中${PLAIN}"
+    else
+        echo -e "${RED}已安装但未运行${PLAIN}"
+    fi
+}
+
+# ================= 旧版 (v1 五协议) 迁移 =================
+
+legacy_present() {
+    [ -f "$CONF_FILE" ] && [ ! -f "$NODES_FILE" ]
+}
+
+migrate_legacy() {
+    # 把 sba.conf + extra_nodes.conf 里的端口/UUID/密码原样搬进 nodes.json，
+    # 保留旧 tag，客户端与已有家宽规则都不用改。
+    [ -f "$CONF_FILE" ] || return 1
+    # shellcheck disable=SC1090
+    source "$CONF_FILE" 2>/dev/null || return 1
+
+    nodes_init || return 1
+    nj_set '.cert.choice=$cc | .cert.domain=$d | .cert.acme_email=$ae
+            | .cert.cf_email=$ce | .cert.cf_key=$ck | .cert.cf_token=$ct | .cert.cf_account_id=$ca
+            | .reality.private_key=$rp | .reality.public_key=$rb | .reality.short_id=$rs
+            | .reality.dest=(if $rd == "" then $dd else $rd end)
+            | .creds.uuid=(if $u == "" then .creds.uuid else $u end)' \
+        --arg cc "${CERT_CHOICE:-1}" --arg d "${DOMAIN:-bing.com}" --arg ae "${ACME_EMAIL:-}" \
+        --arg ce "${CF_EMAIL:-}" --arg ck "${CF_KEY:-}" --arg ct "${CF_TOKEN:-}" --arg ca "${CF_ACCOUNT_ID:-}" \
+        --arg rp "${REALITY_PRIVATE:-}" --arg rb "${REALITY_PUBLIC:-}" --arg rs "${REALITY_SHORT_ID:-}" \
+        --arg rd "${REALITY_DEST:-}" --arg dd "$DEFAULT_REALITY_DEST" --arg u "${UUID_REALITY:-}" || return 1
+
+    # 旧版 padding 有两种写法: 完整数组 [..] 或裸列表 "a", "b"
+    if [ -n "${PADDING_SCHEME_JSON:-}" ]; then
+        local pad_json="$PADDING_SCHEME_JSON"
+        jq -e 'type=="array"' <<<"$pad_json" >/dev/null 2>&1 || pad_json="[${PADDING_SCHEME_JSON}]"
+        jq -e 'type=="array"' <<<"$pad_json" >/dev/null 2>&1 &&
+            nj_set '.creds.padding=$p' --argjson p "$pad_json"
+    fi
+
+    legacy_add_node "vless-reality" "reality-in" "${PORT_REALITY:-}" "${UUID_REALITY:-}" "" "${REALITY_DEST:-$DEFAULT_REALITY_DEST}" ""
+    legacy_add_node "anytls" "anytls-in" "${PORT_ANYTLS:-}" "" "${PASS_ANYTLS:-}" "${DOMAIN:-bing.com}" ""
+    legacy_add_node "anytls-reality" "any-reality-in" "${PORT_ANYREALITY:-}" "" "${PASS_ANYREALITY:-}" "${REALITY_DEST:-$DEFAULT_REALITY_DEST}" ""
+    legacy_add_node "hysteria2" "hy2-in" "${PORT_HY2:-}" "" "${PASS_HY2:-}" "${DOMAIN:-bing.com}" "${PORT_HY2_RANGE:-}"
+    legacy_add_node "tuic" "tuic-in" "${PORT_TUIC:-}" "${UUID_TUIC:-}" "${PASS_TUIC:-}" "${DOMAIN:-bing.com}" ""
+    migrate_legacy_extra
+    ok "已从旧版配置迁移 $(node_count) 个节点 (端口/UUID/密码均保持不变)"
+}
+
+insert_node() {
+    # insert_node <key> <tag> <port> <uuid> <password> <sni> <hop>
+    local key="$1" tag="$2" port="$3" uuid="$4" pass="$5" sni="$6" hop="$7"
+    proto_exists "$key" || return 1
+    valid_port "$port" || return 1
+    valid_range "$hop" || hop=""
+
+    local trans path="" svc="" ver=0 method=""
+    trans=$(proto_trans "$key")
+    case "$trans" in
+        ws | hu) path="/$(rand_str 8)" ;;
+        grpc) svc="$(rand_str 8)" ;;
     esac
+    [ "$key" == "snell" ] && ver=5
+    [ "$key" == "ss-2022" ] && method="2022-blake3-aes-128-gcm"
+    [ "$key" == "ss-aes" ] && method="aes-256-gcm"
+    tag=$(uniq_tag "${tag:-$(default_tag "$key")}")
+
+    nj_set '.nodes += [{key:$k, tag:$t, port:($p|tonumber), enabled:true, sni:$sni,
+            path:$path, service_name:$svc, hop:$hop, version:($v|tonumber), method:$m,
+            obfs:"", uuid:$u, password:$pw, remark:""}]' \
+        --arg k "$key" --arg t "$tag" --arg p "$port" --arg sni "$sni" --arg path "$path" \
+        --arg svc "$svc" --arg hop "$hop" --arg v "$ver" --arg m "$method" \
+        --arg u "$uuid" --arg pw "$pass"
 }
 
-ask_sni() {
-    local default_sni="$1"
-    local sni
+legacy_add_node() { insert_node "$1" "$2" "$3" "$4" "$5" "$6" "$7"; }
 
-    while true; do
-        read -r -p "请输入 SNI 域名 [默认 ${default_sni}]: " sni
-        sni=${sni:-$default_sni}
+migrate_legacy_extra() {
+    # extra_nodes.conf: 每行一条 base64，解码后为
+    #   proto(1-5) \t port \t sni \t identifier(uuid) \t password
+    [ -f "$EXTRA_NODES_FILE" ] || return 0
+    local enc rec proto port sni ident pass key
+    while IFS= read -r enc; do
+        [ -z "${enc// /}" ] && continue
+        rec=$(printf '%s' "$enc" | base64 -d 2>/dev/null) || continue
+        # 用 awk 按制表符切，避免 read+IFS 把连续制表符(空字段)合并
+        proto=$(awk -F'\t' '{print $1}' <<<"$rec")
+        port=$(awk -F'\t' '{print $2}' <<<"$rec")
+        sni=$(awk -F'\t' '{print $3}' <<<"$rec")
+        ident=$(awk -F'\t' '{print $4}' <<<"$rec")
+        pass=$(awk -F'\t' '{print $5}' <<<"$rec")
+        case "$proto" in
+            1) key="vless-reality" ;;
+            2) key="anytls" ;;
+            3) key="anytls-reality" ;;
+            4) key="hysteria2" ;;
+            5) key="tuic" ;;
+            *) continue ;;
+        esac
+        # 旧版对只需单一凭据的协议可能把它写在任意一列，这里做一次归位
+        case "$key" in
+            anytls | anytls-reality | hysteria2)
+                [ -z "$pass" ] && {
+                    pass="$ident"
+                    ident=""
+                }
+                ;;
+            vless-reality)
+                [ -z "$ident" ] && {
+                    ident="$pass"
+                    pass=""
+                }
+                ;;
+        esac
+        insert_node "$key" "$(default_tag "$key")" "$port" "$ident" "$pass" "$sni" ""
+    done <"$EXTRA_NODES_FILE"
+}
 
-        if valid_domain "$sni"; then
-            REPLY="$sni"
-            return 0
-        fi
+SEL_KEYS=()
+COMMON_KEYS="vless-reality anytls hysteria2 tuic vmess-ws-tls"
 
-        echo -e "${RED}SNI 域名格式不正确，请重试。${PLAIN}"
+list_protocols() {
+    local i=1 k tls trans mark
+    for k in $(proto_keys); do
+        tls=$(proto_tls "$k")
+        trans=$(proto_trans "$k")
+        mark=""
+        [ "$tls" == "tls" ] && mark="${YELLOW}[需证书]${PLAIN}"
+        [ "$tls" == "reality" ] && mark="${GREEN}[免证书]${PLAIN}"
+        printf " %b%2d%b) %-34b %b\n" "$GREEN" "$i" "$PLAIN" "$(proto_label "$k")" "$mark"
+        i=$((i + 1))
     done
 }
 
-append_extra_node() {
-    local proto="$1"
-    local port="$2"
-    local sni="$3"
-    local identifier="$4"
-    local password="$5"
-
-    mkdir -p "$CONFIG_DIR"
-
-    local record encoded
-    record="${proto}"$'\t'"${port}"$'\t'"${sni}"$'\t'"${identifier}"$'\t'"${password}"
-    encoded=$(b64_encode "$record")
-
-    printf '%s\n' "$encoded" >> "$EXTRA_NODES_FILE"
-    chmod 600 "$EXTRA_NODES_FILE"
-}
-
-count_extra_nodes() {
-    [ -f "$EXTRA_NODES_FILE" ] || {
-        echo 0
-        return
-    }
-
-    grep -cve '^[[:space:]]*$' "$EXTRA_NODES_FILE" 2>/dev/null || echo 0
-}
-
-add_protocol_node() {
-    clear
-
-    [ -f "$CONF_FILE" ] || {
-        echo -e "${RED}请先完成基础安装，再新增协议节点。${PLAIN}"
-        pause
-        return
-    }
-
-    [ -x "$SING_BOX_BIN" ] || {
-        echo -e "${RED}未检测到 sing-box 核心。${PLAIN}"
-        pause
-        return
-    }
-
-    check_deps_extra || {
-        pause
-        return
-    }
-
-    source "$CONF_FILE"
-
-    echo -e "${CYAN}==========================================${PLAIN}"
-    echo -e "${CYAN}              新增协议节点                ${PLAIN}"
-    echo -e "${CYAN}==========================================${PLAIN}"
-    echo "1. VLESS + REALITY"
-    echo "2. AnyTLS"
-    echo "3. Any-Reality"
-    echo "4. Hysteria2"
-    echo "5. TUIC v5"
-    echo "0. 返回"
-    echo -e "${CYAN}==========================================${PLAIN}"
-
-    local proto
-    read -r -p "请选择协议 [0-5]: " proto
-
-    [ "$proto" == "0" ] && return
-
-    case "$proto" in
-        1 | 2 | 3 | 4 | 5)
-            ;;
-        *)
-            echo -e "${RED}无效选项。${PLAIN}"
-            pause
-            return
-            ;;
-    esac
-
-    collect_all_ports
-    ask_new_node_port
-    local port="$REPLY"
-
-    local default_sni
-    if [ "$proto" == "1" ] || [ "$proto" == "3" ]; then
-        default_sni="${REALITY_DEST:-$DEFAULT_REALITY_DEST}"
-    else
-        default_sni="${DOMAIN:-$DEFAULT_REALITY_DEST}"
-    fi
-
-    ask_sni "$default_sni"
-    local sni="$REPLY"
-
-    if [ "$proto" != "1" ] &&
-        [ "$proto" != "3" ] &&
-        [ "${CERT_CHOICE:-1}" != "1" ] &&
-        [ "$sni" != "${DOMAIN:-}" ]; then
-        echo -e "${YELLOW}警告：当前使用正式证书，SNI ${sni} 与证书域名 ${DOMAIN} 不一致。${PLAIN}"
-        echo -e "${YELLOW}客户端进行证书验证时可能失败。${PLAIN}"
-
-        local confirm
-        read -r -p "仍要继续新增该节点吗？[y/N]: " confirm
-        [[ "$confirm" =~ ^[Yy]$ ]] || return
-    fi
-
-    local identifier="" password=""
-
-    case "$proto" in
-        1)
-            identifier=$(uuidgen 2>/dev/null)
-            [ -n "$identifier" ] || {
-                echo -e "${RED}uuidgen 执行失败。${PLAIN}"
-                pause
-                return
-            }
-            ;;
-
-        2 | 3 | 4)
-            password=$(openssl rand -hex 12 2>/dev/null)
-            [ -n "$password" ] || {
-                echo -e "${RED}生成密码失败。${PLAIN}"
-                pause
-                return
-            }
-            ;;
-
-        5)
-            identifier=$(uuidgen 2>/dev/null)
-            password=$(openssl rand -hex 12 2>/dev/null)
-
-            [ -n "$identifier" ] && [ -n "$password" ] || {
-                echo -e "${RED}生成 TUIC 节点凭据失败。${PLAIN}"
-                pause
-                return
-            }
-            ;;
-    esac
-
-    local old_size=0
-    [ -f "$EXTRA_NODES_FILE" ] &&
-        old_size=$(stat -c '%s' "$EXTRA_NODES_FILE" 2>/dev/null || echo 0)
-
-    append_extra_node "$proto" "$port" "$sni" "$identifier" "$password"
-
-    if ! generate_config_json; then
-        echo -e "${RED}新增节点后配置校验失败，正在回滚。${PLAIN}"
-
-        if [ "$old_size" -gt 0 ]; then
-            truncate -s "$old_size" "$EXTRA_NODES_FILE"
-        else
-            rm -f "$EXTRA_NODES_FILE"
+expand_sel() {
+    # 把 "1,3 5-8" 展开成 "1 3 5 6 7 8"
+    local raw="${1//,/ }" tok a b i out=""
+    for tok in $raw; do
+        if [[ "$tok" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+            a="${BASH_REMATCH[1]}"
+            b="${BASH_REMATCH[2]}"
+            [ "$a" -gt "$b" ] && { i="$a"; a="$b"; b="$i"; }
+            for ((i = a; i <= b; i++)); do out="$out $i"; done
+        elif [[ "$tok" =~ ^[0-9]+$ ]]; then
+            out="$out $tok"
         fi
-
-        generate_config_json >/dev/null 2>&1
-        pause
-        return
-    fi
-
-    if ! configure_systemd; then
-        echo -e "${RED}配置已写入，但服务重启失败。${PLAIN}"
-        echo -e "${YELLOW}请执行：journalctl -u sing-box -n 50 --no-pager${PLAIN}"
-        pause
-        return
-    fi
-
-    echo -e "${GREEN}✔ 新增节点成功。${PLAIN}"
-    echo -e "协议: ${GREEN}$(protocol_name "$proto")${PLAIN}"
-    echo -e "端口: ${GREEN}${port}${PLAIN}"
-    echo -e "SNI:  ${GREEN}${sni}${PLAIN}"
-    echo ""
-
-    case "$proto" in
-        1)
-            echo -e "UUID: ${GREEN}${identifier}${PLAIN}"
-            ;;
-        2 | 3 | 4)
-            echo -e "密码: ${GREEN}${password}${PLAIN}"
-            ;;
-        5)
-            echo -e "UUID: ${GREEN}${identifier}${PLAIN}"
-            echo -e "密码: ${GREEN}${password}${PLAIN}"
-            ;;
-    esac
-
-    sleep 2
-    show_links
+    done
+    echo "$out" | tr ' ' '\n' | grep -v '^$' | awk '!seen[$0]++' | tr '\n' ' '
 }
 
-# ================= 安装 =================
+select_protocols() {
+    SEL_KEYS=()
+    local all=() sel k n
+    mapfile -t all < <(proto_keys)
+    clear
+    line
+    echo -e "${CYAN}            选择要安装的节点协议            ${PLAIN}"
+    line
+    list_protocols
+    line
+    echo -e " ${GREEN}直接回车${PLAIN} = 全部安装 (共 ${#all[@]} 种，推荐)"
+    echo -e " 输入编号   = 只装选中的，支持 ${YELLOW}1 3 5${PLAIN} / ${YELLOW}1-8${PLAIN} / ${YELLOW}1,4-6${PLAIN}"
+    echo -e " 输入 ${YELLOW}c${PLAIN}     = 精选常用 5 种 (REALITY / AnyTLS / Hysteria2 / TUIC / VMess-WS)"
+    echo ""
+    read -rp "请选择 [回车=全部]: " sel
+    if [ -z "${sel// /}" ]; then
+        SEL_KEYS=("${all[@]}")
+    elif [[ "$sel" =~ ^[cC]$ ]]; then
+        for k in $COMMON_KEYS; do SEL_KEYS+=("$k"); done
+    else
+        for n in $(expand_sel "$sel"); do
+            [ "$n" -ge 1 ] 2>/dev/null && [ "$n" -le "${#all[@]}" ] && SEL_KEYS+=("${all[$((n - 1))]}")
+        done
+    fi
+    [ ${#SEL_KEYS[@]} -eq 0 ] && { err "未选择任何协议"; return 1; }
+    ok "已选择 ${#SEL_KEYS[@]} 种协议"
+    return 0
+}
+
+ensure_core() {
+    [ -x "$SING_BOX_BIN" ] && return 0
+    download_core
+}
+
+save_cert_state() {
+    nj_set '.cert.choice=$c | .cert.domain=$d | .cert.acme_email=$ae
+            | .cert.cf_email=$ce | .cert.cf_key=$ck | .cert.cf_token=$ct | .cert.cf_account_id=$ca' \
+        --arg c "${CERT_CHOICE:-1}" --arg d "${DOMAIN:-bing.com}" --arg ae "${ACME_EMAIL:-}" \
+        --arg ce "${CF_EMAIL:-}" --arg ck "${CF_KEY:-}" --arg ct "${CF_TOKEN:-}" --arg ca "${CF_ACCOUNT_ID:-}"
+}
+
+ask_reality_dest() {
+    local d
+    read -r -p "REALITY / ShadowTLS 伪装域名 [回车=${DEFAULT_REALITY_DEST}]: " d
+    d="${d:-$DEFAULT_REALITY_DEST}"
+    valid_domain "$d" || d="$DEFAULT_REALITY_DEST"
+    nj_set '.reality.dest=$d' --arg d "$d"
+}
+
+alloc_and_add_nodes() {
+    local mode cur p k taken
+    line
+    msg "端口分配方式："
+    msg " 1. 全部随机 (推荐)"
+    msg " 2. 从指定起始端口连续分配"
+    msg " 3. 逐个手动输入"
+    read -r -p "请选择 [回车=1]: " mode
+    mode="${mode:-1}"
+    if [ "$mode" == "2" ]; then
+        ask_port "起始端口" "$(pick_port 20000 50000)"
+        cur="$ASK_PORT"
+    fi
+
+    for k in "${SEL_KEYS[@]}"; do
+        case "$mode" in
+            2)
+                taken=" $(used_ports | tr '\n' ' ') "
+                p="$cur"
+                while [ "$p" -le 65535 ] && { [[ "$taken" == *" $p "* ]] || port_in_use "$p"; }; do
+                    p=$((p + 1))
+                done
+                [ "$p" -gt 65535 ] && p=$(pick_port)
+                cur=$((p + 1))
+                ;;
+            3)
+                ask_port "$(proto_label "$k") 端口" "$(pick_port)"
+                p="$ASK_PORT"
+                ;;
+            *) p=$(pick_port) ;;
+        esac
+        node_add "$k" "$p" || warn "$(proto_label "$k") 添加失败，已跳过"
+    done
+}
+
+ask_hy2_extra() {
+    # Hysteria2 端口跳跃 / obfs (仅在选了 hy2 时询问)
+    local tags c rng
+    mapfile -t tags < <(nj '.nodes[]? | select(.key=="hysteria2") | .tag')
+    [ ${#tags[@]} -eq 0 ] && return 0
+    line
+    read -r -p "为 Hysteria2 开启端口跳跃 (UDP 端口段 REDIRECT)？[y/N]: " c
+    if [[ "$c" =~ ^[Yy]$ ]]; then
+        while true; do
+            read -r -p "端口段 (格式 起始:结束，如 30000:31000): " rng
+            valid_range "$rng" && break
+            err "格式不正确"
+        done
+        nj_set '.nodes = [.nodes[] | if .key=="hysteria2" then .hop=$r else . end]' --arg r "$rng"
+    fi
+    read -r -p "为 Hysteria2 开启 salamander 混淆？[y/N]: " c
+    if [[ "$c" =~ ^[Yy]$ ]]; then
+        nj_set '.nodes = [.nodes[] | if .key=="hysteria2" then .obfs="salamander" else . end]'
+    fi
+    return 0
+}
 
 fresh_install() {
     clear
-
-    echo -e "${CYAN}==========================================${PLAIN}"
-    echo -e "${CYAN}        开始全新安装 Sing-box 服务         ${PLAIN}"
-    echo -e "${CYAN}==========================================${PLAIN}"
-
-    if [ -f "$CONF_FILE" ]; then
+    if [ -f "$NODES_FILE" ]; then
+        warn "检测到已有安装 (当前 $(node_count) 个节点)。"
+        msg "重新安装会清空现有节点配置 (证书文件保留)。"
         local c
-        read -r -p "检测到已有安装，重装将覆盖现有配置，继续？[y/N]: " c
+        read -r -p "确认继续？[y/N]: " c
         [[ "$c" =~ ^[Yy]$ ]] || return
+        rm -f "$NODES_FILE"
     fi
 
-    if ! command -v apt-get >/dev/null 2>&1; then
-        echo -e "${RED}本脚本仅支持 Debian/Ubuntu apt 系统。${PLAIN}"
+    check_deps || {
         pause
         return
-    fi
+    }
+    # 先装内核：家宽/CGNAT 下 GitHub 可能不通，避免参数白填一遍
+    ensure_core || {
+        err "sing-box 内核安装失败，请检查网络后重试。"
+        pause
+        return
+    }
 
-    echo -e "\n${GREEN}安装基础依赖...${PLAIN}"
+    select_protocols || {
+        pause
+        return
+    }
 
-    apt_install \
-        curl \
-        wget \
-        jq \
-        openssl \
-        socat \
-        uuid-runtime \
-        cron \
-        iptables \
-        qrencode \
-        iproute2 ||
-        {
-            pause
-            return
-        }
+    nodes_init || {
+        pause
+        return
+    }
 
-    echo -e "\n${YELLOW}=== 1. 证书配置 ===${PLAIN}"
-
-    ask_cert_params || return
-
-    echo -e "\n${YELLOW}=== 2. 协议端口 ===${PLAIN}"
-
-    generate_random_ports
-    CHOSEN_PORTS=()
-
-    ask_port "VLESS-REALITY 端口" "$RND_REALITY"
-    PORT_REALITY="$REPLY"
-
-    ask_port "标准 AnyTLS 端口" "$RND_ANYTLS"
-    PORT_ANYTLS="$REPLY"
-
-    ask_port "Any-Reality 端口" "$RND_ANYREALITY"
-    PORT_ANYREALITY="$REPLY"
-
-    ask_port "Hysteria2 端口" "$RND_HY2"
-    PORT_HY2="$REPLY"
-
-    local rng
-
-    while true; do
-        read -r -p "Hy2 跳跃端口段 (如 20000-30000，直接回车不跳跃): " rng
-
-        if [ -z "$rng" ]; then
-            PORT_HY2_RANGE=""
-            break
-        fi
-
-        if valid_range "$rng"; then
-            PORT_HY2_RANGE=$(echo "$rng" | tr '-' ':')
-            break
-        fi
-
-        echo -e "${RED}格式不正确，应为 起始-结束 且 起始<结束。${PLAIN}"
+    local need_cert=0 k
+    for k in "${SEL_KEYS[@]}"; do
+        [ "$(proto_tls "$k")" == "tls" ] && need_cert=1
     done
 
-    ask_port "TUIC v5 端口" "$RND_TUIC"
-    PORT_TUIC="$REPLY"
-
-    echo -e "\n${YELLOW}=== 3. REALITY 伪装域名 ===${PLAIN}"
-
-    local dest
-
-    while true; do
-        read -r -p "伪装目标域名 [默认: ${DEFAULT_REALITY_DEST}]: " dest
-        REALITY_DEST=${dest:-$DEFAULT_REALITY_DEST}
-
-        if valid_domain "$REALITY_DEST"; then
-            break
-        fi
-
-        echo -e "${RED}伪装目标域名格式不正确，请重试。${PLAIN}"
-    done
-
-    echo -e "\n${YELLOW}=== 4. AnyTLS Padding ===${PLAIN}"
-
-    local pad
-
-    read -r -p "自定义 padding（可输入 JSON 片段或完整 JSON 数组，直接回车使用内置配置）: " pad
-
-    if ! set_padding_value "$pad"; then
-        echo -e "${RED}输入不是合法 JSON 字符串数组，已改用内置配置。${PLAIN}"
-        PADDING_SCHEME_JSON="$DEFAULT_PADDING"
-    fi
-
-    echo -e "\n${GREEN}下载 Sing-box 核心...${PLAIN}"
-
-    if ! download_core; then
-        echo -e "${RED}安装中止。${PLAIN}"
-        pause
-        return
-    fi
-
-    echo -e "\n${GREEN}签发证书...${PLAIN}"
-
-    if ! issue_cert; then
-        echo -e "${RED}证书签发失败，安装中止。${PLAIN}"
-        echo -e "${YELLOW}请检查域名解析、80 端口或 Cloudflare 凭证。${PLAIN}"
-        pause
-        return
-    fi
-
-    UUID_REALITY=$(uuidgen 2>/dev/null)
-    PASS_ANYTLS=$(openssl rand -hex 12 2>/dev/null)
-    PASS_ANYREALITY=$(openssl rand -hex 12 2>/dev/null)
-    PASS_HY2=$(openssl rand -hex 12 2>/dev/null)
-    UUID_TUIC=$(uuidgen 2>/dev/null)
-    PASS_TUIC=$(openssl rand -hex 12 2>/dev/null)
-
-    if [ -z "$UUID_REALITY" ] ||
-        [ -z "$PASS_ANYTLS" ] ||
-        [ -z "$PASS_ANYREALITY" ] ||
-        [ -z "$PASS_HY2" ] ||
-        [ -z "$UUID_TUIC" ] ||
-        [ -z "$PASS_TUIC" ]; then
-        echo -e "${RED}节点凭据生成失败。${PLAIN}"
-        pause
-        return
-    fi
-
-    local keypair
-    keypair=$("$SING_BOX_BIN" generate reality-keypair 2>/dev/null)
-
-    REALITY_PRIVATE=$(echo "$keypair" | awk '/PrivateKey/{print $NF}')
-    REALITY_PUBLIC=$(echo "$keypair" | awk '/PublicKey/{print $NF}')
-    REALITY_SHORT_ID=$("$SING_BOX_BIN" generate rand --hex 8 2>/dev/null)
-
-    if [ -z "$REALITY_PRIVATE" ] ||
-        [ -z "$REALITY_PUBLIC" ] ||
-        [ -z "$REALITY_SHORT_ID" ]; then
-        echo -e "${RED}REALITY 密钥生成失败。${PLAIN}"
-        pause
-        return
-    fi
-
-    mkdir -p "$CONFIG_DIR"
-    rm -f "$EXTRA_NODES_FILE"
-
-    save_config
-
-    if ! generate_config_json; then
-        echo -e "${RED}配置生成失败，安装中止。${PLAIN}"
-        pause
-        return
-    fi
-
-    if ! configure_systemd; then
-        echo -e "${RED}systemd 服务启动失败。${PLAIN}"
-        echo -e "${YELLOW}请执行 journalctl -u sing-box -n 50 查看日志。${PLAIN}"
-        pause
-        return
-    fi
-
-    if systemctl is-active --quiet sing-box; then
-        echo -e "\n${GREEN}✔ Sing-box 安装成功并已运行。${PLAIN}"
+    clear
+    line
+    echo -e "${CYAN}                 证书配置                 ${PLAIN}"
+    line
+    if [ "$need_cert" == "1" ]; then
+        msg "已选协议中包含需要 TLS 证书的类型。"
+        ask_cert_params || return
     else
-        echo -e "\n${RED}服务未能启动，请执行 journalctl -u sing-box -n 50 查看日志。${PLAIN}"
+        msg "已选协议无需 TLS 证书 (仅 REALITY / 无加密)，跳过证书申请。"
+        CERT_CHOICE=1
+        DOMAIN="bing.com"
+    fi
+    save_cert_state || return
+    ask_reality_dest
+    ensure_creds || return
+    ensure_reality || return
+
+    alloc_and_add_nodes
+    ask_hy2_extra
+    [ "$(node_count)" -eq 0 ] && {
+        err "没有成功添加任何节点"
+        pause
+        return
+    }
+
+    if [ "$need_cert" == "1" ] || [ ! -s "$CERT_DIR/server.crt" ]; then
+        warn "正在准备证书 ..."
+        issue_cert || {
+            err "证书生成/申请失败。"
+            warn "已改用自签证书继续 (客户端需勾选跳过证书验证)。"
+            CERT_CHOICE=1
+            DOMAIN="bing.com"
+            save_cert_state
+            nj_set '.nodes = [.nodes[] | if .key|test("-tls$|^hysteria|^tuic$|^anytls$|^naive$") then .sni="bing.com" else . end]'
+            issue_cert || {
+                err "自签证书也失败了，请检查 openssl 是否可用。"
+                pause
+                return
+            }
+        }
+        ok "证书就绪：$CERT_DIR/server.crt"
     fi
 
-    echo -e "${YELLOW}提示: 若启用防火墙/云安全组，请放行上述端口。${PLAIN}"
-    echo -e "${YELLOW}Hy2 及 Hy2 跳跃端口段使用 UDP。${PLAIN}"
-
-    sleep 2
+    apply_config || {
+        pause
+        return
+    }
+    install_shortcut
+    ok "安装完成！共 $(node_count) 个节点，快捷命令：sba"
+    pause
     show_links
 }
 
-# ================= 证书管理 =================
+# ================= 分享链接 =================
 
-standalone_cert_manager() {
-    clear
+link_extract() {
+    local o="$1"
+    LK_KEY=$(echo "$o" | jq -r '.key')
+    LK_TAG=$(echo "$o" | jq -r '.tag')
+    LK_PORT=$(echo "$o" | jq -r '.port')
+    LK_SNI=$(echo "$o" | jq -r '.sni // ""')
+    LK_PATH=$(echo "$o" | jq -r '.path // ""')
+    LK_SVC=$(echo "$o" | jq -r '.service_name // ""')
+    LK_VER=$(echo "$o" | jq -r '.version // 0')
+    LK_METHOD=$(echo "$o" | jq -r '.method // ""')
+    LK_OBFS=$(echo "$o" | jq -r '.obfs // ""')
+    LK_HOP=$(echo "$o" | jq -r '.hop // ""')
+    LK_REMARK=$(echo "$o" | jq -r '.remark // ""')
+    LK_TLSMODE=$(proto_tls "$LK_KEY")
+    LK_TRANS=$(proto_trans "$LK_KEY")
 
-    [ -f "$CONF_FILE" ] || {
-        echo -e "${RED}未检测到配置！${PLAIN}"
-        sleep 2
-        return
-    }
-
-    source "$CONF_FILE"
-
-    local old_domain="$DOMAIN"
-    local old_choice="$CERT_CHOICE"
-
-    echo -e "${CYAN}==========================================${PLAIN}"
-    echo -e "${CYAN}          独立证书申请与修复模块          ${PLAIN}"
-    echo -e "${CYAN}==========================================${PLAIN}"
-    echo -e "当前域名: ${GREEN}${DOMAIN:-无}${PLAIN}   当前类型: ${GREEN}${CERT_CHOICE:-未知}${PLAIN}"
-    echo ""
-
-    cp -f "$CONF_FILE" "${CONF_FILE}.cert.bak"
-
-    ask_cert_params "back" || {
-        rm -f "${CONF_FILE}.cert.bak"
-        return
-    }
-
-    if ! issue_cert; then
-        echo -e "${RED}证书签发失败，恢复原证书配置。${PLAIN}"
-        mv -f "${CONF_FILE}.cert.bak" "$CONF_FILE"
-        pause
-        return
+    LK_UUID=$(echo "$o" | jq -r '.uuid // ""')
+    [ -z "$LK_UUID" ] && LK_UUID="$CR_UUID"
+    LK_PASS=$(echo "$o" | jq -r '.password // ""')
+    [ -z "$LK_PASS" ] && LK_PASS="$CR_PASS"
+    LK_SS=$(echo "$o" | jq -r '.password // ""')
+    if [ -z "$LK_SS" ]; then
+        case "$LK_KEY" in
+            ss-2022 | shadowtls) LK_SS="$CR_SS2022" ;;
+            ss-aes) LK_SS="$CR_SSPASS" ;;
+            snell) LK_SS="$CR_PSK" ;;
+        esac
     fi
 
-    save_config
-    rm -f "${CONF_FILE}.cert.bak"
-
-    # 从域名证书切回自签时，移除旧域名续期任务
-    if [ "$CERT_CHOICE" == "1" ] &&
-        [ "$old_choice" != "1" ] &&
-        [ -x "$HOME/.acme.sh/acme.sh" ] &&
-        [ -n "$old_domain" ]; then
-        "$HOME/.acme.sh/acme.sh" \
-            --remove \
-            -d "$old_domain" \
-            --ecc >/dev/null 2>&1
+    LK_INS=0
+    [ "${CERT_CHOICE_SAVED:-1}" == "1" ] && LK_INS=1
+    if [ "$LK_TLSMODE" == "tls" ] && [ "$LK_INS" == "0" ] && [ -n "$CERT_DOMAIN" ]; then
+        LK_ADDR="$CERT_DOMAIN"
+    else
+        LK_ADDR="${PUBLIC_IP:-127.0.0.1}"
     fi
-
-    if ! systemctl restart sing-box; then
-        echo -e "${RED}证书已更新，但 sing-box 重启失败。${PLAIN}"
-        pause
-        return
-    fi
-
-    echo -e "${GREEN}✔ 证书已更新并重启服务。${PLAIN}"
-    sleep 1
-    show_links
+    LK_NAME="$LK_TAG"
+    [ -n "$LK_REMARK" ] && LK_NAME="$LK_REMARK"
 }
 
-# ================= 参数修改 =================
+link_trans_query() {
+    # 传输层查询串 (不含前导 &)
+    case "$LK_TRANS" in
+        ws) echo "type=ws&path=$(urlenc "$LK_PATH")&host=$(urlenc "${LK_SNI:-$LK_ADDR}")" ;;
+        grpc) echo "type=grpc&serviceName=$(urlenc "$LK_SVC")&mode=gun" ;;
+        hu) echo "type=httpupgrade&path=$(urlenc "$LK_PATH")&host=$(urlenc "${LK_SNI:-$LK_ADDR}")" ;;
+        *) echo "type=tcp" ;;
+    esac
+}
 
-modify_parameters() {
-    clear
+link_sec_query() {
+    # 加密层查询串 (不含前导 &)
+    case "$LK_TLSMODE" in
+        reality)
+            echo "security=reality&sni=$(urlenc "$LK_SNI")&fp=chrome&pbk=${R_PUB}&sid=${R_SID}"
+            ;;
+        tls)
+            local q="security=tls&sni=$(urlenc "${LK_SNI:-$LK_ADDR}")&fp=chrome"
+            [ "$LK_INS" == "1" ] && q="${q}&allowInsecure=1"
+            echo "$q"
+            ;;
+        *) echo "security=none" ;;
+    esac
+}
 
-    [ -f "$CONF_FILE" ] || {
-        echo -e "${RED}未检测到配置！${PLAIN}"
-        sleep 2
-        return
-    }
+build_link() {
+    # 输入: 单个 node JSON；输出: 一行或多行文本 (分享链接 / 参数说明)
+    link_extract "$1"
+    local q flow="" vm
 
-    check_deps_extra || {
-        pause
-        return
-    }
+    # Argo 后端节点不直连，改用 Cloudflare 隧道域名生成链接
+    if [ -f "$ARGO_FILE" ] && [ -n "$LK_TAG" ] &&
+        [ "$LK_TAG" == "$(jq -r '.node_tag // ""' "$ARGO_FILE" 2>/dev/null)" ]; then
+        argo_link
+        return 0
+    fi
 
-    source "$CONF_FILE"
-
-    [ -z "$REALITY_DEST" ] &&
-        REALITY_DEST="$DEFAULT_REALITY_DEST"
-
-    echo -e "${CYAN}==========================================${PLAIN}"
-    echo -e "${CYAN}            修改节点参数                  ${PLAIN}"
-    echo -e "${CYAN}==========================================${PLAIN}"
-    echo -e "1. REALITY 端口 (当前: $PORT_REALITY)"
-    echo -e "2. AnyTLS 端口 (当前: $PORT_ANYTLS)"
-    echo -e "3. Any-Reality 端口 (当前: $PORT_ANYREALITY)"
-    echo -e "4. Hysteria2 端口 (当前: $PORT_HY2${PORT_HY2_RANGE:+, 跳跃: $PORT_HY2_RANGE})"
-    echo -e "5. TUIC v5 端口 (当前: $PORT_TUIC)"
-    echo -e "6. AnyTLS/Any-Reality Padding"
-    echo -e "7. REALITY 伪装域名 (当前: $REALITY_DEST)"
-    echo -e "0. 返回主菜单"
-
-    local choice np nr npad ndest others oldport
-
-    read -r -p "请选择 [0-7]: " choice
-    [ "$choice" == "0" ] && return
-
-    case "$choice" in
-        1 | 2 | 3 | 5)
-            read -r -p "新端口: " np
-
-            if ! valid_port "$np"; then
-                echo -e "${RED}端口无效。${PLAIN}"
-                sleep 1
-                return
-            fi
-
-            case "$choice" in
-                1)
-                    oldport="$PORT_REALITY"
-                    others="$PORT_ANYTLS $PORT_ANYREALITY $PORT_HY2 $PORT_TUIC"
+    case "$LK_KEY" in
+        vless-*)
+            [ "$LK_KEY" == "vless-reality" ] && flow="&flow=xtls-rprx-vision"
+            q="$(link_trans_query)&$(link_sec_query)${flow}"
+            echo "vless://${LK_UUID}@${LK_ADDR}:${LK_PORT}?${q}#$(urlenc "$LK_NAME")"
+            ;;
+        vmess-reality)
+            # base64 型 vmess 链接无 reality 标准字段，附带 pbk/sid 供 NekoBox 等客户端识别
+            vm=$(jq -nc --arg ps "$LK_NAME" --arg add "$LK_ADDR" --arg port "$LK_PORT" \
+                --arg id "$LK_UUID" --arg sni "$LK_SNI" --arg pbk "$R_PUB" --arg sid "$R_SID" \
+                '{v:"2", ps:$ps, add:$add, port:$port, id:$id, aid:"0", scy:"auto",
+                  net:"tcp", type:"none", host:"", path:"", tls:"reality",
+                  sni:$sni, alpn:"", fp:"chrome", pbk:$pbk, sid:$sid}')
+            echo "vmess://$(b64_encode "$vm")"
+            ;;
+        vmess-*)
+            local net="tcp" host="" vpath="" vtls="" vsni=""
+            case "$LK_TRANS" in
+                ws)
+                    net="ws"
+                    vpath="$LK_PATH"
+                    host="${LK_SNI:-$LK_ADDR}"
                     ;;
-                2)
-                    oldport="$PORT_ANYTLS"
-                    others="$PORT_REALITY $PORT_ANYREALITY $PORT_HY2 $PORT_TUIC"
+                grpc)
+                    net="grpc"
+                    vpath="$LK_SVC"
                     ;;
-                3)
-                    oldport="$PORT_ANYREALITY"
-                    others="$PORT_REALITY $PORT_ANYTLS $PORT_HY2 $PORT_TUIC"
-                    ;;
-                5)
-                    oldport="$PORT_TUIC"
-                    others="$PORT_REALITY $PORT_ANYTLS $PORT_ANYREALITY $PORT_HY2"
+                hu)
+                    net="httpupgrade"
+                    vpath="$LK_PATH"
+                    host="${LK_SNI:-$LK_ADDR}"
                     ;;
             esac
-
-            local extra_port
-            while read -r extra_port; do
-                [ -n "$extra_port" ] &&
-                    others="${others} ${extra_port}"
-            done < <(get_extra_ports)
-
-            if [[ " $others " == *" $np "* ]]; then
-                echo -e "${RED}端口与其他协议或额外节点冲突。${PLAIN}"
-                sleep 1
-                return
-            fi
-
-            if [ "$np" != "$oldport" ] &&
-                port_in_use "$np"; then
-                echo -e "${YELLOW}警告：端口 $np 当前已被系统占用。${PLAIN}"
-
-                local confirm
-                read -r -p "仍要使用该端口吗？[y/N]: " confirm
-                [[ "$confirm" =~ ^[Yy]$ ]] || return
-            fi
-
-            case "$choice" in
-                1) PORT_REALITY="$np" ;;
-                2) PORT_ANYTLS="$np" ;;
-                3) PORT_ANYREALITY="$np" ;;
-                5) PORT_TUIC="$np" ;;
-            esac
+            [ "$LK_TLSMODE" == "tls" ] && {
+                vtls="tls"
+                vsni="${LK_SNI:-$LK_ADDR}"
+            }
+            vm=$(jq -nc --arg ps "$LK_NAME" --arg add "$LK_ADDR" --arg port "$LK_PORT" \
+                --arg id "$LK_UUID" --arg net "$net" --arg host "$host" --arg path "$vpath" \
+                --arg tls "$vtls" --arg sni "$vsni" \
+                '{v:"2", ps:$ps, add:$add, port:$port, id:$id, aid:"0", scy:"auto",
+                  net:$net, type:"none", host:$host, path:$path, tls:$tls, sni:$sni, fp:"chrome"}')
+            echo "vmess://$(b64_encode "$vm")"
             ;;
-
-        4)
-            read -r -p "新 Hy2 主监听端口: " np
-
-            if ! valid_port "$np"; then
-                echo -e "${RED}端口无效。${PLAIN}"
-                sleep 1
-                return
-            fi
-
-            local hy2_others="$PORT_REALITY $PORT_ANYTLS $PORT_ANYREALITY $PORT_TUIC"
-            local extra_port
-
-            while read -r extra_port; do
-                [ -n "$extra_port" ] &&
-                    hy2_others="${hy2_others} ${extra_port}"
-            done < <(get_extra_ports)
-
-            if [[ " $hy2_others " == *" $np "* ]]; then
-                echo -e "${RED}端口与其他协议或额外节点冲突。${PLAIN}"
-                sleep 1
-                return
-            fi
-
-            PORT_HY2="$np"
-
-            read -r -p "新跳跃段 (如 20000-30000；输入 none 清除；回车保持不变): " nr
-
-            if [ "$nr" == "none" ]; then
-                PORT_HY2_RANGE=""
-            elif [ -n "$nr" ]; then
-                if valid_range "$nr"; then
-                    PORT_HY2_RANGE=$(echo "$nr" | tr '-' ':')
-                else
-                    echo -e "${RED}跳跃段格式不正确，该项未修改。${PLAIN}"
-                fi
-            fi
+        trojan-*)
+            q="$(link_trans_query)&$(link_sec_query)"
+            echo "trojan://$(urlenc "$LK_PASS")@${LK_ADDR}:${LK_PORT}?${q}#$(urlenc "$LK_NAME")"
             ;;
-
-        6)
-            read -r -p "新 Padding（留空恢复内置）: " npad
-
-            if ! set_padding_value "$npad"; then
-                echo -e "${RED}非法 JSON，未修改。${PLAIN}"
-                sleep 1
-                return
-            fi
-            ;;
-
-        7)
-            read -r -p "新伪装域名: " ndest
-
-            if valid_domain "$ndest"; then
-                REALITY_DEST="$ndest"
+        anytls | anytls-reality)
+            q="sni=$(urlenc "$LK_SNI")"
+            if [ "$LK_TLSMODE" == "reality" ]; then
+                q="${q}&security=reality&pbk=${R_PUB}&sid=${R_SID}&fp=chrome"
             else
-                echo -e "${RED}域名格式不正确。${PLAIN}"
-                sleep 1
-                return
+                [ "$LK_INS" == "1" ] && q="${q}&insecure=1"
             fi
+            echo "anytls://$(urlenc "$LK_PASS")@${LK_ADDR}:${LK_PORT}?${q}#$(urlenc "$LK_NAME")"
             ;;
-
+        hysteria2)
+            q="sni=$(urlenc "${LK_SNI:-$LK_ADDR}")"
+            [ "$LK_INS" == "1" ] && q="${q}&insecure=1"
+            [ -n "$LK_OBFS" ] && q="${q}&obfs=${LK_OBFS}&obfs-password=$(urlenc "$CR_OBFS")"
+            [ -n "$LK_HOP" ] && q="${q}&mport=${LK_HOP/:/-}"
+            echo "hysteria2://$(urlenc "$LK_PASS")@${LK_ADDR}:${LK_PORT}?${q}#$(urlenc "$LK_NAME")"
+            ;;
+        hysteria)
+            q="protocol=udp&auth=$(urlenc "$LK_PASS")&peer=$(urlenc "${LK_SNI:-$LK_ADDR}")&upmbps=100&downmbps=500&alpn=h3"
+            [ "$LK_INS" == "1" ] && q="${q}&insecure=1"
+            echo "hysteria://${LK_ADDR}:${LK_PORT}?${q}#$(urlenc "$LK_NAME")"
+            ;;
+        tuic)
+            q="sni=$(urlenc "${LK_SNI:-$LK_ADDR}")&congestion_control=bbr&udp_relay_mode=native&alpn=h3"
+            [ "$LK_INS" == "1" ] && q="${q}&allow_insecure=1"
+            echo "tuic://${LK_UUID}:$(urlenc "$LK_PASS")@${LK_ADDR}:${LK_PORT}?${q}#$(urlenc "$LK_NAME")"
+            ;;
+        ss-2022 | ss-aes)
+            echo "ss://$(b64_url "${LK_METHOD}:${LK_SS}")@${LK_ADDR}:${LK_PORT}#$(urlenc "$LK_NAME")"
+            ;;
+        shadowtls)
+            q="plugin=$(urlenc "shadow-tls;version=3;host=${LK_SNI};password=${LK_SS}")"
+            echo "ss://$(b64_url "2022-blake3-aes-128-gcm:${LK_SS}")@${LK_ADDR}:${LK_PORT}?${q}#$(urlenc "$LK_NAME")"
+            ;;
+        snell)
+            # Snell 无标准分享链接；给出 Surge / Clash 可直接粘的配置行
+            # 服务端 v5 的线路协议与 v4 相同，客户端填 version = 4
+            echo "# ${LK_NAME} (Snell v${LK_VER} 服务端，客户端 version 填 $([ "$LK_VER" == "6" ] && echo 6 || echo 4))"
+            echo "${LK_NAME} = snell, ${LK_ADDR}, ${LK_PORT}, psk=${LK_SS}, version=$([ "$LK_VER" == "6" ] && echo 6 || echo 4), reuse=true"
+            ;;
+        naive)
+            echo "naive+https://$(urlenc "$CR_USER"):$(urlenc "$LK_PASS")@${LK_ADDR}:${LK_PORT}#$(urlenc "$LK_NAME")"
+            ;;
+        socks5 | mixed)
+            echo "socks://$(b64_url "${CR_USER}:${LK_PASS}")@${LK_ADDR}:${LK_PORT}#$(urlenc "$LK_NAME")"
+            ;;
+        http)
+            echo "http://$(urlenc "$CR_USER"):$(urlenc "$LK_PASS")@${LK_ADDR}:${LK_PORT}#$(urlenc "$LK_NAME")"
+            ;;
         *)
-            return
+            echo "# ${LK_TAG}: 暂不支持自动生成分享链接"
             ;;
     esac
-
-    cp "$CONF_FILE" "${CONF_FILE}.bak"
-
-    save_config
-
-    if generate_config_json; then
-        if configure_systemd; then
-            rm -f "${CONF_FILE}.bak"
-
-            echo -e "${GREEN}✔ 修改成功，服务已重启。${PLAIN}"
-            echo -e "${YELLOW}注意：重启会中断现有连接。${PLAIN}"
-
-            sleep 1
-            show_links
-        else
-            echo -e "${RED}服务重启失败，正在恢复原配置。${PLAIN}"
-
-            mv -f "${CONF_FILE}.bak" "$CONF_FILE"
-            source "$CONF_FILE"
-            generate_config_json >/dev/null 2>&1
-            systemctl restart sing-box >/dev/null 2>&1 || true
-
-            pause
-        fi
-    else
-        echo -e "${RED}新配置未通过校验，已回滚。${PLAIN}"
-
-        mv -f "${CONF_FILE}.bak" "$CONF_FILE"
-        source "$CONF_FILE"
-        generate_config_json >/dev/null 2>&1
-
-        pause
-    fi
 }
 
-# ================= 节点链接 =================
-
-build_vless_link() {
-    local ip="$1"
-    local port="$2"
-    local uuid="$3"
-    local sni="$4"
-    local label="$5"
-
-    printf 'vless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp&headerType=none#%s' \
-        "$uuid" \
-        "$ip" \
-        "$port" \
-        "$sni" \
-        "$REALITY_PUBLIC" \
-        "$REALITY_SHORT_ID" \
-        "$label"
+all_links() {
+    local o
+    while IFS= read -r o; do
+        [ -z "$o" ] && continue
+        build_link "$o"
+    done < <(jq -c '.nodes[]? | select(.enabled != false)' "$NODES_FILE" 2>/dev/null)
 }
 
-build_anytls_link() {
-    local ip="$1"
-    local port="$2"
-    local password="$3"
-    local sni="$4"
-    local insecure="$5"
-    local label="$6"
+uri_links() { all_links | grep -E '^[a-z0-9+.-]+://'; }
 
-    printf 'anytls://%s@%s:%s?security=tls&sni=%s&fp=chrome&alpn=http%%2F1.1&insecure=%s&allowInsecure=%s&type=tcp&headerType=none#%s' \
-        "$password" \
-        "$ip" \
-        "$port" \
-        "$sni" \
-        "$insecure" \
-        "$insecure" \
-        "$label"
-}
-
-build_anyreality_link() {
-    local ip="$1"
-    local port="$2"
-    local password="$3"
-    local sni="$4"
-    local label="$5"
-
-    printf 'anytls://%s@%s:%s?security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp&headerType=none#%s' \
-        "$password" \
-        "$ip" \
-        "$port" \
-        "$sni" \
-        "$REALITY_PUBLIC" \
-        "$REALITY_SHORT_ID" \
-        "$label"
-}
-
-build_hy2_link() {
-    local ip="$1"
-    local port="$2"
-    local password="$3"
-    local sni="$4"
-    local insecure="$5"
-    local range="$6"
-    local label="$7"
-
-    local extra=""
-
-    [ -n "$range" ] &&
-        extra="&ports=${range/:/-}"
-
-    printf 'hy2://%s@%s:%s?insecure=%s&sni=%s%s#%s' \
-        "$password" \
-        "$ip" \
-        "$port" \
-        "$insecure" \
-        "$sni" \
-        "$extra" \
-        "$label"
-}
-
-build_tuic_link() {
-    local ip="$1"
-    local port="$2"
-    local uuid="$3"
-    local password="$4"
-    local sni="$5"
-    local insecure="$6"
-    local label="$7"
-
-    printf 'tuic://%s:%s@%s:%s?sni=%s&alpn=h3&allow_insecure=%s#%s' \
-        "$uuid" \
-        "$password" \
-        "$ip" \
-        "$port" \
-        "$sni" \
-        "$insecure" \
-        "$label"
+save_links_file() {
+    local f="${CONFIG_DIR}/links.txt"
+    {
+        echo "# SBA ${SBA_VERSION} 节点分享链接  生成时间: $(date '+%F %T')"
+        all_links
+        echo ""
+        echo "# 聚合订阅 (Base64)"
+        b64_encode "$(uri_links)"
+    } >"$f" 2>/dev/null
+    chmod 600 "$f" 2>/dev/null
+    echo "$f"
 }
 
 show_links() {
-    [ -f "$CONF_FILE" ] || {
-        echo -e "${RED}未找到配置！${PLAIN}"
-        sleep 1
-        return
-    }
-
-    source "$CONF_FILE"
-
-    check_deps_extra || {
+    [ -f "$NODES_FILE" ] || {
+        err "尚未安装，请先执行安装。"
         pause
         return
     }
+    load_state
+    get_public_ip
+    clear
+    line
+    echo -e "${CYAN}               节点分享链接               ${PLAIN}"
+    line
+    local i=1 o key tag port
+    while IFS= read -r o; do
+        [ -z "$o" ] && continue
+        key=$(echo "$o" | jq -r '.key')
+        tag=$(echo "$o" | jq -r '.tag')
+        port=$(echo "$o" | jq -r '.port')
+        echo -e "${GREEN}[$i] $(proto_label "$key")${PLAIN} | tag: ${tag} | 端口: ${port}"
+        build_link "$o"
+        echo ""
+        i=$((i + 1))
+    done < <(jq -c '.nodes[]? | select(.enabled != false)' "$NODES_FILE" 2>/dev/null)
 
-    get_public_ip || {
-        sleep 2
+    [ "$i" == "1" ] && warn "当前没有启用的节点。"
+    line
+    echo -e "${YELLOW}聚合订阅 (Base64，可直接粘进客户端的「从剪贴板导入」)：${PLAIN}"
+    b64_encode "$(uri_links)"
+    echo ""
+    [ "${CERT_CHOICE_SAVED:-1}" == "1" ] && warn "当前使用自签证书，TLS 类节点需在客户端勾选「跳过证书验证 / allowInsecure」。"
+    ok "已保存到 $(save_links_file)"
+    line
+    local c
+    read -r -p "输入节点编号显示二维码，回车返回: " c
+    [[ "$c" =~ ^[0-9]+$ ]] && show_qr "$c"
+    return 0
+}
+
+show_qr() {
+    local idx="$1" o link
+    o=$(jq -c --argjson n "$((idx - 1))" '[.nodes[]? | select(.enabled != false)] | .[$n] // empty' "$NODES_FILE" 2>/dev/null)
+    [ -z "$o" ] && return 0
+    link=$(build_link "$o" | grep -E '^[a-z0-9+.-]+://' | head -1)
+    [ -z "$link" ] && {
+        warn "该协议没有可用的分享链接。"
+        pause
         return
     }
-
-    local final_dest="${REALITY_DEST:-$DEFAULT_REALITY_DEST}"
-    local insecure="0"
-
-    [ "$CERT_CHOICE" == "1" ] &&
-        insecure="1"
-
-    local -a LINK_NAMES=()
-    local -a LINKS=()
-
-    LINK_NAMES+=("VLESS + REALITY")
-    LINKS+=(
-        "$(build_vless_link \
-            "$PUBLIC_IP" \
-            "$PORT_REALITY" \
-            "$UUID_REALITY" \
-            "$final_dest" \
-            "${PUBLIC_IP}-VLESS-REALITY")"
-    )
-
-    LINK_NAMES+=("标准 AnyTLS")
-    LINKS+=(
-        "$(build_anytls_link \
-            "$PUBLIC_IP" \
-            "$PORT_ANYTLS" \
-            "$PASS_ANYTLS" \
-            "${DOMAIN:-$final_dest}" \
-            "$insecure" \
-            "${PUBLIC_IP}-AnyTLS")"
-    )
-
-    LINK_NAMES+=("Any-Reality")
-    LINKS+=(
-        "$(build_anyreality_link \
-            "$PUBLIC_IP" \
-            "$PORT_ANYREALITY" \
-            "$PASS_ANYREALITY" \
-            "$final_dest" \
-            "${PUBLIC_IP}-AnyReality")"
-    )
-
-    LINK_NAMES+=("Hysteria2")
-    LINKS+=(
-        "$(build_hy2_link \
-            "$PUBLIC_IP" \
-            "$PORT_HY2" \
-            "$PASS_HY2" \
-            "${DOMAIN:-$final_dest}" \
-            "$insecure" \
-            "${PORT_HY2_RANGE:-}" \
-            "${PUBLIC_IP}-Hysteria2")"
-    )
-
-    LINK_NAMES+=("TUIC v5")
-    LINKS+=(
-        "$(build_tuic_link \
-            "$PUBLIC_IP" \
-            "$PORT_TUIC" \
-            "$UUID_TUIC" \
-            "$PASS_TUIC" \
-            "${DOMAIN:-$final_dest}" \
-            "$insecure" \
-            "${PUBLIC_IP}-TUIC")"
-    )
-
-    local extra_index=0
-    local encoded decoded
-    local proto port sni identifier password
-    local label link
-
-    if [ -f "$EXTRA_NODES_FILE" ]; then
-        while IFS= read -r encoded || [ -n "$encoded" ]; do
-            [ -z "$encoded" ] && continue
-
-            decoded=$(b64_decode "$encoded" 2>/dev/null) || continue
-
-            IFS=$'\t' read -r proto port sni identifier password <<< "$decoded"
-
-            case "$proto" in
-                1 | 2 | 3 | 4 | 5)
-                    ;;
-                *)
-                    continue
-                    ;;
-            esac
-
-            valid_port "$port" || continue
-            valid_domain "$sni" || continue
-
-            extra_index=$((extra_index + 1))
-            label="${PUBLIC_IP}-$(protocol_name "$proto")-节点${extra_index}"
-
-            case "$proto" in
-                1)
-                    link=$(
-                        build_vless_link \
-                            "$PUBLIC_IP" \
-                            "$port" \
-                            "$identifier" \
-                            "$sni" \
-                            "$label"
-                    )
-                    ;;
-
-                2)
-                    link=$(
-                        build_anytls_link \
-                            "$PUBLIC_IP" \
-                            "$port" \
-                            "$password" \
-                            "$sni" \
-                            "$insecure" \
-                            "$label"
-                    )
-                    ;;
-
-                3)
-                    link=$(
-                        build_anyreality_link \
-                            "$PUBLIC_IP" \
-                            "$port" \
-                            "$password" \
-                            "$sni" \
-                            "$label"
-                    )
-                    ;;
-
-                4)
-                    link=$(
-                        build_hy2_link \
-                            "$PUBLIC_IP" \
-                            "$port" \
-                            "$password" \
-                            "$sni" \
-                            "$insecure" \
-                            "" \
-                            "$label"
-                    )
-                    ;;
-
-                5)
-                    link=$(
-                        build_tuic_link \
-                            "$PUBLIC_IP" \
-                            "$port" \
-                            "$identifier" \
-                            "$password" \
-                            "$sni" \
-                            "$insecure" \
-                            "$label"
-                    )
-                    ;;
-            esac
-
-            LINK_NAMES+=("$(protocol_name "$proto") - 节点${extra_index}")
-            LINKS+=("$link")
-        done < "$EXTRA_NODES_FILE"
+    if ! command -v qrencode >/dev/null 2>&1; then
+        warn "正在安装 qrencode ..."
+        pkg_install qrencode >/dev/null 2>&1
     fi
-
     clear
+    if command -v qrencode >/dev/null 2>&1; then
+        qrencode -t ANSIUTF8 "$link"
+    else
+        err "qrencode 不可用，无法显示二维码。"
+    fi
+    echo "$link"
+    pause
+}
 
-    echo -e "${CYAN}===========================================${PLAIN}"
-    echo -e "${CYAN}              节点链接列表                 ${PLAIN}"
-    echo -e "${CYAN}===========================================${PLAIN}"
+# ================= 节点管理 =================
 
-    local i
-    for ((i = 0; i < ${#LINKS[@]}; i++)); do
-        echo -e "${GREEN}[$((i + 1))] ${LINK_NAMES[$i]}:${PLAIN}"
-        echo "${LINKS[$i]}"
-        echo ""
+node_table() {
+    local i=1 o tag key port en hop st
+    echo -e " ${CYAN}编号  标签                    协议                       端口     状态${PLAIN}"
+    while IFS= read -r o; do
+        [ -z "$o" ] && continue
+        tag=$(echo "$o" | jq -r '.tag')
+        key=$(echo "$o" | jq -r '.key')
+        port=$(echo "$o" | jq -r '.port')
+        en=$(echo "$o" | jq -r '.enabled')
+        hop=$(echo "$o" | jq -r '.hop // ""')
+        [ "$en" == "false" ] && st="${YELLOW}已停用${PLAIN}" || st="${GREEN}启用${PLAIN}"
+        [ -n "$hop" ] && port="${port} (${hop})"
+        printf " %-5s %-23s %-26s %-8s %b\n" "$i" "$tag" "$(proto_field "$key" 2)" "$port" "$st"
+        i=$((i + 1))
+    done < <(jq -c '.nodes[]?' "$NODES_FILE" 2>/dev/null)
+    [ "$i" == "1" ] && warn " (暂无节点)"
+}
+
+pick_node_tag() {
+    # $1=提示 -> 结果写入 PICK_TAG
+    local tip="$1" n total
+    PICK_TAG=""
+    total=$(node_count)
+    [ "$total" -eq 0 ] && {
+        err "当前没有节点"
+        return 1
+    }
+    read -r -p "$tip [1-${total}, 回车取消]: " n
+    [ -z "$n" ] && return 1
+    [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -ge 1 ] && [ "$n" -le "$total" ] || {
+        err "编号无效"
+        return 1
+    }
+    PICK_TAG=$(jq -r --argjson n "$((n - 1))" '.nodes[$n].tag' "$NODES_FILE")
+    [ -n "$PICK_TAG" ] && [ "$PICK_TAG" != "null" ]
+}
+
+add_node_flow() {
+    clear
+    select_protocols || {
+        pause
+        return
+    }
+    local need_cert=0 k
+    for k in "${SEL_KEYS[@]}"; do
+        [ "$(proto_tls "$k")" == "tls" ] && need_cert=1
     done
-
-    echo -e "${CYAN}===========================================${PLAIN}"
-
-    local q
-
-    while true; do
-        read -r -p "输入节点序号 [1-${#LINKS[@]}] 显示二维码，回车返回主菜单: " q
-
-        if [ -z "$q" ]; then
+    if [ "$need_cert" == "1" ] && [ ! -s "$CERT_DIR/server.crt" ]; then
+        warn "所选协议需要证书，但当前没有证书，先生成自签证书。"
+        CERT_CHOICE=1
+        DOMAIN="bing.com"
+        save_cert_state
+        issue_cert || {
+            err "证书生成失败"
+            pause
             return
-        fi
+        }
+    fi
+    ensure_creds || return
+    ensure_reality || return
+    alloc_and_add_nodes
+    apply_config && show_links
+}
 
-        if [[ "$q" =~ ^[0-9]+$ ]] &&
-            [ "$q" -ge 1 ] &&
-            [ "$q" -le "${#LINKS[@]}" ]; then
-            clear
-            echo -e "${GREEN}${LINK_NAMES[$((q - 1))]} 二维码:${PLAIN}"
-            echo ""
+node_set() {
+    # node_set <tag> <jq程序> [jq参数...]
+    local t="$1" prog="$2"
+    shift 2
+    nj_set ".nodes = [.nodes[] | if .tag == \$__t then ($prog) else . end]" --arg __t "$t" "$@"
+}
 
-            qrencode -t ANSIUTF8 "${LINKS[$((q - 1))]}"
+edit_node_flow() {
+    local tag key o c v
+    clear
+    node_table
+    pick_node_tag "请选择要修改的节点编号" || {
+        pause
+        return
+    }
+    tag="$PICK_TAG"
+    o=$(node_json_by_tag "$tag")
+    key=$(echo "$o" | jq -r '.key')
+    clear
+    line
+    echo -e " 节点: ${GREEN}${tag}${PLAIN}  ($(proto_label "$key"))"
+    line
+    msg " 1. 修改端口"
+    msg " 2. 修改 SNI / 伪装域名"
+    msg " 3. 修改 UUID / 密码"
+    msg " 4. 修改 WS / HTTPUpgrade 路径 或 gRPC serviceName"
+    msg " 5. 启用 / 停用该节点"
+    msg " 6. 设置 Hysteria2 端口跳跃区间"
+    msg " 7. 设置备注 (显示在分享链接名称上)"
+    msg " 8. 删除该节点"
+    msg " 0. 返回"
+    read -r -p "请选择: " c
+    case "$c" in
+        1)
+            ask_port "新端口" "$(pick_port)"
+            node_set "$tag" '.port = ($v|tonumber)' --arg v "$ASK_PORT" || return
+            ;;
+        2)
+            read -r -p "新 SNI / 伪装域名: " v
+            valid_domain "$v" || {
+                err "域名格式不正确"
+                pause
+                return
+            }
+            node_set "$tag" '.sni = $v' --arg v "$v" || return
+            ;;
+        3)
+            read -r -p "新 UUID (留空跳过): " v
+            [ -n "$v" ] && node_set "$tag" '.uuid = $v' --arg v "$v"
+            read -r -p "新 密码 / PSK (留空跳过): " v
+            [ -n "$v" ] && node_set "$tag" '.password = $v' --arg v "$v"
+            ;;
+        4)
+            read -r -p "新 路径 / serviceName: " v
+            [ -z "$v" ] && return
+            case "$(proto_trans "$key")" in
+                grpc) node_set "$tag" '.service_name = $v' --arg v "${v#/}" ;;
+                ws | hu) node_set "$tag" '.path = $v' --arg v "/${v#/}" ;;
+                *)
+                    warn "该协议没有传输层路径"
+                    pause
+                    return
+                    ;;
+            esac
+            ;;
+        5)
+            node_set "$tag" '.enabled = (.enabled | not)' || return
+            ;;
+        6)
+            [ "$key" == "hysteria2" ] || {
+                err "端口跳跃仅支持 Hysteria2"
+                pause
+                return
+            }
+            read -r -p "端口段 (起始:结束，留空=关闭跳跃): " v
+            if [ -z "$v" ]; then
+                node_set "$tag" '.hop = ""'
+            else
+                valid_range "$v" || {
+                    err "格式应为 30000:31000"
+                    pause
+                    return
+                }
+                node_set "$tag" '.hop = $v' --arg v "$v"
+            fi
+            ;;
+        7)
+            read -r -p "备注 (留空清除): " v
+            node_set "$tag" '.remark = $v' --arg v "$v" || return
+            ;;
+        8)
+            read -r -p "确认删除节点 ${tag}？[y/N]: " v
+            [[ "$v" =~ ^[Yy]$ ]] || return
+            node_del "$tag" || return
+            ;;
+        0 | "") return ;;
+        *)
+            err "无效选项"
+            pause
+            return
+            ;;
+    esac
+    apply_config
+    pause
+}
 
-            echo ""
-            read -r -p "按回车返回节点列表..." _
-            clear
+rotate_creds() {
+    local c
+    clear
+    warn "重置全局凭据后，所有客户端都需要重新导入节点链接。"
+    read -r -p "确认重置 UUID / 密码 / SS 密钥 / PSK ？[y/N]: " c
+    [[ "$c" =~ ^[Yy]$ ]] || return
+    read -r -p "同时清除各节点的独立凭据 (旧版迁移遗留的逐协议密码)？[y/N]: " c
+    if [[ "$c" =~ ^[Yy]$ ]]; then
+        nj_set '.nodes = [.nodes[] | .uuid="" | .password=""]' || return
+    fi
+    nj_set '.creds.uuid="" | .creds.password="" | .creds.ss2022="" | .creds.ss_pass=""
+            | .creds.snell_psk="" | .creds.obfs=""' || return
+    ensure_creds || return
+    apply_config && show_links
+}
 
-            echo -e "${CYAN}===========================================${PLAIN}"
-            for ((i = 0; i < ${#LINKS[@]}; i++)); do
-                echo -e "${GREEN}[$((i + 1))] ${LINK_NAMES[$i]}:${PLAIN}"
-                echo "${LINKS[$i]}"
-                echo ""
-            done
-            echo -e "${CYAN}===========================================${PLAIN}"
-        else
-            echo -e "${RED}无效输入。${PLAIN}"
-        fi
+manage_nodes() {
+    [ -f "$NODES_FILE" ] || {
+        err "尚未安装，请先执行安装。"
+        pause
+        return
+    }
+    while true; do
+        clear
+        line
+        echo -e "${CYAN}                 节点管理                 ${PLAIN}"
+        line
+        node_table
+        line
+        msg " 1. 添加节点 (可多选协议)"
+        msg " 2. 修改 / 删除节点"
+        msg " 3. 查看分享链接与二维码"
+        msg " 4. 重置全局 UUID / 密码"
+        msg " 5. 重新生成 config.json 并重启"
+        msg " 0. 返回主菜单"
+        line
+        local c
+        read -r -p "请输入选项: " c
+        case "$c" in
+            1) add_node_flow ;;
+            2) edit_node_flow ;;
+            3) show_links ;;
+            4) rotate_creds ;;
+            5)
+                apply_config
+                pause
+                ;;
+            0 | "") return ;;
+            *)
+                err "无效选项"
+                sleep 1
+                ;;
+        esac
     done
 }
 
-# ================= 卸载 =================
+# ================= Argo (Cloudflare Tunnel) =================
 
-uninstall_singbox() {
-    clear
-
-    local c c2 c3
-
-    read -r -p "确认要彻底卸载 Sing-box 吗？[y/N]: " c
-    [[ "$c" =~ ^[Yy]$ ]] || return
-
-    [ -f "$CONF_FILE" ] &&
-        source "$CONF_FILE"
-
-    systemctl stop sing-box >/dev/null 2>&1
-    systemctl disable sing-box >/dev/null 2>&1
-
-    rm -f "$SERVICE_FILE"
-    systemctl daemon-reload
-
-    # 清理 Hy2 跳跃端口规则
-    if [ -n "${PORT_HY2_RANGE:-}" ] &&
-        [ -n "${PORT_HY2:-}" ]; then
-        local ipt ip6t
-
-        ipt=$(command -v iptables 2>/dev/null)
-        ip6t=$(command -v ip6tables 2>/dev/null)
-
-        [ -n "$ipt" ] &&
-            "$ipt" \
-                -t nat \
-                -D PREROUTING \
-                -p udp \
-                --dport "$PORT_HY2_RANGE" \
-                -j REDIRECT \
-                --to-ports "$PORT_HY2" 2>/dev/null
-
-        [ -n "$ip6t" ] &&
-            "$ip6t" \
-                -t nat \
-                -D PREROUTING \
-                -p udp \
-                --dport "$PORT_HY2_RANGE" \
-                -j REDIRECT \
-                --to-ports "$PORT_HY2" 2>/dev/null
-    fi
-
-    rm -rf "$CONFIG_DIR"
-    rm -f "$SING_BOX_BIN"
-    rm -f "${SING_BOX_BIN}.bak"
-    rm -f "${SING_BOX_BIN}.new"
-
-    if [ -x "$HOME/.acme.sh/acme.sh" ]; then
-        read -r -p "是否同时卸载 acme.sh 及其证书续期任务？[y/N]: " c2
-
-        if [[ "$c2" =~ ^[Yy]$ ]]; then
-            "$HOME/.acme.sh/acme.sh" \
-                --uninstall >/dev/null 2>&1
-            rm -rf "$HOME/.acme.sh"
-        fi
-    fi
-
-    read -r -p "是否删除 sba 快捷指令？[y/N]: " c3
-    [[ "$c3" =~ ^[Yy]$ ]] &&
-        rm -f /usr/bin/sba
-
-    echo -e "${GREEN}✔ 卸载完成！${PLAIN}"
-    sleep 2
+argo_asset() {
+    case "$(uname -m)" in
+        x86_64 | amd64) echo "cloudflared-linux-amd64" ;;
+        aarch64 | arm64) echo "cloudflared-linux-arm64" ;;
+        armv7l | armv6l) echo "cloudflared-linux-arm" ;;
+        i386 | i686) echo "cloudflared-linux-386" ;;
+        *) echo "" ;;
+    esac
 }
 
-# ================= 脚本自更新 =================
+install_cloudflared() {
+    [ -x "$CLOUDFLARED_BIN" ] && return 0
+    local asset url
+    asset=$(argo_asset)
+    [ -z "$asset" ] && {
+        err "不支持的架构: $(uname -m)"
+        return 1
+    }
+    # 直连 releases/latest/download，不走 GitHub API (家宽/CGNAT 下 API 常 403)
+    url="${GH_PROXY}https://github.com/cloudflare/cloudflared/releases/latest/download/${asset}"
+    warn "正在下载 cloudflared ..."
+    curl "${CURL_OPTS[@]}" -o "${CLOUDFLARED_BIN}.tmp" "$url" || {
+        err "cloudflared 下载失败"
+        rm -f "${CLOUDFLARED_BIN}.tmp"
+        return 1
+    }
+    chmod +x "${CLOUDFLARED_BIN}.tmp"
+    mv -f "${CLOUDFLARED_BIN}.tmp" "$CLOUDFLARED_BIN"
+    "$CLOUDFLARED_BIN" --version >/dev/null 2>&1 || {
+        err "cloudflared 无法执行"
+        return 1
+    }
+    ok "cloudflared 安装完成：$("$CLOUDFLARED_BIN" --version 2>/dev/null | head -1)"
+}
+
+argo_init() {
+    [ -f "$ARGO_FILE" ] && jq -e . "$ARGO_FILE" >/dev/null 2>&1 && return 0
+    mkdir -p "$CONFIG_DIR"
+    jq -n '{enabled:false, mode:"temp", token:"", domain:"", port:0, node_tag:"", path:""}' >"$ARGO_FILE" || return 1
+    chmod 600 "$ARGO_FILE"
+}
+
+ag() { jq -r "$1" "$ARGO_FILE" 2>/dev/null; }
+
+ag_set() {
+    local prog="$1"
+    shift
+    local tmp="${ARGO_FILE}.tmp"
+    jq "$@" "$prog" "$ARGO_FILE" >"$tmp" 2>/dev/null || {
+        rm -f "$tmp"
+        return 1
+    }
+    mv -f "$tmp" "$ARGO_FILE"
+    chmod 600 "$ARGO_FILE"
+}
+
+argo_ensure_node() {
+    # Argo 后端必须是明文 (CF 隧道到本机走 HTTP)；这里固定用 vmess-ws 明文入站
+    local tag port path
+    tag=$(ag '.node_tag // ""')
+    if [ -n "$tag" ] && [ -n "$(node_json_by_tag "$tag")" ]; then
+        port=$(node_json_by_tag "$tag" | jq -r '.port')
+        path=$(node_json_by_tag "$tag" | jq -r '.path')
+        ag_set '.port=($p|tonumber) | .path=$pa' --arg p "$port" --arg pa "$path" || return 1
+        return 0
+    fi
+    nodes_init || return 1
+    ensure_creds || return 1
+    port=$(pick_port 20000 60000)
+    tag=$(uniq_tag "argo-in")
+    insert_node "vmess-ws" "$tag" "$port" "" "" "" "" || return 1
+    # Argo 后端只监听本机回环，避免直连暴露明文端口
+    node_set "$tag" '.sni = "" | .listen_local = true' || return 1
+    path=$(node_json_by_tag "$tag" | jq -r '.path')
+    ag_set '.node_tag=$t | .port=($p|tonumber) | .path=$pa' \
+        --arg t "$tag" --arg p "$port" --arg pa "$path" || return 1
+    ok "已创建 Argo 后端节点: ${tag} (本机 ${port}${path})"
+}
+
+argo_service() {
+    local mode port token args
+    mode=$(ag '.mode // "temp"')
+    port=$(ag '.port // 0')
+    token=$(ag '.token // ""')
+    if [ "$mode" == "token" ]; then
+        [ -z "$token" ] && {
+            err "缺少 Argo Token"
+            return 1
+        }
+        args="tunnel --no-autoupdate --edge-ip-version auto --protocol http2 run --token ${token}"
+    else
+        args="tunnel --no-autoupdate --edge-ip-version auto --protocol http2 --logfile ${ARGO_LOG} --loglevel info --url http://localhost:${port}"
+    fi
+
+    cat >"$ARGO_SERVICE_FILE" <<EOF_ARGO
+[Unit]
+Description=SBA Argo Tunnel (cloudflared)
+After=network-online.target sing-box.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=${CLOUDFLARED_BIN} ${args}
+Restart=always
+RestartSec=10s
+LimitNOFILE=infinity
+
+[Install]
+WantedBy=multi-user.target
+EOF_ARGO
+    chmod 600 "$ARGO_SERVICE_FILE"
+    systemctl daemon-reload || return 1
+    systemctl enable sba-argo >/dev/null 2>&1 || true
+    return 0
+}
+
+argo_detect_domain() {
+    # 临时隧道: 从 cloudflared 日志里抓 trycloudflare 域名
+    local i d=""
+    for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+        d=$(grep -ohE '[a-zA-Z0-9-]+\.trycloudflare\.com' "$ARGO_LOG" 2>/dev/null | tail -1)
+        [ -n "$d" ] && break
+        sleep 2
+    done
+    [ -z "$d" ] && return 1
+    ag_set '.domain=$d' --arg d "$d" || return 1
+    echo "$d"
+}
+
+argo_link() {
+    # 用 LK_* (link_extract 设好的) + argo.json 生成 CDN 链接
+    local dom vm ip
+    dom=$(ag '.domain // ""')
+    [ -z "$dom" ] && {
+        echo "# ${LK_TAG}: Argo 域名尚未就绪，请稍后在 Argo 菜单中查看"
+        return 0
+    }
+    ip=$(ag '.cdn_ip // ""')
+    [ -z "$ip" ] && ip="$dom"
+    vm=$(jq -nc --arg ps "Argo-${dom%%.*}" --arg add "$ip" --arg host "$dom" \
+        --arg id "$LK_UUID" --arg path "${LK_PATH}?ed=2048" \
+        '{v:"2", ps:$ps, add:$add, port:"443", id:$id, aid:"0", scy:"auto",
+          net:"ws", type:"none", host:$host, path:$path, tls:"tls", sni:$host, fp:"chrome"}')
+    echo "vmess://$(b64_encode "$vm")"
+}
+
+argo_apply() {
+    install_cloudflared || return 1
+    argo_init || return 1
+    argo_ensure_node || return 1
+    ag_set '.enabled=true' || return 1
+    apply_config || return 1
+    argo_service || return 1
+    : >"$ARGO_LOG" 2>/dev/null
+    systemctl restart sba-argo >/dev/null 2>&1
+    sleep 3
+    if ! systemctl is-active --quiet sba-argo 2>/dev/null; then
+        err "cloudflared 启动失败，最近日志："
+        journalctl -u sba-argo -n 15 --no-pager 2>/dev/null | tail -15
+        return 1
+    fi
+    if [ "$(ag '.mode')" == "temp" ]; then
+        warn "正在等待 Cloudflare 分配临时域名 ..."
+        local d
+        d=$(argo_detect_domain) || {
+            err "未能获取 trycloudflare 域名，可稍后在 Argo 菜单里刷新。"
+            return 1
+        }
+        ok "临时隧道域名: ${d}"
+    fi
+    return 0
+}
+
+show_argo_link() {
+    local o tag
+    tag=$(ag '.node_tag // ""')
+    o=$(node_json_by_tag "$tag")
+    [ -z "$o" ] && return 1
+    load_state
+    link_extract "$o"
+    line
+    echo -e "${YELLOW}Argo 节点 (VMess + WS + TLS over Cloudflare)：${PLAIN}"
+    echo -e " 隧道域名: ${GREEN}$(ag '.domain')${PLAIN}   连接地址: $(ag '.cdn_ip // ""' | grep -q . && ag '.cdn_ip' || ag '.domain')"
+    echo -e " 本机后端: 127.0.0.1:$(ag '.port')   路径: $(ag '.path')"
+    argo_link
+    line
+}
+
+argo_setup() {
+    local mode="$1" tok dom ip port
+    clear
+    install_cloudflared || {
+        pause
+        return 1
+    }
+    argo_init || return 1
+    argo_ensure_node || {
+        pause
+        return 1
+    }
+    port=$(ag '.port')
+
+    if [ "$mode" == "token" ]; then
+        line
+        msg "固定隧道需要先在 Cloudflare Zero Trust 里建好 Tunnel："
+        msg " 1) Networks → Tunnels → Create tunnel，复制安装命令里的 ${YELLOW}Token${PLAIN}"
+        msg " 2) Public Hostname 的 Service 填 ${GREEN}http://localhost:${port}${PLAIN}"
+        line
+        while true; do
+            read -r -p "请粘贴 Argo Token: " tok
+            [ -n "${tok// /}" ] && break
+            err "Token 不能为空"
+        done
+        while true; do
+            read -r -p "隧道对应的域名 (如 argo.example.com): " dom
+            valid_domain "$dom" && break
+            err "域名格式不正确"
+        done
+        ag_set '.mode="token" | .token=$t | .domain=$d' --arg t "$tok" --arg d "$dom" || return 1
+    else
+        warn "临时隧道 (trycloudflare.com) 域名随机、重启即变，适合临时应急。"
+        ag_set '.mode="temp" | .token="" | .domain=""' || return 1
+    fi
+
+    read -r -p "优选 IP / 优选域名 (回车 = 直接用隧道域名): " ip
+    ag_set '.cdn_ip=$i' --arg i "${ip// /}"
+
+    argo_apply || {
+        pause
+        return 1
+    }
+    show_argo_link
+    pause
+}
+
+argo_state() {
+    if [ ! -f "$ARGO_FILE" ] || ! jq -e '.enabled == true' "$ARGO_FILE" >/dev/null 2>&1; then
+        echo -e "${YELLOW}未启用${PLAIN}"
+    elif systemctl is-active --quiet sba-argo 2>/dev/null; then
+        echo -e "${GREEN}运行中${PLAIN} ($(ag '.mode'))  $(ag '.domain')"
+    else
+        echo -e "${RED}已配置但未运行${PLAIN}"
+    fi
+}
+
+argo_uninstall() {
+    local c
+    read -r -p "确认卸载 Argo (同时删除后端节点)？[y/N]: " c
+    [[ "$c" =~ ^[Yy]$ ]] || return
+    systemctl disable --now sba-argo >/dev/null 2>&1
+    rm -f "$ARGO_SERVICE_FILE" "$ARGO_LOG"
+    systemctl daemon-reload >/dev/null 2>&1
+    local tag
+    tag=$(ag '.node_tag // ""')
+    [ -n "$tag" ] && node_del "$tag"
+    rm -f "$ARGO_FILE"
+    apply_config
+    ok "Argo 已卸载"
+    pause
+}
+
+argo_menu() {
+    argo_init
+    while true; do
+        clear
+        line
+        echo -e "${CYAN}          Argo (Cloudflare Tunnel)         ${PLAIN}"
+        line
+        echo -e " 当前状态: $(argo_state)"
+        line
+        msg " 1. 安装/切换为 ${GREEN}临时隧道${PLAIN} (trycloudflare，无需域名)"
+        msg " 2. 安装/切换为 ${GREEN}固定隧道${PLAIN} (Token + 自有域名)"
+        msg " 3. 查看 Argo 节点链接"
+        msg " 4. 重启 Argo (临时隧道会换新域名)"
+        msg " 5. 查看 cloudflared 日志"
+        msg " 6. 修改优选 IP / 优选域名"
+        msg " 7. 卸载 Argo"
+        msg " 0. 返回主菜单"
+        line
+        local c ip
+        read -r -p "请输入选项: " c
+        case "$c" in
+            1) argo_setup temp ;;
+            2) argo_setup token ;;
+            3)
+                show_argo_link || {
+                    err "尚未配置 Argo"
+                }
+                pause
+                ;;
+            4)
+                : >"$ARGO_LOG" 2>/dev/null
+                systemctl restart sba-argo >/dev/null 2>&1
+                sleep 3
+                [ "$(ag '.mode')" == "temp" ] && argo_detect_domain >/dev/null
+                ok "已重启：$(argo_state)"
+                show_argo_link
+                pause
+                ;;
+            5)
+                clear
+                journalctl -u sba-argo -n 40 --no-pager 2>/dev/null | tail -40
+                [ -s "$ARGO_LOG" ] && tail -20 "$ARGO_LOG"
+                pause
+                ;;
+            6)
+                read -r -p "优选 IP / 优选域名 (回车 = 用隧道域名): " ip
+                ag_set '.cdn_ip=$i' --arg i "${ip// /}" && ok "已更新"
+                pause
+                ;;
+            7) argo_uninstall ;;
+            0 | "") return ;;
+            *)
+                err "无效选项"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
+# ================= 证书 / 服务 / 卸载 =================
+
+cert_info() {
+    [ -s "$CERT_DIR/server.crt" ] || {
+        warn "尚无证书文件"
+        return 1
+    }
+    local sub dates
+    sub=$(openssl x509 -in "$CERT_DIR/server.crt" -noout -subject 2>/dev/null)
+    dates=$(openssl x509 -in "$CERT_DIR/server.crt" -noout -dates 2>/dev/null | tr '\n' ' ')
+    echo -e " 证书方式: $(nj '.cert.choice // "1"' | sed 's/^1$/自签/;s/^2$/Standalone/;s/^3$/Cloudflare DNS/')"
+    echo -e " 绑定域名: $(nj '.cert.domain // ""')"
+    echo -e " ${sub}"
+    echo -e " ${dates}"
+}
+
+cert_menu() {
+    while true; do
+        clear
+        line
+        echo -e "${CYAN}                 证书管理                 ${PLAIN}"
+        line
+        cert_info
+        line
+        msg " 1. 更换证书方式 / 重新申请"
+        msg " 2. 强制续期 (acme.sh renew)"
+        msg " 0. 返回"
+        line
+        local c
+        read -r -p "请输入选项: " c
+        case "$c" in
+            1)
+                ask_cert_params back || continue
+                save_cert_state || continue
+                if issue_cert; then
+                    # TLS 类节点的 SNI 跟随新域名
+                    local keys k
+                    for k in $(proto_keys); do
+                        [ "$(proto_tls "$k")" == "tls" ] && keys="$keys $k"
+                    done
+                    nj_set '.nodes = [.nodes[] | if ($ks | index(.key)) then .sni=$d else . end]' \
+                        --argjson ks "$(printf '%s\n' $keys | jq -R . | jq -sc .)" --arg d "${DOMAIN:-bing.com}"
+                    ok "证书已更新"
+                    apply_config
+                else
+                    err "证书申请失败"
+                fi
+                pause
+                ;;
+            2)
+                if [ -x "$HOME/.acme.sh/acme.sh" ] && [ "$(nj '.cert.choice')" != "1" ]; then
+                    "$HOME/.acme.sh/acme.sh" --renew -d "$(nj '.cert.domain')" --ecc --force
+                    systemctl restart sing-box >/dev/null 2>&1
+                    ok "续期完成"
+                else
+                    warn "当前是自签证书或未安装 acme.sh，无需续期。"
+                fi
+                pause
+                ;;
+            0 | "") return ;;
+            *)
+                err "无效选项"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
+service_menu() {
+    while true; do
+        clear
+        line
+        echo -e "${CYAN}                 服务管理                 ${PLAIN}"
+        line
+        echo -e " sing-box: $(service_state)   内核版本: $(core_version)"
+        echo -e " Argo:     $(argo_state)"
+        line
+        msg " 1. 启动    2. 停止    3. 重启"
+        msg " 4. 查看运行状态"
+        msg " 5. 查看实时日志 (Ctrl+C 退出)"
+        msg " 6. 查看 config.json"
+        msg " 7. 更新 sing-box 内核"
+        msg " 8. 开启 BBR (当前: $(check_bbr_status))"
+        msg " 0. 返回"
+        line
+        local c
+        read -r -p "请输入选项: " c
+        case "$c" in
+            1)
+                systemctl start sing-box
+                sleep 1
+                ok "$(service_state)"
+                pause
+                ;;
+            2)
+                systemctl stop sing-box
+                sleep 1
+                ok "已停止"
+                pause
+                ;;
+            3)
+                systemctl restart sing-box
+                sleep 1
+                ok "$(service_state)"
+                pause
+                ;;
+            4)
+                clear
+                systemctl status sing-box --no-pager 2>&1 | head -25
+                pause
+                ;;
+            5)
+                clear
+                journalctl -u sing-box -f --no-pager
+                ;;
+            6)
+                clear
+                [ -f "$CONFIG_FILE" ] && jq . "$CONFIG_FILE" | head -200 || err "配置不存在"
+                pause
+                ;;
+            7)
+                update_core
+                pause
+                ;;
+            8) enable_bbr ;;
+            0 | "") return ;;
+            *)
+                err "无效选项"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
+uninstall_all() {
+    clear
+    warn "此操作将卸载 sing-box、Argo 隧道以及全部节点配置。"
+    local c
+    read -r -p "确认卸载？[y/N]: " c
+    [[ "$c" =~ ^[Yy]$ ]] || return
+    read -r -p "是否保留证书文件 (${CERT_DIR})？[Y/n]: " c
+    local keep_cert=1
+    [[ "$c" =~ ^[Nn]$ ]] && keep_cert=0
+
+    systemctl disable --now sing-box >/dev/null 2>&1
+    systemctl disable --now sba-argo >/dev/null 2>&1
+    rm -f "$SERVICE_FILE" "$ARGO_SERVICE_FILE" "$ARGO_LOG"
+    systemctl daemon-reload >/dev/null 2>&1
+
+    rm -f "$SING_BOX_BIN" "$CLOUDFLARED_BIN"
+    if [ "$keep_cert" == "1" ]; then
+        rm -f "$CONFIG_FILE" "${CONFIG_FILE}.bak" "$NODES_FILE" "$ISP_FILE" "$ARGO_FILE" \
+            "${CONFIG_DIR}/links.txt" "$CONF_FILE" "$EXTRA_NODES_FILE"
+    else
+        rm -rf "$CONFIG_DIR"
+    fi
+    rm -f /usr/bin/sba
+    ok "卸载完成。"
+    exit 0
+}
 
 update_script() {
     clear
-
-    local target self tmp
-
-    target="/usr/bin/sba"
-    self=$(readlink -f "$0" 2>/dev/null)
-
-    if [ -n "$self" ] &&
-        [ -f "$self" ] &&
-        [[ "$self" != "/usr/bin/sba" ]] &&
-        [[ "$self" != "/bin/bash" ]] &&
-        [[ "$self" != "/usr/bin/bash" ]]; then
-        target="$self"
-    fi
-
-    # 临时文件放在目标同目录，保证 mv 是原子替换
-    tmp="${target}.update.tmp"
-
-    echo -e "${YELLOW}拉取最新主脚本...${PLAIN}"
-
-    if ! curl "${CURL_OPTS[@]}" \
-        -o "$tmp" \
-        "${REPO_RAW}/install.sh?t=$(date +%s)"; then
-        echo -e "${RED}下载失败，请检查网络或设置 GH_PROXY。${PLAIN}"
+    warn "正在从仓库拉取最新脚本 ..."
+    local tmp="/tmp/sba_new_$$.sh"
+    if ! curl "${CURL_OPTS[@]}" -o "$tmp" "${REPO_RAW}/install.sh"; then
+        err "下载失败，请检查网络。"
         rm -f "$tmp"
         pause
         return
     fi
-
     if ! bash -n "$tmp" 2>/dev/null; then
-        echo -e "${RED}下载的脚本语法校验失败，已取消更新。${PLAIN}"
+        err "下载到的脚本语法校验失败，已放弃更新。"
         rm -f "$tmp"
         pause
         return
     fi
-
-    chmod +x "$tmp"
-    mv -f "$tmp" "$target"
-
-    if [ "$target" != "/usr/bin/sba" ]; then
-        cp -f "$target" /usr/bin/sba
-        chmod +x /usr/bin/sba
-    fi
-
-    echo -e "${GREEN}✅ 更新成功，重新加载...${PLAIN}"
-    sleep 1
-
-    exec bash "$target"
+    local newver
+    newver=$(grep -m1 '^SBA_VERSION=' "$tmp" | cut -d'"' -f2)
+    mv -f "$tmp" /usr/bin/sba
+    chmod +x /usr/bin/sba
+    ok "已更新到版本 ${newver:-未知}，请重新执行 sba。"
+    exit 0
 }
 
-# ================= 远程模块调用 =================
-
-run_remote_module() {
-    local name="$1"
-    local file="$2"
-    local tmp
-    local rc
-
-    tmp=$(mktemp /tmp/sba_module.XXXXXX) || return 1
-
-    clear
-    echo -e "${YELLOW}正在拉取 ${name} 模块...${PLAIN}"
-
-    # 下载失败时绝不执行残留文件
-    if ! curl "${CURL_OPTS[@]}" \
-        --max-time 60 \
-        -o "$tmp" \
-        "${REPO_RAW}/${file}?t=$(date +%s)"; then
-        echo -e "${RED}拉取失败！${PLAIN}"
-        echo -e "${YELLOW}请检查网络、GH_PROXY 设置或确认仓库中存在 ${file}。${PLAIN}"
+run_module() {
+    # 优先用脚本同目录下的模块文件，其次从仓库拉取
+    local name="$1" dir local_file tmp
+    dir=$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || echo .)")" 2>/dev/null && pwd)
+    local_file="${dir}/${name}"
+    if [ -f "$local_file" ]; then
+        bash "$local_file"
+        return $?
+    fi
+    tmp="/tmp/sba_${name}"
+    if curl "${CURL_OPTS[@]}" -o "$tmp" "${REPO_RAW}/${name}"; then
+        bash "$tmp"
         rm -f "$tmp"
-        pause
-        return
+        return 0
     fi
-
-    if ! bash -n "$tmp" 2>/dev/null; then
-        echo -e "${RED}模块语法校验失败，已中止。${PLAIN}"
-        rm -f "$tmp"
-        pause
-        return
-    fi
-
-    bash "$tmp"
-    rc=$?
-
-    rm -f "$tmp"
-
-    if [ "$rc" -ne 0 ]; then
-        echo -e "\n${RED}⚠️ ${name} 模块退出码 ${rc}，请检查上方输出。${PLAIN}"
-        pause
-    fi
+    err "无法获取模块 ${name}"
+    pause
+    return 1
 }
 
 # ================= 主菜单 =================
 
 start_menu() {
     clear
-
-    echo -e "${CYAN}==========================================${PLAIN}"
-    echo -e "${CYAN}     Sing-box 五协议管理脚本 (SBA)        ${PLAIN}"
-    echo -e "${CYAN}==========================================${PLAIN}"
-
-    local bbr_txt svc_txt extra_count
-
-    bbr_txt=$(check_bbr_status)
-    extra_count=0
-
-    [ -f "$EXTRA_NODES_FILE" ] &&
-        extra_count=$(count_extra_nodes)
-
-    if [ -f "$CONF_FILE" ]; then
-        if systemctl is-active --quiet sing-box 2>/dev/null; then
-            svc_txt="${GREEN}运行中${PLAIN}"
-        else
-            svc_txt="${RED}已安装但服务未运行${PLAIN}"
-        fi
-    else
-        svc_txt="${YELLOW}未安装${PLAIN}"
-    fi
-
-    echo -e "状态: ${svc_txt}   |   BBR: ${bbr_txt}"
-    echo -e "额外节点: ${GREEN}${extra_count}${PLAIN} 个"
-    echo -e "------------------------------------------"
-    echo -e "${GREEN}1.${PLAIN}   更新 Sing-box 核心"
-    echo -e "${GREEN}2.${PLAIN}   全新安装 / 强制重装 Sing-box"
-    echo -e "${GREEN}3.${PLAIN}   修改端口、伪装域名等参数"
-    echo -e "${GREEN}4.${PLAIN}   独立申请或修复证书"
-    echo -e "${GREEN}5.${PLAIN}   查看节点链接与二维码"
-    echo -e "${GREEN}6.${PLAIN}   开启 BBR 加速"
-    echo -e "${GREEN}7.${PLAIN}   彻底卸载 Sing-box"
-    echo -e "${GREEN}8.${PLAIN}   更新主管理脚本 (SBA)"
-    echo -e "${GREEN}9.${PLAIN}   ➡️ 端口转发模块 (远程调用 Realm)"
-    echo -e "${GREEN}10.${PLAIN}  ➡️ 家宽接管模块 (远程调用 ISP)"
-    echo -e "${GREEN}11.${PLAIN}  新增协议节点"
-    echo -e "${GREEN}0.${PLAIN}   退出"
-    echo -e "------------------------------------------"
-    echo -e "${CYAN}==========================================${PLAIN}"
-
-    local mc
-    read -r -p "请输入选项: " mc
-
-    case "$mc" in
-        1)
-            if [ -f "$CONF_FILE" ]; then
-                silent_update_core
-            else
-                echo -e "${RED}请先安装。${PLAIN}"
-                sleep 1
-            fi
-            ;;
-
-        2)
-            fresh_install
-            ;;
-
-        3)
-            modify_parameters
-            ;;
-
-        4)
-            standalone_cert_manager
-            ;;
-
-        5)
-            show_links
-            ;;
-
-        6)
-            enable_bbr
-            ;;
-
-        7)
-            uninstall_singbox
-            ;;
-
-        8)
-            update_script
-            ;;
-
-        9)
-            run_remote_module "端口转发(Realm)" "realm.sh"
-            ;;
-
-        10)
-            run_remote_module "家宽接管(ISP)" "isp.sh"
-            ;;
-
-        11)
-            add_protocol_node
-            ;;
-
-        0)
-            exit 0
-            ;;
-
-        *)
-            ;;
-    esac
+    echo -e "${GREEN}==========================================${PLAIN}"
+    echo -e "${GREEN}   Sing-box 全协议一键脚本 (SBA) v${SBA_VERSION}${PLAIN}"
+    echo -e "${GREEN}==========================================${PLAIN}"
+    echo -e " 服务状态: $(service_state)    内核: ${CYAN}$(core_version)${PLAIN}"
+    echo -e " 节点数量: ${CYAN}$(node_count)${PLAIN} / 可选协议 ${CYAN}$(proto_keys | wc -l | tr -d ' ')${PLAIN} 种"
+    echo -e " 家宽接管: $(isp_summary || echo -e "${YELLOW}未开启${PLAIN}")"
+    echo -e " Argo隧道: $(argo_state)"
+    line
+    msg " 1. ${GREEN}安装 / 重装${PLAIN} (默认全协议，支持勾选)"
+    msg " 2. 节点管理 (增删改 / 分享链接 / 二维码)"
+    msg " 3. Argo 隧道 (Cloudflare Tunnel)"
+    msg " 4. 家宽流量接管 (ISP 模块)"
+    msg " 5. 证书管理"
+    msg " 6. 服务管理 / 内核更新 / BBR"
+    msg " 7. Realm 端口转发"
+    msg " 8. 更新脚本"
+    msg " 9. ${RED}卸载${PLAIN}"
+    msg " 0. 退出"
+    line
 }
 
-# ================= 启动 =================
+main() {
+    if [ "$EUID" -ne 0 ]; then
+        err "必须使用 root 用户运行此脚本 (可先执行 sudo su -)。"
+        exit 1
+    fi
+    check_deps || exit 1
+    mkdir -p "$CONFIG_DIR"
 
-install_shortcut
+    if legacy_present; then
+        clear
+        warn "检测到旧版 (v1) 配置 ${CONF_FILE}"
+        msg "将把原有端口 / UUID / 密码原样迁移到新架构，客户端无需重新导入。"
+        local c
+        read -r -p "现在迁移吗？[Y/n]: " c
+        if [[ ! "$c" =~ ^[Nn]$ ]]; then
+            if migrate_legacy; then
+                ensure_core && apply_config
+            else
+                err "迁移失败，可选择重新安装。"
+            fi
+            pause
+        fi
+    fi
 
-while true; do
-    start_menu
-done
+    install_shortcut
+
+    while true; do
+        start_menu
+        local choice
+        read -r -p "请输入选项 [0-9]: " choice
+        case "$choice" in
+            1) fresh_install ;;
+            2) manage_nodes ;;
+            3) argo_menu ;;
+            4) run_module "isp.sh" ;;
+            5) cert_menu ;;
+            6) service_menu ;;
+            7) run_module "realm.sh" ;;
+            8) update_script ;;
+            9) uninstall_all ;;
+            0)
+                echo ""
+                exit 0
+                ;;
+            *)
+                err "请输入正确的数字 [0-9]"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
+# SBA_SOURCE_ONLY=1 时只加载函数，供测试使用
+[ "${SBA_SOURCE_ONLY:-0}" == "1" ] || main "$@"

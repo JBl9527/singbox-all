@@ -1,7 +1,9 @@
 #!/bin/bash
 
 # ==========================================
-# Sing-box 独立家宽流量接管模块 (SBA ISP)
+# Sing-box 家宽流量接管模块 (SBA ISP) v2
+#   默认：本机所有节点的全部流量走家宽落地
+#   高级：只让指定节点 / 端口的流量走家宽
 # ==========================================
 
 RED='\033[0;31m'
@@ -10,342 +12,1095 @@ YELLOW='\033[0;33m'
 CYAN='\033[0;36m'
 PLAIN='\033[0m'
 
-CONFIG_FILE="/usr/local/etc/sing-box/config.json"
-RESIDENTIAL_TAG="Residential-ISP-Node"
+CONFIG_DIR="/usr/local/etc/sing-box"
+CONFIG_FILE="${CONFIG_DIR}/config.json"
+NODES_FILE="${CONFIG_DIR}/nodes.json"
+ISP_FILE="${CONFIG_DIR}/isp.json"
+ISP_TAG="Residential-ISP-Node"
+HAVE_CORE=0
 
-if [[ $EUID -ne 0 ]]; then
-    echo -e "${RED}错误：必须使用 root 用户运行此脚本！${PLAIN}"
-    sleep 3
-    exit 1
-fi
+# 复用主脚本的函数 (apply_config / 节点表 / 校验等)
+load_core() {
+    local dir cand
+    dir=$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || echo .)")" 2>/dev/null && pwd)
+    for cand in "${dir}/install.sh" /usr/bin/sba; do
+        [ -f "$cand" ] || continue
+        grep -q 'SBA_SOURCE_ONLY' "$cand" 2>/dev/null || continue
+        # shellcheck disable=SC1090
+        SBA_SOURCE_ONLY=1 source "$cand" >/dev/null 2>&1 && {
+            HAVE_CORE=1
+            return 0
+        }
+    done
+    return 1
+}
+load_core
 
-if ! command -v jq &> /dev/null; then
-    echo -e "${YELLOW}正在安装 jq 依赖...${PLAIN}"
-    apt-get update && apt-get install -y jq || { echo -e "${RED}jq 安装失败，请手动安装！${PLAIN}"; sleep 3; exit 1; }
-fi
-
-if [ ! -f "$CONFIG_FILE" ]; then
-    echo -e "${RED}未找到 Sing-box 配置文件：$CONFIG_FILE${PLAIN}"
-    echo -e "${YELLOW}请确认您是否已经安装了 Sing-box，或者路径是否正确。${PLAIN}"
-    sleep 3
-    exit 1
-fi
-
-# ================= 1. 开启家宽接管 =================
-
-enable_takeover() {
-    clear
-    echo -e "${CYAN}==========================================${PLAIN}"
-    echo -e "${CYAN}           配置家宽节点连接参数           ${PLAIN}"
-    echo -e "${CYAN}==========================================${PLAIN}"
-    echo "1. SOCKS5 (常见于代理池和指纹浏览器节点)"
-    echo "2. HTTP / HTTPS"
-    echo "3. Shadowsocks (SS)"
-    echo "4. Trojan"
-    echo "5. VMess (基础 TCP)"
-    read -p "请选择家宽协议 [1-5]: " proto_choice
-
-    echo -e "\n${YELLOW}--- 输入节点信息 ---${PLAIN}"
-    read -p "服务器 IP 或 域名: " isp_address
-    read -p "服务器 端口: " isp_port
-
-    local outbound_json=""
-
-    case "$proto_choice" in
-        1)
-            read -p "用户名 (留空则无认证): " isp_user
-            read -p "密码 (留空则无认证): " isp_pass
-            if [ -z "$isp_user" ]; then
-                outbound_json="{\"type\": \"socks\", \"tag\": \"$RESIDENTIAL_TAG\", \"server\": \"$isp_address\", \"server_port\": $isp_port, \"version\": \"5\"}"
-            else
-                outbound_json="{\"type\": \"socks\", \"tag\": \"$RESIDENTIAL_TAG\", \"server\": \"$isp_address\", \"server_port\": $isp_port, \"version\": \"5\", \"username\": \"$isp_user\", \"password\": \"$isp_pass\"}"
-            fi
-            ;;
-        2)
-            read -p "用户名 (留空则无认证): " isp_user
-            read -p "密码 (留空则无认证): " isp_pass
-            if [ -z "$isp_user" ]; then
-                outbound_json="{\"type\": \"http\", \"tag\": \"$RESIDENTIAL_TAG\", \"server\": \"$isp_address\", \"server_port\": $isp_port}"
-            else
-                outbound_json="{\"type\": \"http\", \"tag\": \"$RESIDENTIAL_TAG\", \"server\": \"$isp_address\", \"server_port\": $isp_port, \"username\": \"$isp_user\", \"password\": \"$isp_pass\"}"
-            fi
-            ;;
-        3)
-            read -p "加密方式 (如 aes-256-gcm): " isp_method
-            read -p "连接密码: " isp_pass
-            outbound_json="{\"type\": \"shadowsocks\", \"tag\": \"$RESIDENTIAL_TAG\", \"server\": \"$isp_address\", \"server_port\": $isp_port, \"method\": \"$isp_method\", \"password\": \"$isp_pass\"}"
-            ;;
-        4)
-            read -p "连接密码: " isp_pass
-            read -p "SNI 域名 (留空使用服务器地址): " isp_sni
-            [ -z "$isp_sni" ] && isp_sni="$isp_address"
-            outbound_json="{\"type\": \"trojan\", \"tag\": \"$RESIDENTIAL_TAG\", \"server\": \"$isp_address\", \"server_port\": $isp_port, \"password\": \"$isp_pass\", \"tls\": {\"enabled\": true, \"server_name\": \"$isp_sni\"}}"
-            ;;
-        5)
-            read -p "UUID: " isp_uuid
-            outbound_json="{\"type\": \"vmess\", \"tag\": \"$RESIDENTIAL_TAG\", \"server\": \"$isp_address\", \"server_port\": $isp_port, \"uuid\": \"$isp_uuid\", \"security\": \"auto\", \"alter_id\": 0}"
-            ;;
-        *)
-            echo -e "${RED}输入错误，操作取消。${PLAIN}"
-            sleep 2
-            return
-            ;;
-    esac
-
-    echo -e "\n${CYAN}==========================================${PLAIN}"
-    echo -e "${CYAN}             选择需要接管的节点           ${PLAIN}"
-    echo -e "${CYAN}==========================================${PLAIN}"
-    echo "1. 从本机已搭节点中选择 (自动读取)"
-    echo "2. 手动指定入站 端口 (高级)"
-    echo "3. 手动指定入站 Tag (高级)"
-    read -p "请选择接管模式 [1-3]: " mode_choice
-
-    local rule_json=""
-    
-    if [ "$mode_choice" == "1" ]; then
-        echo -e "\n${YELLOW}已识别到以下本机节点 (Inbounds)：${PLAIN}"
-        
-        mapfile -t INBOUND_TAGS < <(jq -r 'if .inbounds != null then .inbounds[] | select(.tag != null and .type != "direct" and .type != "block") | .tag else empty end' "$CONFIG_FILE")
-        
-        if [ ${#INBOUND_TAGS[@]} -eq 0 ]; then
-            echo -e "${RED}未在配置文件中找到任何有效节点！${PLAIN}"
-            sleep 2
-            return
-        fi
-
-        for i in "${!INBOUND_TAGS[@]}"; do
-            local pt=$(jq -r "if .inbounds != null then [.inbounds[] | select(.tag == \"${INBOUND_TAGS[$i]}\")][0] | if .listen_port != null then .listen_port else \"未知\" end else \"未知\" end" "$CONFIG_FILE")
-            echo -e " [$((i+1))] ${GREEN}${INBOUND_TAGS[$i]}${PLAIN} (端口: $pt)"
-        done
-        
-        read -p "请输入对应数字选择接管目标 [1-${#INBOUND_TAGS[@]}]: " tag_idx
-        
-        if [[ ! "$tag_idx" =~ ^[0-9]+$ ]] || [ "$tag_idx" -lt 1 ] || [ "$tag_idx" -gt "${#INBOUND_TAGS[@]}" ]; then
-             echo -e "${RED}输入错误，操作取消。${PLAIN}"
-             sleep 2
-             return
-        fi
-
-        local target_tag="${INBOUND_TAGS[$((tag_idx-1))]}"
-        rule_json="{\"inbound\": [\"$target_tag\"], \"outbound\": \"$RESIDENTIAL_TAG\"}"
-        echo -e "已选择接管节点: ${GREEN}$target_tag${PLAIN}"
-
-    elif [ "$mode_choice" == "2" ]; then
-        read -p "请输入需要接管的入站端口号 (如 10000): " target_port
-        rule_json="{\"inbound_port\": [$target_port], \"outbound\": \"$RESIDENTIAL_TAG\"}"
-    elif [ "$mode_choice" == "3" ]; then
-        read -p "请输入需要接管的入站 Tag 名称: " target_tag
-        rule_json="{\"inbound\": [\"$target_tag\"], \"outbound\": \"$RESIDENTIAL_TAG\"}"
-    else
-        echo -e "${RED}输入错误，操作取消。${PLAIN}"
-        sleep 2
-        return
-    fi
-
-    cp "$CONFIG_FILE" "${CONFIG_FILE}.bak_$(date +%s)"
-    echo -e "\n${YELLOW}正在修改并重载 Sing-box 配置...${PLAIN}"
-
-    if ! jq --arg tag "$RESIDENTIAL_TAG" \
-       --argjson new_out "$outbound_json" \
-       --argjson new_rule "$rule_json" \
-    '
-    .outbounds = (if .outbounds != null then [.outbounds[] | select(.tag != $tag)] else [] end) + [$new_out] |
-    .route = (if .route != null then .route else {} end) |
-    .route.rules = [$new_rule] + (if .route.rules != null then [.route.rules[] | select(.outbound != $tag and . != $new_rule)] else [] end)
-    ' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp"; then
-        echo -e "${RED}❌ 写入配置失败，请检查上面是否有报错信息！${PLAIN}"
-        rm -f "${CONFIG_FILE}.tmp"
-        read -n 1 -s -r -p "按任意键返回子菜单..."
-        return
-    fi
-    
-    mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
-    
-    if sing-box check -c "$CONFIG_FILE"; then
-        systemctl restart sing-box
-        if systemctl is-active --quiet sing-box; then
-            echo -e "${GREEN}✅ 家宽流量接管已成功开启！${PLAIN}"
-        else
-            echo -e "${RED}❌ Sing-box 启动失败，请检查配置。${PLAIN}"
-        fi
-    else
-         echo -e "${RED}❌ 新配置存在语法错误。已自动回滚！${PLAIN}"
-         LATEST_BAK=$(ls -t "${CONFIG_FILE}.bak_"* | head -1 2>/dev/null)
-         [ -n "$LATEST_BAK" ] && mv "$LATEST_BAK" "$CONFIG_FILE"
-    fi
+msg() { echo -e "$1"; }
+ok() { echo -e "${GREEN}✔ $1${PLAIN}"; }
+warn() { echo -e "${YELLOW}! $1${PLAIN}"; }
+err() { echo -e "${RED}✘ $1${PLAIN}"; }
+line() { echo -e "${CYAN}------------------------------------------${PLAIN}"; }
+pause() {
     echo ""
-    read -n 1 -s -r -p "按任意键返回子菜单..."
+    read -n 1 -s -r -p "按任意键继续..."
+    echo ""
 }
 
-# ================= 2. 查看接管状态 =================
+isp_preflight() {
+    if [ "$EUID" -ne 0 ]; then
+        err "必须使用 root 用户运行此脚本！"
+        sleep 2
+        exit 1
+    fi
+
+    if ! command -v jq >/dev/null 2>&1; then
+        warn "正在安装 jq 依赖 ..."
+        if command -v apt-get >/dev/null 2>&1; then
+            apt-get update -y >/dev/null 2>&1 && apt-get install -y jq >/dev/null 2>&1
+        elif command -v dnf >/dev/null 2>&1; then
+            dnf install -y jq >/dev/null 2>&1
+        elif command -v yum >/dev/null 2>&1; then
+            yum install -y jq >/dev/null 2>&1
+        elif command -v apk >/dev/null 2>&1; then
+            apk add --no-cache jq >/dev/null 2>&1
+        fi
+        command -v jq >/dev/null 2>&1 || {
+            err "jq 安装失败，请手动安装后重试。"
+            exit 1
+        }
+    fi
+
+    if [ ! -f "$CONFIG_FILE" ] && [ ! -f "$NODES_FILE" ]; then
+        err "未找到 sing-box 配置 (${CONFIG_FILE})"
+        warn "请先安装 sing-box (主脚本菜单 1)。"
+        sleep 3
+        exit 1
+    fi
+}
+
+# ================= 通用小工具 =================
+
+urldec() {
+    local s="${1//+/ }"
+    printf '%b' "${s//%/\\x}"
+}
+
+qs_get() {
+    # qs_get <查询串> <键>
+    local qs="$1" k="$2" kv
+    for kv in ${qs//&/ }; do
+        [ "${kv%%=*}" == "$k" ] || continue
+        urldec "${kv#*=}"
+        return 0
+    done
+    return 1
+}
+
+b64d() {
+    # 兼容无 padding 的 base64url
+    local s="${1//-/+}"
+    s="${s//_//}"
+    case $((${#s} % 4)) in
+        2) s="${s}==" ;;
+        3) s="${s}=" ;;
+    esac
+    printf '%s' "$s" | base64 -d 2>/dev/null
+}
+
+vp() { [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
+
+uri_split() {
+    local u="$1" rest
+    U_SCHEME="${u%%://*}"
+    rest="${u#*://}"
+    rest="${rest%%#*}"
+    U_QUERY=""
+    case "$rest" in
+        *\?*)
+            U_QUERY="${rest#*\?}"
+            rest="${rest%%\?*}"
+            ;;
+    esac
+    U_USER=""
+    case "$rest" in
+        *@*)
+            U_USER="${rest%@*}"
+            rest="${rest##*@}"
+            ;;
+    esac
+    if [[ "$rest" =~ ^\[(.+)\]:([0-9]+)$ ]]; then
+        U_HOST="${BASH_REMATCH[1]}"
+        U_PORT="${BASH_REMATCH[2]}"
+    elif [[ "$rest" == *:* ]]; then
+        U_HOST="${rest%%:*}"
+        U_PORT="${rest##*:}"
+    else
+        U_HOST="$rest"
+        U_PORT=""
+    fi
+}
+
+o_tls() {
+    # o_tls <none|tls|reality> <sni> <insecure 0/1> <alpn逗号分隔> <pbk> <sid>
+    case "$1" in
+        tls)
+            jq -n --arg sni "$2" --arg ins "$3" --arg alpn "$4" \
+                '{enabled:true, server_name:$sni, insecure:($ins=="1")}
+                 + (if $alpn == "" then {} else {alpn:($alpn|split(","))} end)'
+            ;;
+        reality)
+            jq -n --arg sni "$2" --arg pbk "$5" --arg sid "$6" \
+                '{enabled:true, server_name:$sni, utls:{enabled:true, fingerprint:"chrome"},
+                  reality:{enabled:true, public_key:$pbk, short_id:$sid}}'
+            ;;
+        *) echo "null" ;;
+    esac
+}
+
+o_trans() {
+    # o_trans <tcp|ws|grpc|httpupgrade> <path> <host> <serviceName>
+    local p="$2" ed=0
+    case "$p" in
+        *\?ed=*)
+            ed="${p##*\?ed=}"
+            p="${p%%\?*}"
+            ;;
+    esac
+    case "$1" in
+        ws)
+            jq -n --arg p "${p:-/}" --arg h "$3" --arg ed "$ed" \
+                '{type:"ws", path:$p} + (if $h == "" then {} else {headers:{Host:$h}} end)
+                 + (if ($ed|tonumber) > 0 then {max_early_data:($ed|tonumber), early_data_header_name:"Sec-WebSocket-Protocol"} else {} end)'
+            ;;
+        grpc) jq -n --arg s "$4" '{type:"grpc", service_name:$s}' ;;
+        httpupgrade | hu)
+            jq -n --arg p "${p:-/}" --arg h "$3" \
+                '{type:"httpupgrade", path:$p} + (if $h == "" then {} else {host:$h} end)'
+            ;;
+        *) echo "null" ;;
+    esac
+}
+
+set_info() { P_INFO=$(jq -nc --arg t "$1" --arg s "$2" --arg p "$3" '{type:$t, server:$s, port:($p|tonumber)}'); }
+
+pl_vless() {
+    local sec type path host svc pbk sid flow ins tls trans base
+    sec=$(qs_get "$U_QUERY" security || echo "none")
+    type=$(qs_get "$U_QUERY" type || echo tcp)
+    path=$(qs_get "$U_QUERY" path || echo "")
+    host=$(qs_get "$U_QUERY" host || echo "")
+    svc=$(qs_get "$U_QUERY" serviceName || echo "")
+    pbk=$(qs_get "$U_QUERY" pbk || echo "")
+    sid=$(qs_get "$U_QUERY" sid || echo "")
+    flow=$(qs_get "$U_QUERY" flow || echo "")
+    ins=0
+    [ "$(qs_get "$U_QUERY" allowInsecure || echo 0)" == "1" ] && ins=1
+    [ "$(qs_get "$U_QUERY" insecure || echo 0)" == "1" ] && ins=1
+    local sni
+    sni=$(qs_get "$U_QUERY" sni || echo "")
+    [ -z "$sni" ] && sni="${host:-$U_HOST}"
+
+    tls=$(o_tls "$sec" "$sni" "$ins" "" "$pbk" "$sid")
+    trans=$(o_trans "$type" "$path" "$host" "$svc")
+    base=$(jq -nc --arg t "$ISP_TAG" --arg s "$U_HOST" --arg p "$U_PORT" --arg u "$(urldec "$U_USER")" --arg f "$flow" \
+        '{type:"vless", tag:$t, server:$s, server_port:($p|tonumber), uuid:$u}
+         + (if $f == "" then {} else {flow:$f} end)')
+    P_OUT=$(jq -nc --argjson b "$base" --argjson tls "$tls" --argjson tr "$trans" \
+        '[$b + (if $tls==null then {} else {tls:$tls} end) + (if $tr==null then {} else {transport:$tr} end)]')
+    set_info vless "$U_HOST" "$U_PORT"
+}
+
+pl_vmess() {
+    local raw j add port id aid net type host path tls sni ins o_t o_tr base
+    raw=$(b64d "${1#vmess://}")
+    jq -e . >/dev/null 2>&1 <<<"$raw" || {
+        err "vmess 链接解析失败 (仅支持 base64 JSON 格式)"
+        return 1
+    }
+    j="$raw"
+    add=$(jq -r '.add // ""' <<<"$j")
+    port=$(jq -r '.port // ""' <<<"$j" | tr -d '"')
+    id=$(jq -r '.id // ""' <<<"$j")
+    aid=$(jq -r '.aid // .alterId // 0' <<<"$j" | tr -d '"')
+    net=$(jq -r '.net // "tcp"' <<<"$j")
+    host=$(jq -r '.host // ""' <<<"$j")
+    path=$(jq -r '.path // ""' <<<"$j")
+    tls=$(jq -r '.tls // ""' <<<"$j")
+    sni=$(jq -r '.sni // ""' <<<"$j")
+    [ -z "$sni" ] && sni="${host:-$add}"
+    ins=0
+    [ "$(jq -r '.verify_cert // "true"' <<<"$j")" == "false" ] && ins=1
+    o_t="null"
+    [ "$tls" == "tls" ] && o_t=$(o_tls tls "$sni" "$ins" "" "" "")
+    [ "$tls" == "reality" ] && o_t=$(o_tls reality "$sni" 0 "" "$(jq -r '.pbk // ""' <<<"$j")" "$(jq -r '.sid // ""' <<<"$j")")
+    o_tr=$(o_trans "$net" "$path" "$host" "$path")
+    vp "$port" || {
+        err "vmess 链接端口不合法"
+        return 1
+    }
+    base=$(jq -nc --arg t "$ISP_TAG" --arg s "$add" --arg p "$port" --arg u "$id" --arg a "$aid" \
+        '{type:"vmess", tag:$t, server:$s, server_port:($p|tonumber), uuid:$u,
+          security:"auto", alter_id:($a|tonumber)}')
+    P_OUT=$(jq -nc --argjson b "$base" --argjson tls "$o_t" --argjson tr "$o_tr" \
+        '[$b + (if $tls==null then {} else {tls:$tls} end) + (if $tr==null then {} else {transport:$tr} end)]')
+    set_info vmess "$add" "$port"
+}
+
+pl_trojan() {
+    local sec type path host svc ins sni tls trans base
+    sec=$(qs_get "$U_QUERY" security || echo "tls")
+    [ "$sec" == "none" ] && sec="none"
+    type=$(qs_get "$U_QUERY" type || echo tcp)
+    path=$(qs_get "$U_QUERY" path || echo "")
+    host=$(qs_get "$U_QUERY" host || echo "")
+    svc=$(qs_get "$U_QUERY" serviceName || echo "")
+    ins=0
+    [ "$(qs_get "$U_QUERY" allowInsecure || echo 0)" == "1" ] && ins=1
+    [ "$(qs_get "$U_QUERY" insecure || echo 0)" == "1" ] && ins=1
+    sni=$(qs_get "$U_QUERY" sni || echo "")
+    [ -z "$sni" ] && sni="${host:-$U_HOST}"
+    [ "$sec" == "reality" ] &&
+        tls=$(o_tls reality "$sni" 0 "" "$(qs_get "$U_QUERY" pbk || echo '')" "$(qs_get "$U_QUERY" sid || echo '')") ||
+        tls=$(o_tls "$sec" "$sni" "$ins" "" "" "")
+    trans=$(o_trans "$type" "$path" "$host" "$svc")
+    base=$(jq -nc --arg t "$ISP_TAG" --arg s "$U_HOST" --arg p "$U_PORT" --arg pw "$(urldec "$U_USER")" \
+        '{type:"trojan", tag:$t, server:$s, server_port:($p|tonumber), password:$pw}')
+    P_OUT=$(jq -nc --argjson b "$base" --argjson tls "$tls" --argjson tr "$trans" \
+        '[$b + (if $tls==null then {} else {tls:$tls} end) + (if $tr==null then {} else {transport:$tr} end)]')
+    set_info trojan "$U_HOST" "$U_PORT"
+}
+
+pl_ss() {
+    local body userinfo method pass plugin stls_host stls_pw ver
+    body="${1#ss://}"
+    body="${body%%#*}"
+    if [[ "$body" != *@* ]]; then
+        # 整体 base64: method:pass@host:port
+        body=$(b64d "${body%%\?*}")
+        [ -z "$body" ] && {
+            err "ss 链接解析失败"
+            return 1
+        }
+        uri_split "ss://${body}"
+        userinfo="$U_USER"
+        method="${userinfo%%:*}"
+        pass="${userinfo#*:}"
+    else
+        uri_split "$1"
+        userinfo=$(b64d "$U_USER")
+        [ -z "$userinfo" ] && userinfo=$(urldec "$U_USER")
+        method="${userinfo%%:*}"
+        pass="${userinfo#*:}"
+    fi
+    vp "$U_PORT" || {
+        err "ss 链接端口不合法"
+        return 1
+    }
+    plugin=$(qs_get "$U_QUERY" plugin || echo "")
+
+    if [[ "$plugin" == shadow-tls* ]]; then
+        # ss over shadowtls: shadowsocks 不写 server/port，靠 detour 指向 shadowtls 出站
+        stls_host=$(sed -n 's/.*host=\([^;]*\).*/\1/p' <<<"$plugin")
+        stls_pw=$(sed -n 's/.*password=\([^;]*\).*/\1/p' <<<"$plugin")
+        ver=$(sed -n 's/.*version=\([^;]*\).*/\1/p' <<<"$plugin")
+        [ -z "$ver" ] && ver=3
+        P_OUT=$(jq -nc --arg t "$ISP_TAG" --arg m "$method" --arg pw "$pass" \
+            --arg s "$U_HOST" --arg p "$U_PORT" --arg h "${stls_host:-$U_HOST}" \
+            --arg spw "$stls_pw" --arg v "$ver" \
+            '[{type:"shadowsocks", tag:$t, method:$m, password:$pw, detour:($t+"-stls")},
+              {type:"shadowtls", tag:($t+"-stls"), server:$s, server_port:($p|tonumber),
+               version:($v|tonumber), password:$spw,
+               tls:{enabled:true, server_name:$h, utls:{enabled:true, fingerprint:"chrome"}}}]')
+        set_info "ss+shadowtls" "$U_HOST" "$U_PORT"
+    else
+        P_OUT=$(jq -nc --arg t "$ISP_TAG" --arg s "$U_HOST" --arg p "$U_PORT" --arg m "$method" --arg pw "$pass" \
+            '[{type:"shadowsocks", tag:$t, server:$s, server_port:($p|tonumber), method:$m, password:$pw}]')
+        set_info shadowsocks "$U_HOST" "$U_PORT"
+    fi
+}
+
+pl_hy2() {
+    local sni ins obfs obpw
+    sni=$(qs_get "$U_QUERY" sni || echo "$U_HOST")
+    ins=0
+    [ "$(qs_get "$U_QUERY" insecure || echo 0)" == "1" ] && ins=1
+    obfs=$(qs_get "$U_QUERY" obfs || echo "")
+    obpw=$(qs_get "$U_QUERY" obfs-password || echo "")
+    P_OUT=$(jq -nc --arg t "$ISP_TAG" --arg s "$U_HOST" --arg p "$U_PORT" \
+        --arg pw "$(urldec "$U_USER")" --arg sni "$sni" --arg ins "$ins" \
+        --arg ob "$obfs" --arg obpw "$obpw" \
+        '[{type:"hysteria2", tag:$t, server:$s, server_port:($p|tonumber), password:$pw,
+           tls:{enabled:true, server_name:$sni, insecure:($ins=="1"), alpn:["h3"]}}
+          + (if $ob == "" then {} else {obfs:{type:$ob, password:$obpw}} end)]')
+    set_info hysteria2 "$U_HOST" "$U_PORT"
+}
+
+pl_hysteria() {
+    local sni ins auth up down
+    sni=$(qs_get "$U_QUERY" peer || qs_get "$U_QUERY" sni || echo "$U_HOST")
+    ins=0
+    [ "$(qs_get "$U_QUERY" insecure || echo 0)" == "1" ] && ins=1
+    auth=$(qs_get "$U_QUERY" auth || echo "")
+    up=$(qs_get "$U_QUERY" upmbps || echo 100)
+    down=$(qs_get "$U_QUERY" downmbps || echo 500)
+    P_OUT=$(jq -nc --arg t "$ISP_TAG" --arg s "$U_HOST" --arg p "$U_PORT" --arg a "$auth" \
+        --arg sni "$sni" --arg ins "$ins" --arg up "$up" --arg down "$down" \
+        '[{type:"hysteria", tag:$t, server:$s, server_port:($p|tonumber), auth_str:$a,
+           up_mbps:($up|tonumber), down_mbps:($down|tonumber),
+           tls:{enabled:true, server_name:$sni, insecure:($ins=="1"), alpn:["h3"]}}]')
+    set_info hysteria "$U_HOST" "$U_PORT"
+}
+
+pl_tuic() {
+    local uuid pass sni ins cc udp
+    uuid="${U_USER%%:*}"
+    pass=$(urldec "${U_USER#*:}")
+    sni=$(qs_get "$U_QUERY" sni || echo "$U_HOST")
+    ins=0
+    [ "$(qs_get "$U_QUERY" allow_insecure || echo 0)" == "1" ] && ins=1
+    [ "$(qs_get "$U_QUERY" insecure || echo 0)" == "1" ] && ins=1
+    cc=$(qs_get "$U_QUERY" congestion_control || echo bbr)
+    udp=$(qs_get "$U_QUERY" udp_relay_mode || echo native)
+    P_OUT=$(jq -nc --arg t "$ISP_TAG" --arg s "$U_HOST" --arg p "$U_PORT" --arg u "$uuid" \
+        --arg pw "$pass" --arg sni "$sni" --arg ins "$ins" --arg cc "$cc" --arg udp "$udp" \
+        '[{type:"tuic", tag:$t, server:$s, server_port:($p|tonumber), uuid:$u, password:$pw,
+           congestion_control:$cc, udp_relay_mode:$udp,
+           tls:{enabled:true, server_name:$sni, insecure:($ins=="1"), alpn:["h3"]}}]')
+    set_info tuic "$U_HOST" "$U_PORT"
+}
+
+pl_anytls() {
+    local sni ins sec tls
+    sni=$(qs_get "$U_QUERY" sni || echo "$U_HOST")
+    ins=0
+    [ "$(qs_get "$U_QUERY" insecure || echo 0)" == "1" ] && ins=1
+    sec=$(qs_get "$U_QUERY" security || echo tls)
+    if [ "$sec" == "reality" ]; then
+        tls=$(o_tls reality "$sni" 0 "" "$(qs_get "$U_QUERY" pbk || echo '')" "$(qs_get "$U_QUERY" sid || echo '')")
+    else
+        tls=$(o_tls tls "$sni" "$ins" "" "" "")
+    fi
+    P_OUT=$(jq -nc --arg t "$ISP_TAG" --arg s "$U_HOST" --arg p "$U_PORT" \
+        --arg pw "$(urldec "$U_USER")" --argjson tls "$tls" \
+        '[{type:"anytls", tag:$t, server:$s, server_port:($p|tonumber), password:$pw, tls:$tls}]')
+    set_info anytls "$U_HOST" "$U_PORT"
+}
+
+pl_socks() {
+    local ui user pass
+    ui="$U_USER"
+    [[ "$ui" != *:* ]] && ui=$(b64d "$ui")
+    user=$(urldec "${ui%%:*}")
+    pass=$(urldec "${ui#*:}")
+    [ "$user" == "$pass" ] && [ -z "${ui}" ] && {
+        user=""
+        pass=""
+    }
+    P_OUT=$(jq -nc --arg t "$ISP_TAG" --arg s "$U_HOST" --arg p "$U_PORT" --arg u "$user" --arg pw "$pass" \
+        '[{type:"socks", tag:$t, server:$s, server_port:($p|tonumber), version:"5"}
+          + (if $u == "" then {} else {username:$u, password:$pw} end)]')
+    set_info socks "$U_HOST" "$U_PORT"
+}
+
+pl_http() {
+    local user pass usetls=0
+    [ "$U_SCHEME" == "https" ] && usetls=1
+    user=$(urldec "${U_USER%%:*}")
+    pass=$(urldec "${U_USER#*:}")
+    [ -z "$U_USER" ] && {
+        user=""
+        pass=""
+    }
+    P_OUT=$(jq -nc --arg t "$ISP_TAG" --arg s "$U_HOST" --arg p "${U_PORT:-80}" --arg u "$user" \
+        --arg pw "$pass" --arg tls "$usetls" --arg sni "$U_HOST" \
+        '[{type:"http", tag:$t, server:$s, server_port:($p|tonumber)}
+          + (if $u == "" then {} else {username:$u, password:$pw} end)
+          + (if $tls == "1" then {tls:{enabled:true, server_name:$sni}} else {} end)]')
+    set_info http "$U_HOST" "${U_PORT:-80}"
+}
+
+parse_link() {
+    local u
+    u=$(printf '%s' "$1" | tr -d '[:space:]')
+    P_OUT=""
+    P_INFO=""
+    case "$u" in
+        vmess://*) pl_vmess "$u" || return 1 ;;
+        vless://*)
+            uri_split "$u"
+            pl_vless
+            ;;
+        trojan://*)
+            uri_split "$u"
+            pl_trojan
+            ;;
+        ss://*) pl_ss "$u" || return 1 ;;
+        hysteria2://* | hy2://*)
+            uri_split "$u"
+            pl_hy2
+            ;;
+        hysteria://*)
+            uri_split "$u"
+            pl_hysteria
+            ;;
+        tuic://*)
+            uri_split "$u"
+            pl_tuic
+            ;;
+        anytls://*)
+            uri_split "$u"
+            pl_anytls
+            ;;
+        socks://* | socks5://*)
+            uri_split "$u"
+            pl_socks
+            ;;
+        http://* | https://*)
+            uri_split "$u"
+            pl_http
+            ;;
+        naive+https://*)
+            err "sing-box 1.14 的 naive 出站不可用 (cronet 库缺失)，请换用其它协议。"
+            return 1
+            ;;
+        *)
+            err "无法识别的链接格式: ${u:0:20}..."
+            return 1
+            ;;
+    esac
+    jq -e . >/dev/null 2>&1 <<<"$P_OUT" || {
+        err "链接解析失败"
+        return 1
+    }
+    local sv
+    sv=$(jq -r '[.[] | select(.server != null)] | .[0].server // ""' <<<"$P_OUT")
+    [ -z "$sv" ] && {
+        err "链接里缺少服务器地址"
+        return 1
+    }
+    return 0
+}
+
+input_by_link() {
+    local u
+    line
+    msg "支持: vless / vmess / trojan / ss (含 shadow-tls 插件) / hysteria2 / hysteria / tuic / anytls / socks / http"
+    line
+    read -r -p "请粘贴家宽节点分享链接: " u
+    [ -z "${u// /}" ] && return 1
+    parse_link "$u" || return 1
+    ok "已解析: $(jq -r '.type + "  " + .server + ":" + (.port|tostring)' <<<"$P_INFO")"
+    return 0
+}
+
+ask_common() {
+    # 结果: M_ADDR / M_PORT
+    while true; do
+        read -r -p "服务器 IP 或域名: " M_ADDR
+        [ -n "${M_ADDR// /}" ] && break
+        err "不能为空"
+    done
+    while true; do
+        read -r -p "服务器端口: " M_PORT
+        vp "$M_PORT" && break
+        err "端口不合法"
+    done
+}
+
+input_manual() {
+    local c u pw method sni ins ver mode
+    line
+    msg " 1. SOCKS5 (最常见的家宽/指纹浏览器节点)"
+    msg " 2. HTTP / HTTPS"
+    msg " 3. Shadowsocks"
+    msg " 4. Trojan"
+    msg " 5. VMess (TCP，可选 TLS)"
+    msg " 6. VLESS (TCP / TLS)"
+    msg " 7. Hysteria2"
+    msg " 8. TUIC v5"
+    msg " 9. AnyTLS"
+    msg "10. Snell (v4 / v6)"
+    line
+    read -r -p "请选择家宽节点协议 [1-10]: " c
+    ask_common
+    P_OUT=""
+    case "$c" in
+        1)
+            read -r -p "用户名 (留空=无认证): " u
+            read -r -p "密码: " pw
+            P_OUT=$(jq -nc --arg t "$ISP_TAG" --arg s "$M_ADDR" --arg p "$M_PORT" --arg u "$u" --arg pw "$pw" \
+                '[{type:"socks", tag:$t, server:$s, server_port:($p|tonumber), version:"5"}
+                  + (if $u == "" then {} else {username:$u, password:$pw} end)]')
+            set_info socks "$M_ADDR" "$M_PORT"
+            ;;
+        2)
+            read -r -p "用户名 (留空=无认证): " u
+            read -r -p "密码: " pw
+            read -r -p "启用 TLS (HTTPS 代理)？[y/N]: " ins
+            P_OUT=$(jq -nc --arg t "$ISP_TAG" --arg s "$M_ADDR" --arg p "$M_PORT" --arg u "$u" --arg pw "$pw" \
+                --arg tls "$(echo "$ins" | grep -qi '^y' && echo 1 || echo 0)" \
+                '[{type:"http", tag:$t, server:$s, server_port:($p|tonumber)}
+                  + (if $u == "" then {} else {username:$u, password:$pw} end)
+                  + (if $tls == "1" then {tls:{enabled:true, server_name:$s}} else {} end)]')
+            set_info http "$M_ADDR" "$M_PORT"
+            ;;
+        3)
+            read -r -p "加密方式 [回车=aes-256-gcm]: " method
+            method="${method:-aes-256-gcm}"
+            read -r -p "密码: " pw
+            P_OUT=$(jq -nc --arg t "$ISP_TAG" --arg s "$M_ADDR" --arg p "$M_PORT" --arg m "$method" --arg pw "$pw" \
+                '[{type:"shadowsocks", tag:$t, server:$s, server_port:($p|tonumber), method:$m, password:$pw}]')
+            set_info shadowsocks "$M_ADDR" "$M_PORT"
+            ;;
+        4)
+            read -r -p "密码: " pw
+            read -r -p "SNI [回车=${M_ADDR}]: " sni
+            read -r -p "跳过证书验证 (自签证书需要)？[y/N]: " ins
+            P_OUT=$(jq -nc --arg t "$ISP_TAG" --arg s "$M_ADDR" --arg p "$M_PORT" --arg pw "$pw" \
+                --arg sni "${sni:-$M_ADDR}" --arg ins "$(echo "$ins" | grep -qi '^y' && echo 1 || echo 0)" \
+                '[{type:"trojan", tag:$t, server:$s, server_port:($p|tonumber), password:$pw,
+                   tls:{enabled:true, server_name:$sni, insecure:($ins=="1")}}]')
+            set_info trojan "$M_ADDR" "$M_PORT"
+            ;;
+        5)
+            read -r -p "UUID: " u
+            read -r -p "启用 TLS？[y/N]: " ins
+            read -r -p "SNI [回车=${M_ADDR}]: " sni
+            P_OUT=$(jq -nc --arg t "$ISP_TAG" --arg s "$M_ADDR" --arg p "$M_PORT" --arg u "$u" \
+                --arg sni "${sni:-$M_ADDR}" --arg tls "$(echo "$ins" | grep -qi '^y' && echo 1 || echo 0)" \
+                '[{type:"vmess", tag:$t, server:$s, server_port:($p|tonumber), uuid:$u,
+                   security:"auto", alter_id:0}
+                  + (if $tls == "1" then {tls:{enabled:true, server_name:$sni, insecure:true}} else {} end)]')
+            set_info vmess "$M_ADDR" "$M_PORT"
+            ;;
+        6)
+            read -r -p "UUID: " u
+            read -r -p "启用 TLS？[y/N]: " ins
+            read -r -p "SNI [回车=${M_ADDR}]: " sni
+            P_OUT=$(jq -nc --arg t "$ISP_TAG" --arg s "$M_ADDR" --arg p "$M_PORT" --arg u "$u" \
+                --arg sni "${sni:-$M_ADDR}" --arg tls "$(echo "$ins" | grep -qi '^y' && echo 1 || echo 0)" \
+                '[{type:"vless", tag:$t, server:$s, server_port:($p|tonumber), uuid:$u}
+                  + (if $tls == "1" then {tls:{enabled:true, server_name:$sni, insecure:true}} else {} end)]')
+            set_info vless "$M_ADDR" "$M_PORT"
+            ;;
+        7)
+            read -r -p "密码: " pw
+            read -r -p "SNI [回车=${M_ADDR}]: " sni
+            read -r -p "跳过证书验证？[Y/n]: " ins
+            P_OUT=$(jq -nc --arg t "$ISP_TAG" --arg s "$M_ADDR" --arg p "$M_PORT" --arg pw "$pw" \
+                --arg sni "${sni:-$M_ADDR}" --arg ins "$(echo "$ins" | grep -qi '^n' && echo 0 || echo 1)" \
+                '[{type:"hysteria2", tag:$t, server:$s, server_port:($p|tonumber), password:$pw,
+                   tls:{enabled:true, server_name:$sni, insecure:($ins=="1"), alpn:["h3"]}}]')
+            set_info hysteria2 "$M_ADDR" "$M_PORT"
+            ;;
+        8)
+            read -r -p "UUID: " u
+            read -r -p "密码: " pw
+            read -r -p "SNI [回车=${M_ADDR}]: " sni
+            read -r -p "跳过证书验证？[Y/n]: " ins
+            P_OUT=$(jq -nc --arg t "$ISP_TAG" --arg s "$M_ADDR" --arg p "$M_PORT" --arg u "$u" --arg pw "$pw" \
+                --arg sni "${sni:-$M_ADDR}" --arg ins "$(echo "$ins" | grep -qi '^n' && echo 0 || echo 1)" \
+                '[{type:"tuic", tag:$t, server:$s, server_port:($p|tonumber), uuid:$u, password:$pw,
+                   congestion_control:"bbr", udp_relay_mode:"native",
+                   tls:{enabled:true, server_name:$sni, insecure:($ins=="1"), alpn:["h3"]}}]')
+            set_info tuic "$M_ADDR" "$M_PORT"
+            ;;
+        9)
+            read -r -p "密码: " pw
+            read -r -p "SNI [回车=${M_ADDR}]: " sni
+            read -r -p "跳过证书验证？[Y/n]: " ins
+            P_OUT=$(jq -nc --arg t "$ISP_TAG" --arg s "$M_ADDR" --arg p "$M_PORT" --arg pw "$pw" \
+                --arg sni "${sni:-$M_ADDR}" --arg ins "$(echo "$ins" | grep -qi '^n' && echo 0 || echo 1)" \
+                '[{type:"anytls", tag:$t, server:$s, server_port:($p|tonumber), password:$pw,
+                   tls:{enabled:true, server_name:$sni, insecure:($ins=="1")}}]')
+            set_info anytls "$M_ADDR" "$M_PORT"
+            ;;
+        10)
+            read -r -p "PSK: " pw
+            warn "sing-box 出站只支持 Snell v4 / v6 (v5 服务端请填 4，线路协议一致)。"
+            read -r -p "版本 [4/6，回车=4]: " ver
+            ver="${ver:-4}"
+            [ "$ver" == "6" ] || ver=4
+            mode=""
+            [ "$ver" == "6" ] && {
+                read -r -p "v6 mode [default/unshaped/unsafe-raw，回车=default]: " mode
+                mode="${mode:-default}"
+            }
+            P_OUT=$(jq -nc --arg t "$ISP_TAG" --arg s "$M_ADDR" --arg p "$M_PORT" --arg pw "$pw" \
+                --arg v "$ver" --arg m "$mode" \
+                '[{type:"snell", tag:$t, server:$s, server_port:($p|tonumber), psk:$pw, version:($v|tonumber)}
+                  + (if $m == "" then {} else {mode:$m} end)]')
+            set_info "snell v${ver}" "$M_ADDR" "$M_PORT"
+            ;;
+        *)
+            err "输入错误"
+            return 1
+            ;;
+    esac
+    [ -z "$P_OUT" ] && return 1
+    return 0
+}
+
+isp_expand() {
+    local raw="${1//,/ }" tok a b i out=""
+    for tok in $raw; do
+        if [[ "$tok" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+            a="${BASH_REMATCH[1]}"
+            b="${BASH_REMATCH[2]}"
+            for ((i = a; i <= b; i++)); do out="$out $i"; done
+        elif [[ "$tok" =~ ^[0-9]+$ ]]; then
+            out="$out $tok"
+        fi
+    done
+    echo "$out" | tr ' ' '\n' | grep -v '^$' | awk '!seen[$0]++' | tr '\n' ' '
+}
+
+list_inbounds() {
+    # 输出: tag <TAB> port <TAB> 类型
+    if [ -f "$NODES_FILE" ]; then
+        jq -r '.nodes[]? | select(.enabled != false) | "\(.tag)\t\(.port)\t\(.key)"' "$NODES_FILE" 2>/dev/null
+    elif [ -f "$CONFIG_FILE" ]; then
+        jq -r '.inbounds[]? | select(.tag != null and .type != "direct" and .type != "tun")
+               | "\(.tag)\t\(.listen_port // 0)\t\(.type)"' "$CONFIG_FILE" 2>/dev/null
+    fi
+}
+
+select_targets() {
+    # 结果: TARGET_TAGS (JSON 数组)
+    TARGET_TAGS="[]"
+    local rows=() i n c tag ports p
+    mapfile -t rows < <(list_inbounds)
+    [ ${#rows[@]} -eq 0 ] && {
+        err "没有找到任何本机节点"
+        return 1
+    }
+    line
+    msg "本机节点列表："
+    for i in "${!rows[@]}"; do
+        printf " %b%2d%b) %-24s 端口 %-8s %s\n" "$GREEN" "$((i + 1))" "$PLAIN" \
+            "$(cut -f1 <<<"${rows[$i]}")" "$(cut -f2 <<<"${rows[$i]}")" "$(cut -f3 <<<"${rows[$i]}")"
+    done
+    line
+    msg " 直接输入编号选择需要接管的节点，支持 ${YELLOW}1 3${PLAIN} / ${YELLOW}1-4${PLAIN}"
+    msg " 输入 ${YELLOW}p${PLAIN} 改为按端口指定 (会自动换算成节点 tag)"
+    read -r -p "请输入: " c
+
+    if [[ "$c" =~ ^[pP]$ ]]; then
+        read -r -p "端口号 (多个用空格/逗号分隔): " ports
+        for p in ${ports//,/ }; do
+            tag=$(awk -F'\t' -v pp="$p" '$2==pp{print $1; exit}' <<<"$(printf '%s\n' "${rows[@]}")")
+            if [ -n "$tag" ]; then
+                TARGET_TAGS=$(jq -c --arg t "$tag" '. + [$t]' <<<"$TARGET_TAGS")
+            else
+                warn "端口 $p 没有对应的本机节点，已忽略 (1.14 的 route.rules 不支持直接写端口)"
+            fi
+        done
+    else
+        for n in $(isp_expand "$c"); do
+            [ "$n" -ge 1 ] 2>/dev/null && [ "$n" -le "${#rows[@]}" ] || continue
+            tag=$(cut -f1 <<<"${rows[$((n - 1))]}")
+            TARGET_TAGS=$(jq -c --arg t "$tag" '. + [$t]' <<<"$TARGET_TAGS")
+        done
+    fi
+    TARGET_TAGS=$(jq -c 'unique' <<<"$TARGET_TAGS")
+    [ "$(jq 'length' <<<"$TARGET_TAGS")" -eq 0 ] && {
+        err "未选择任何节点"
+        return 1
+    }
+    ok "已选择: $(jq -r 'join(", ")' <<<"$TARGET_TAGS")"
+    return 0
+}
+
+write_isp() {
+    # write_isp <all|selective>
+    local mode="$1" tmp="${ISP_FILE}.tmp"
+    mkdir -p "$CONFIG_DIR"
+    jq -n --argjson out "$P_OUT" --argjson info "${P_INFO:-null}" --arg tag "$ISP_TAG" \
+        --arg mode "$mode" --argjson tags "${TARGET_TAGS:-[]}" \
+        '{enabled:true, mode:$mode, tag:$tag, outbounds:$out,
+          targets:{tags:$tags}, info:$info}' >"$tmp" 2>/dev/null || {
+        err "写入 isp.json 失败"
+        rm -f "$tmp"
+        return 1
+    }
+    mv -f "$tmp" "$ISP_FILE"
+    chmod 600 "$ISP_FILE"
+}
+
+sb_bin() {
+    command -v sing-box 2>/dev/null || echo /usr/local/bin/sing-box
+}
+
+patch_config_direct() {
+    # 没有 nodes.json 的老部署：直接改 config.json
+    local mode tags bin tmp bak
+    mode=$(jq -r '.mode // "all"' "$ISP_FILE")
+    tags=$(jq -c '.targets.tags // []' "$ISP_FILE")
+    bin=$(sb_bin)
+    tmp="${CONFIG_FILE}.tmp"
+    bak="${CONFIG_FILE}.bak_$(date +%s)"
+    cp -f "$CONFIG_FILE" "$bak"
+
+    jq --arg tag "$ISP_TAG" --argjson out "$P_OUT" --arg mode "$mode" --argjson tags "$tags" '
+        .outbounds = ([(.outbounds // [])[]
+                       | select((.tag // "") != $tag and ((.tag // "") | startswith($tag + "-") | not))]
+                      + $out)
+        | .outbounds = (if ([.outbounds[] | select(.type == "direct")] | length) == 0
+                        then .outbounds + [{type:"direct", tag:"direct"}] else .outbounds end)
+        | .route = (.route // {})
+        | .route.rules = [((.route.rules // [])[]) | select((.outbound // "") != $tag)]
+        | if $mode == "all"
+          then .route.final = $tag
+          else .route.rules = ([{inbound:$tags, outbound:$tag}] + .route.rules)
+               | .route.final = (if (.route.final // "") == $tag then "direct" else (.route.final // "direct") end)
+          end
+    ' "$CONFIG_FILE" >"$tmp" 2>/dev/null || {
+        err "修改 config.json 失败"
+        rm -f "$tmp"
+        return 1
+    }
+
+    if [ -x "$bin" ] || command -v sing-box >/dev/null 2>&1; then
+        local out
+        out=$("$bin" check -c "$tmp" 2>&1)
+        [ -n "$out" ] && {
+            err "新配置未通过 sing-box 校验，已放弃修改："
+            echo "$out" | head -5
+            rm -f "$tmp"
+            return 1
+        }
+    fi
+    mv -f "$tmp" "$CONFIG_FILE"
+    systemctl restart sing-box >/dev/null 2>&1
+    sleep 1
+    if systemctl is-active --quiet sing-box 2>/dev/null; then
+        return 0
+    fi
+    err "sing-box 启动失败，已回滚。"
+    journalctl -u sing-box -n 10 --no-pager 2>/dev/null | tail -10
+    cp -f "$bak" "$CONFIG_FILE"
+    systemctl restart sing-box >/dev/null 2>&1
+    return 1
+}
+
+apply_isp() {
+    if [ "$HAVE_CORE" == "1" ] && [ -f "$NODES_FILE" ]; then
+        # 主脚本会用 nodes.json + isp.json 重新生成 config.json
+        apply_config
+        return $?
+    fi
+    patch_config_direct
+}
+
+load_existing() {
+    [ -f "$ISP_FILE" ] || return 1
+    P_OUT=$(jq -c '.outbounds // []' "$ISP_FILE" 2>/dev/null)
+    P_INFO=$(jq -c '.info // null' "$ISP_FILE" 2>/dev/null)
+    TARGET_TAGS=$(jq -c '.targets.tags // []' "$ISP_FILE" 2>/dev/null)
+    [ -n "$P_OUT" ] && [ "$(jq 'length' <<<"$P_OUT")" -gt 0 ]
+}
+
+status_body() {
+    if ! load_existing || ! jq -e '.enabled == true' "$ISP_FILE" >/dev/null 2>&1; then
+        warn "当前未开启家宽接管。"
+        return 1
+    fi
+    local mode
+    mode=$(jq -r '.mode // "all"' "$ISP_FILE")
+    echo -e "${GREEN}【家宽落地节点】${PLAIN}"
+    jq -r '.outbounds[] | "  - " + .type + "  " + ((.server // "(链式)")|tostring)
+           + (if .server_port then ":" + (.server_port|tostring) else "" end)
+           + "   tag=" + .tag' "$ISP_FILE"
+    echo ""
+    echo -e "${GREEN}【接管范围】${PLAIN}"
+    if [ "$mode" == "all" ]; then
+        echo -e "  ${GREEN}全量接管${PLAIN}：本机所有入站的流量默认走家宽 (route.final=${ISP_TAG})"
+    else
+        echo -e "  ${YELLOW}按节点接管${PLAIN}：$(jq -r '(.targets.tags // []) | join(", ")' "$ISP_FILE")"
+    fi
+    if [ -f "$CONFIG_FILE" ]; then
+        echo ""
+        echo -e "${GREEN}【生效情况 (config.json)】${PLAIN}"
+        echo -e "  route.final = $(jq -r '.route.final // "-"' "$CONFIG_FILE")"
+        echo -e "  指向家宽的规则数 = $(jq --arg t "$ISP_TAG" '[(.route.rules // [])[] | select((.outbound // "") == $t)] | length' "$CONFIG_FILE")"
+        echo -e "  家宽出站已写入 = $(jq --arg t "$ISP_TAG" '[(.outbounds // [])[] | select(.tag == $t)] | length > 0' "$CONFIG_FILE")"
+    fi
+    return 0
+}
 
 view_status() {
     clear
-    echo -e "${CYAN}==========================================${PLAIN}"
-    echo -e "${CYAN}          当前家宽流量接管状态            ${PLAIN}"
-    echo -e "${CYAN}==========================================${PLAIN}"
-
-    if ! grep -q "$RESIDENTIAL_TAG" "$CONFIG_FILE"; then
-        echo -e "\n${YELLOW}当前未开启任何家宽接管配置。${PLAIN}\n"
-    else
-        echo -e "${GREEN}【已绑定的家宽节点信息】${PLAIN}"
-        jq -r '.outbounds[]? | select(.tag == "'"$RESIDENTIAL_TAG"'") | 
-        " - 协议类型: \(.type) \n - 节点地址: \(.server):\(.server_port)"' "$CONFIG_FILE"
-
-        echo -e "\n${GREEN}【当前被接管的流量规则】${PLAIN}"
-        jq -r '
-if .route != null and .route.rules != null then
-    .route.rules[]
-    | select(.outbound == "'$RESIDENTIAL_TAG'")
-    | (if .inbound
-        then " - 已接管节点标签 (Tag): \(.inbound | join(", "))"
-        else empty
-       end),
-      (if .inbound_port
-        then " - 已接管入站端口 (Port): \(.inbound_port | join(", "))"
-        else empty
-       end)
-else
-    empty
-end
-' "$CONFIG_FILE"
-        echo ""
-    fi
-    echo -e "${CYAN}==========================================${PLAIN}"
-    read -n 1 -s -r -p "按任意键返回菜单..."
+    line
+    echo -e "${CYAN}            家宽流量接管状态              ${PLAIN}"
+    line
+    status_body
+    line
+    pause
 }
 
-# ================= 3. 选择性移除接管 =================
+enable_takeover() {
+    clear
+    line
+    echo -e "${CYAN}          配置家宽落地节点参数            ${PLAIN}"
+    line
+    msg " 1. 粘贴分享链接自动解析 ${GREEN}(推荐)${PLAIN}"
+    msg " 2. 手动填写参数"
+    msg " 0. 返回"
+    local c m mode
+    read -r -p "请选择 [1-2]: " c
+    case "$c" in
+        1) input_by_link || {
+            pause
+            return
+        } ;;
+        2) input_manual || {
+            pause
+            return
+        } ;;
+        *) return ;;
+    esac
+
+    line
+    msg "接管范围："
+    msg " 1. ${GREEN}全量接管${PLAIN} — 本机所有节点的全部流量走家宽 (默认，推荐)"
+    msg " 2. 按节点接管 — 只让选中的节点走家宽，其余保持直连 (高级)"
+    read -r -p "请选择 [回车=1]: " m
+    if [ "$m" == "2" ]; then
+        select_targets || {
+            pause
+            return
+        }
+        mode="selective"
+    else
+        TARGET_TAGS="[]"
+        mode="all"
+    fi
+
+    write_isp "$mode" || {
+        pause
+        return
+    }
+    warn "正在应用配置并重启 sing-box ..."
+    if apply_isp; then
+        ok "家宽流量接管已开启！"
+        echo ""
+        status_body
+    else
+        err "应用失败，配置已回滚 (isp.json 已保留，可修正后重试)。"
+    fi
+    pause
+}
+
+switch_mode() {
+    clear
+    line
+    echo -e "${CYAN}            切换接管范围                  ${PLAIN}"
+    line
+    if ! load_existing; then
+        err "还没有配置家宽节点，请先执行「开启家宽接管」。"
+        pause
+        return
+    fi
+    local cur m mode
+    cur=$(jq -r '.mode // "all"' "$ISP_FILE")
+    msg "当前范围：$([ "$cur" == "all" ] && echo "${GREEN}全量接管${PLAIN}" || echo "${YELLOW}按节点接管${PLAIN}")"
+    echo ""
+    msg " 1. 全量接管 — 所有节点流量走家宽"
+    msg " 2. 按节点接管 — 重新选择要走家宽的节点"
+    msg " 0. 返回"
+    read -r -p "请选择: " m
+    case "$m" in
+        1)
+            TARGET_TAGS="[]"
+            mode="all"
+            ;;
+        2)
+            select_targets || {
+                pause
+                return
+            }
+            mode="selective"
+            ;;
+        *) return ;;
+    esac
+    write_isp "$mode" || {
+        pause
+        return
+    }
+    warn "正在应用配置并重启 sing-box ..."
+    if apply_isp; then
+        ok "接管范围已切换为：$mode"
+        echo ""
+        status_body
+    else
+        err "应用失败，配置已回滚。"
+    fi
+    pause
+}
+
+clean_config_direct() {   # 没有 nodes.json 的老部署：把家宽相关内容从 config.json 摘掉
+    [ -f "$CONFIG_FILE" ] || return 0
+    local tmp bak
+    tmp=$(mktemp)
+    bak="${CONFIG_FILE}.bak_$(date +%s)"
+    jq --arg tag "$ISP_TAG" '
+        .outbounds = [ (.outbounds // [])[]
+            | select( ((.tag // "") != $tag) and (((.tag // "") | startswith($tag + "-")) | not) ) ]
+        | .outbounds = (if ([ .outbounds[] | select(.type == "direct") ] | length) == 0
+                        then .outbounds + [{type:"direct", tag:"direct"}] else .outbounds end)
+        | if .route then
+              .route.rules = [ ((.route.rules // [])[]) | select((.outbound // "") != $tag) ]
+              | .route.final = (if (.route.final // "") == $tag then "direct" else (.route.final // "direct") end)
+          else . end
+    ' "$CONFIG_FILE" >"$tmp" 2>/dev/null || {
+        rm -f "$tmp"
+        err "config.json 解析失败。"
+        return 1
+    }
+    cp -f "$CONFIG_FILE" "$bak"
+    mv -f "$tmp" "$CONFIG_FILE"
+    chmod 600 "$CONFIG_FILE"
+    if ! "$(sb_bin)" check -c "$CONFIG_FILE" >/dev/null 2>&1; then
+        mv -f "$bak" "$CONFIG_FILE"
+        err "生成的配置未通过校验，已回滚。"
+        return 1
+    fi
+    systemctl restart sing-box >/dev/null 2>&1
+    sleep 1
+    rm -f "$bak"
+    return 0
+}
 
 disable_takeover() {
     clear
-    echo -e "${YELLOW}正在读取当前接管规则...${PLAIN}"
-    
-    if ! grep -q "$RESIDENTIAL_TAG" "$CONFIG_FILE"; then
-         echo -e "${GREEN}当前未发现任何家宽接管配置，无需清理。${PLAIN}"
-         sleep 2
-         return
-    fi
-
-    # 提取所有包含目标 outbound 的规则，存为 JSON 字符串数组
-    mapfile -t ACTIVE_RULES < <(jq -c 'if .route != null and .route.rules != null then .route.rules[] | select(.outbound == "'$RESIDENTIAL_TAG'") else empty end' "$CONFIG_FILE")
-
-    if [ ${#ACTIVE_RULES[@]} -eq 0 ]; then
-        echo -e "${YELLOW}检测到失效的家宽节点，正在自动清理...${PLAIN}"
-        cp "$CONFIG_FILE" "${CONFIG_FILE}.bak_$(date +%s)"
-        jq --arg tag "$RESIDENTIAL_TAG" '
-            .outbounds = (if .outbounds != null then [.outbounds[] | select(.tag != $tag)] else [] end)
-        ' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
-        systemctl restart sing-box
-        echo -e "${GREEN}✅ 残留配置清理完毕！${PLAIN}"
-        sleep 2
+    line
+    echo -e "${CYAN}            关闭家宽接管                  ${PLAIN}"
+    line
+    if [ ! -f "$ISP_FILE" ] && [ -f "$CONFIG_FILE" ] &&
+        ! jq -e --arg t "$ISP_TAG" '((.route.final // "") == $t) or ([(.route.rules // [])[] | select((.outbound // "") == $t)] | length > 0)' \
+            "$CONFIG_FILE" >/dev/null 2>&1; then
+        warn "当前没有检测到家宽接管配置。"
+        pause
         return
     fi
-
-    echo -e "\n${CYAN}==========================================${PLAIN}"
-    echo -e "${CYAN}             选择要移除的接管规则         ${PLAIN}"
-    echo -e "${CYAN}==========================================${PLAIN}"
-    
-    for i in "${!ACTIVE_RULES[@]}"; do
-        local rule_str="${ACTIVE_RULES[$i]}"
-        local display_text=""
-        
-        # 使用 jq 解析提取标签或端口信息展示给用户
-        local in_tag=$(echo "$rule_str" | jq -r 'if .inbound then .inbound | join(", ") else empty end')
-        local in_port=$(echo "$rule_str" | jq -r 'if .inbound_port then .inbound_port | join(", ") else empty end')
-        
-        if [ -n "$in_tag" ]; then
-            display_text="接管的节点标签: ${GREEN}$in_tag${PLAIN}"
-        elif [ -n "$in_port" ]; then
-            display_text="接管的入站端口: ${GREEN}$in_port${PLAIN}"
-        else
-            display_text="未知类型接管规则"
-        fi
-        
-        echo -e " [$((i+1))] 取消 -> $display_text"
-    done
-    echo -e " [0] 返回上级菜单"
-    echo -e " [99] ${RED}一键移除所有接管规则 (全部清理)${PLAIN}"
-    
-    echo -e "${CYAN}==========================================${PLAIN}"
-    read -p "请输入对应的数字进行删除: " del_choice
-    
-    if [ "$del_choice" == "0" ]; then
-        return
-    elif [ "$del_choice" == "99" ]; then
-        # 彻底移除
-        cp "$CONFIG_FILE" "${CONFIG_FILE}.bak_$(date +%s)"
-        if ! jq --arg tag "$RESIDENTIAL_TAG" '
-            .outbounds = (if .outbounds != null then [.outbounds[] | select(.tag != $tag)] else [] end) |
-            if .route != null and .route.rules != null then
-                .route.rules = [.route.rules[] | select(.outbound != $tag)]
-            else
-                .
-            end
-        ' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp"; then
-             echo -e "${RED}❌ 清理配置失败。${PLAIN}"
-             rm -f "${CONFIG_FILE}.tmp"
-             read -n 1 -s -r -p "按任意键返回子菜单..."
-             return
-        fi
-        mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
-        systemctl restart sing-box
-        echo -e "${GREEN}✅ 所有家宽接管规则已全部移除！${PLAIN}"
-
-    elif [[ "$del_choice" =~ ^[0-9]+$ ]] && [ "$del_choice" -ge 1 ] && [ "$del_choice" -le "${#ACTIVE_RULES[@]}" ]; then
-        # 单独删除一条规则
-        local target_del_rule="${ACTIVE_RULES[$((del_choice-1))]}"
-        cp "$CONFIG_FILE" "${CONFIG_FILE}.bak_$(date +%s)"
-        
-        echo -e "${YELLOW}正在移除选中的接管规则...${PLAIN}"
-        if ! jq --argjson del_rule "$target_del_rule" --arg tag "$RESIDENTIAL_TAG" '
-            # 1. 移除精确匹配的那一条规则
-            .route.rules = [.route.rules[] | select(. != $del_rule)] |
-            # 2. 检查是否还有指向家宽节点的其他规则，如果没有，顺手把家宽节点 outbound 删掉
-            if ([.route.rules[] | select(.outbound == $tag)] | length) == 0 then
-                .outbounds = [.outbounds[] | select(.tag != $tag)]
-            else
-                .
-            end
-        ' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp"; then
-            echo -e "${RED}❌ 移除特定规则失败。${PLAIN}"
-            rm -f "${CONFIG_FILE}.tmp"
-            read -n 1 -s -r -p "按任意键返回子菜单..."
-            return
-        fi
-        mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
-        systemctl restart sing-box
-        echo -e "${GREEN}✅ 指定的接管规则已成功移除！${PLAIN}"
+    local c
+    read -r -p "确认关闭并恢复为直连出站？[y/N]: " c
+    [[ "$c" =~ ^[Yy]$ ]] || return
+    rm -f "$ISP_FILE"
+    warn "正在恢复配置 ..."
+    local rc=0
+    if [ "$HAVE_CORE" == "1" ] && [ -f "$NODES_FILE" ]; then
+        apply_config || rc=1
     else
-        echo -e "${RED}输入错误，操作取消。${PLAIN}"
-        sleep 2
-        return
+        clean_config_direct || rc=1
     fi
-    
-    echo ""
-    read -n 1 -s -r -p "按任意键返回子菜单..."
+    if [ "$rc" == "0" ]; then
+        ok "家宽接管已关闭，流量恢复本机直出。"
+    else
+        err "恢复失败，请检查 sing-box 日志：journalctl -u sing-box -n 50"
+    fi
+    pause
 }
 
-# ================= 交互菜单 =================
+test_conn() {
+    clear
+    line
+    echo -e "${CYAN}          家宽落地连通性测试              ${PLAIN}"
+    line
+    if ! load_existing; then
+        err "还没有配置家宽节点。"
+        pause
+        return
+    fi
+    local host port typ
+    host=$(jq -r '.info.server // ""' "$ISP_FILE")
+    port=$(jq -r '.info.port // ""' "$ISP_FILE")
+    typ=$(jq -r '.info.type // "-"' "$ISP_FILE")
+    if [ -z "$host" ] || [ -z "$port" ]; then
+        warn "isp.json 里没有记录落地地址，跳过端口探测。"
+    else
+        msg "落地节点：${GREEN}${typ}${PLAIN}  ${host}:${port}"
+        case "$typ" in
+            hysteria | hysteria2 | tuic)
+                warn "该协议基于 UDP/QUIC，无法用 TCP 探测端口，请直接看下方出口 IP 结果。"
+                ;;
+            *)
+                if timeout 5 bash -c "exec 3<>/dev/tcp/${host}/${port}" 2>/dev/null; then
+                    ok "TCP ${host}:${port} 可达"
+                else
+                    err "TCP ${host}:${port} 不可达 (可能是家宽端口未转发 / 防火墙 / 协议为 UDP)"
+                fi
+                ;;
+        esac
+    fi
+    echo ""
+    warn "正在通过 sing-box 出口查询公网 IP (10s 超时) ..."
+    local myip out
+    myip=$(timeout 10 curl -fsS4 https://api.ipify.org 2>/dev/null || echo "查询失败")
+    msg "本机直连出口 IP：${YELLOW}${myip}${PLAIN}"
+    if systemctl is-active --quiet sing-box; then
+        ok "sing-box 服务运行中"
+    else
+        err "sing-box 未运行：journalctl -u sing-box -n 50"
+    fi
+    out=$(jq -r '.route.final // "-"' "$CONFIG_FILE" 2>/dev/null)
+    msg "当前 route.final = ${GREEN}${out}${PLAIN}"
+    warn "最终是否真的落到家宽，请用客户端连本机节点后访问 ip 查询站点确认。"
+    line
+    pause
+}
+
 show_menu() {
     clear
-    echo -e "${GREEN}===========================================${PLAIN}"
-    echo -e "${GREEN}    Sing-box 家宽流量接管管理模块 (SBA ISP)  ${PLAIN}"
-    echo -e "${GREEN}===========================================${PLAIN}"
-    echo -e " 1. ${GREEN}开启/修改${PLAIN} 家宽流量接管 (接管本机节点流量)"
-    echo -e " 2. ${CYAN}查看当前${PLAIN} 流量接管状态"
-    echo -e " 3. ${RED}删除/取消${PLAIN} 某一个流量接管配置"
-    echo -e " 0. 返回主菜单"
-    echo -e "${GREEN}===========================================${PLAIN}"
-    read -p "请输入选项 [0-3]: " choice
-
-    case "$choice" in
-        1) enable_takeover; show_menu ;;
-        2) view_status; show_menu ;;
-        3) disable_takeover; show_menu ;;
-        0) echo -e "${GREEN}退出家宽模块...${PLAIN}"; sleep 1; exit 0 ;;
-        *) echo -e "${RED}请输入正确的数字 [0-3]${PLAIN}"; sleep 2; show_menu ;;
-    esac
+    local st
+    if [ -f "$ISP_FILE" ] && jq -e '.enabled == true' "$ISP_FILE" >/dev/null 2>&1; then
+        if [ "$(jq -r '.mode // "all"' "$ISP_FILE")" == "all" ]; then
+            st="${GREEN}已开启 · 全量接管${PLAIN}"
+        else
+            st="${GREEN}已开启 · 按节点接管${PLAIN}"
+        fi
+    else
+        st="${YELLOW}未开启${PLAIN}"
+    fi
+    line
+    echo -e "${CYAN}        Sing-box 家宽流量接管 (ISP)       ${PLAIN}"
+    line
+    echo -e " 状态：${st}"
+    echo -e " 说明：把本机节点的流量转发到家宽落地机出网"
+    line
+    msg " ${GREEN}1.${PLAIN} 开启 / 重新配置家宽接管"
+    msg " ${GREEN}2.${PLAIN} 查看当前状态"
+    msg " ${GREEN}3.${PLAIN} 切换接管范围 (全量 ↔ 按节点)"
+    msg " ${GREEN}4.${PLAIN} 连通性测试"
+    msg " ${GREEN}5.${PLAIN} 关闭家宽接管"
+    msg " ${GREEN}0.${PLAIN} 退出"
+    line
 }
 
-show_menu
+isp_main() {
+    local c
+    isp_preflight
+    while true; do
+        show_menu
+        read -r -p "请输入选项 [0-5]: " c
+        case "$c" in
+            1) enable_takeover ;;
+            2) view_status ;;
+            3) switch_mode ;;
+            4) test_conn ;;
+            5) disable_takeover ;;
+            0)
+                clear
+                exit 0
+                ;;
+            *)
+                err "无效选项"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
+# SBA_ISP_SOURCE_ONLY=1 时只加载函数，供测试使用
+[ "${SBA_ISP_SOURCE_ONLY:-0}" == "1" ] || isp_main "$@"
