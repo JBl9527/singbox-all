@@ -732,6 +732,124 @@ sb_bin() {
     command -v sing-box 2>/dev/null || echo /usr/local/bin/sing-box
 }
 
+free_probe_port() {
+    local p=42150
+    while [ "$p" -lt 42199 ]; do
+        (exec 3<>"/dev/tcp/127.0.0.1/${p}") 2>/dev/null || {
+            echo "$p"
+            return 0
+        }
+        exec 3>&- 2>/dev/null
+        p=$((p + 1))
+    done
+    echo 42199
+}
+
+exit_ip_via() {
+    # exit_ip_via <proxy|direct>  依次试几个查 IP 的站，某一个被墙也还能拿到结果
+    local proxy="$1" u ip
+    for u in https://api.ipify.org https://ifconfig.me/ip https://ipinfo.io/ip https://api-ipv4.ip.sb/ip; do
+        if [ "$proxy" == "direct" ]; then
+            ip=$(curl -fsS4 --max-time 6 "$u" 2>/dev/null | tr -dc '0-9a-fA-F:.' | cut -c1-45)
+        else
+            ip=$(curl -s --max-time 6 -x "$proxy" "$u" 2>/dev/null | tr -dc '0-9a-fA-F:.' | cut -c1-45)
+        fi
+        if [ -n "$ip" ]; then
+            echo "$ip"
+            return 0
+        fi
+    done
+    return 1
+}
+
+probe_landing() {
+    # probe_landing [outbounds_json]
+    # 真的把流量灌进落地出站跑一次 —— 只探端口是不够的：端口开着但握手不成的情况最常见
+    # 0=通 1=不通 2=无法测；成功时 LAND_IP 是经落地看到的出口 IP
+    local outs tag bin cfg lport pid code
+    LAND_IP=""
+    LAND_MSG=""
+    outs="${1:-}"
+    tag="$ISP_TAG"
+    if [ -z "$outs" ]; then
+        [ -f "$ISP_FILE" ] || {
+            LAND_MSG="没有 isp.json"
+            return 2
+        }
+        outs=$(jq -c '.outbounds // []' "$ISP_FILE" 2>/dev/null)
+        tag=$(jq -r ".tag // \"$ISP_TAG\"" "$ISP_FILE" 2>/dev/null)
+    fi
+    if [ -z "$outs" ] || [ "$outs" == "[]" ]; then
+        LAND_MSG="没有落地出站参数"
+        return 2
+    fi
+    bin=$(sb_bin)
+    if [ ! -x "$bin" ] && ! command -v sing-box >/dev/null 2>&1; then
+        LAND_MSG="找不到 sing-box 内核"
+        return 2
+    fi
+    lport=$(free_probe_port)
+    cfg="/tmp/sba_isp_probe_$$.json"
+    jq -n --argjson o "$outs" --arg t "$tag" --arg p "$lport" \
+        '{log:{level:"error"},
+          dns:{servers:[{type:"local", tag:"local"}]},
+          inbounds:[{type:"mixed", tag:"probe-in", listen:"127.0.0.1", listen_port:($p|tonumber)}],
+          outbounds:($o + [{type:"direct", tag:"direct"}]),
+          route:{rules:[], final:$t,
+                 default_domain_resolver:{server:"local", strategy:"prefer_ipv4"}}}' >"$cfg" 2>/dev/null
+    local cout
+    cout=$("$bin" check -c "$cfg" 2>&1)
+    if [ -n "$cout" ]; then
+        LAND_MSG=$(echo "$cout" | head -1 | cut -c1-100)
+        rm -f "$cfg"
+        return 2
+    fi
+    "$bin" run -c "$cfg" >/dev/null 2>&1 &
+    pid=$!
+    sleep 1
+    if ! kill -0 "$pid" 2>/dev/null; then
+        LAND_MSG="探测进程启动失败"
+        rm -f "$cfg"
+        return 2
+    fi
+    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time "${ISP_PROBE_TIMEOUT:-10}" \
+        -x "http://127.0.0.1:${lport}" "${ISP_PROBE_URL:-https://www.gstatic.com/generate_204}" 2>/dev/null)
+    if [ "$code" == "204" ] || [ "$code" == "200" ]; then
+        LAND_IP=$(exit_ip_via "http://127.0.0.1:${lport}")
+    fi
+    kill "$pid" >/dev/null 2>&1
+    wait "$pid" 2>/dev/null
+    rm -f "$cfg"
+    if [ "$code" == "204" ] || [ "$code" == "200" ]; then
+        return 0
+    fi
+    LAND_MSG="curl code=${code:-000}"
+    return 1
+}
+
+landing_hint() {
+    # 落地不通时给具体建议 (可传 outbounds_json，默认读 isp.json)
+    local outs typ sec
+    outs="${1:-}"
+    if [ -z "$outs" ] && [ -f "$ISP_FILE" ]; then
+        outs=$(jq -c '.outbounds // []' "$ISP_FILE" 2>/dev/null)
+    fi
+    typ=$(jq -r '.[0].type // ""' <<<"${outs:-[]}" 2>/dev/null)
+    sec=$(jq -r 'if ((.[0].tls.enabled // false) == true) then "tls" else "none" end' \
+        <<<"${outs:-[]}" 2>/dev/null)
+    warn "落地不通的常见原因："
+    msg "  · 家宽那台机器上的服务没在跑，或路由器/光猫的端口转发失效"
+    msg "  · 端口填错：家宽脚本通常一次开好几个连号端口，${YELLOW}不同端口是不同协议${PLAIN}"
+    msg "  · 参数不匹配：UUID / 密码 / SNI / public_key / short_id 抄漏一项都会静默卡住"
+    if [ "$typ" == "vless" ] && [ "$sec" != "tls" ]; then
+        line
+        err "落地是「裸 VLESS」(既没有 TLS 也没有 REALITY)，这种组合八成连不上："
+        msg "  Xray 25.9 起的内核会给裸 VLESS 入站启用 ${YELLOW}VLESS Encryption${PLAIN} (decryption=mlkem768x25519plus...)，"
+        msg "  而 ${YELLOW}sing-box 的 vless 出站根本没有 encryption 字段${PLAIN}，握手会静默卡死、日志里也不报错。"
+        msg "  解决：让落地那台机器换一个端口给本机用 —— ${GREEN}VLESS+REALITY / VMess / Trojan / Shadowsocks / SOCKS5${PLAIN} 都行。"
+    fi
+}
+
 patch_config_direct() {
     # 没有 nodes.json 的老部署：直接改 config.json
     local mode tags bin tmp bak
@@ -859,6 +977,26 @@ enable_takeover() {
             return
         } ;;
         *) return ;;
+    esac
+
+    line
+    warn "正在实测落地节点能不能出网 (最多 ${ISP_PROBE_TIMEOUT:-10}s，只探端口是不够的) ..."
+    probe_landing "$P_OUT"
+    case "$?" in
+        0) ok "落地可用，经落地看到的出口 IP：${GREEN}${LAND_IP:-未知}${PLAIN}" ;;
+        2) warn "无法实测 (${LAND_MSG})，跳过这一步" ;;
+        *)
+            err "落地节点实测不通 (${LAND_MSG})"
+            landing_hint "$P_OUT"
+            line
+            local goon
+            read -r -p "仍要继续开启接管吗？(开启后被接管的节点都会连不上) [y/N]: " goon
+            if [[ ! "$goon" =~ ^[yY]$ ]]; then
+                warn "已取消，isp.json 未改动。"
+                pause
+                return
+            fi
+            ;;
     esac
 
     line
@@ -1035,10 +1173,25 @@ test_conn() {
         esac
     fi
     echo ""
-    warn "正在通过 sing-box 出口查询公网 IP (10s 超时) ..."
     local myip out
-    myip=$(timeout 10 curl -fsS4 https://api.ipify.org 2>/dev/null || echo "查询失败")
+    myip=$(exit_ip_via direct || echo "查询失败")
     msg "本机直连出口 IP：${YELLOW}${myip}${PLAIN}"
+    warn "正在把流量真的灌进落地出站实测 (最多 ${ISP_PROBE_TIMEOUT:-10}s) ..."
+    probe_landing
+    case "$?" in
+        0)
+            ok "落地实测可用，经落地看到的出口 IP：${GREEN}${LAND_IP:-未知}${PLAIN}"
+            if [ -n "$LAND_IP" ] && [ "$LAND_IP" == "$myip" ]; then
+                warn "经落地的出口 IP 和本机直连一样，检查落地是不是又把流量转回了 VPS。"
+            fi
+            ;;
+        2) warn "无法实测 (${LAND_MSG})" ;;
+        *)
+            err "落地实测不通 (${LAND_MSG}) —— 被接管的节点现在必然全部连不上 (客户端表现为 -1)"
+            landing_hint
+            ;;
+    esac
+    echo ""
     if systemctl is-active --quiet sing-box; then
         ok "sing-box 服务运行中"
     else
@@ -1046,7 +1199,6 @@ test_conn() {
     fi
     out=$(jq -r '.route.final // "-"' "$CONFIG_FILE" 2>/dev/null)
     msg "当前 route.final = ${GREEN}${out}${PLAIN}"
-    warn "最终是否真的落到家宽，请用客户端连本机节点后访问 ip 查询站点确认。"
     line
     pause
 }

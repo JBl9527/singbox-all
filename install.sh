@@ -310,7 +310,8 @@ ask_port() {
     done
 }
 
-get_public_ip() {
+get_public_ip_quiet() {
+    # 只自动探测、失败就返回 1，绝不交互：自检等非交互流程必须用这个
     [ -n "$PUBLIC_IP" ] && return 0
     local url
     for url in ifconfig.me ipv4.icanhazip.com api.ipify.org; do
@@ -318,6 +319,11 @@ get_public_ip() {
         valid_ipv4 "$PUBLIC_IP" && return 0
         PUBLIC_IP=""
     done
+    return 1
+}
+
+get_public_ip() {
+    get_public_ip_quiet && return 0
     warn "自动获取公网 IPv4 失败。"
     while true; do
         read -r -p "请手动输入本机公网 IP: " PUBLIC_IP
@@ -362,14 +368,24 @@ enable_bbr() {
 }
 
 install_shortcut() {
-    [ -f /usr/bin/sba ] && return 0
+    # 每次安装都刷新 /usr/bin/sba：否则用 bash <(curl ...) 跑新版时，
+    # 老的 sba 会一直留在盘上，用户敲 sba 进的还是旧脚本 (实机踩过)
     local self
     self=$(readlink -f "$0" 2>/dev/null)
     if [ -n "$self" ] && [ -f "$self" ] && [[ "$self" != /bin/bash && "$self" != /usr/bin/bash ]]; then
-        cp "$self" /usr/bin/sba 2>/dev/null && chmod +x /usr/bin/sba && return 0
+        if cmp -s "$self" /usr/bin/sba 2>/dev/null; then
+            return 0
+        fi
+        cp -f "$self" /usr/bin/sba 2>/dev/null && chmod +x /usr/bin/sba && return 0
     fi
     command -v curl >/dev/null 2>&1 || return 0
-    curl "${CURL_OPTS[@]}" -o /usr/bin/sba "${REPO_RAW}/install.sh" 2>/dev/null && chmod +x /usr/bin/sba
+    local tmp="/tmp/sba_shortcut_$$.sh"
+    if curl "${CURL_OPTS[@]}" -o "$tmp" "${REPO_RAW}/install.sh" 2>/dev/null &&
+        bash -n "$tmp" 2>/dev/null; then
+        mv -f "$tmp" /usr/bin/sba
+        chmod +x /usr/bin/sba
+    fi
+    rm -f "$tmp"
     return 0
 }
 
@@ -969,6 +985,61 @@ build_inbound() {
           + (if $lo == "true" then {listen:"127.0.0.1"} else {} end)]'
 }
 
+# ================= 防火墙 =================
+
+# 输出所有需要对外放行的端口（含 hy2 跳跃区间，形如 40000:41000）
+node_ports() {
+    [ -f "$NODES_FILE" ] || return 0
+    jq -r '.nodes[]? | select((.enabled // true) != false)
+           | select((.listen_local // false) != true) | (.port|tostring)' "$NODES_FILE" 2>/dev/null
+    jq -r '.nodes[]? | select((.hop // "") != "") | .hop' "$NODES_FILE" 2>/dev/null
+}
+
+# 在系统防火墙上放行节点端口（tcp+udp）。云厂商安全组不在系统内，只能提示用户自己去放行。
+open_firewall() {
+    local ports p proto n=0
+    ports=$(node_ports | sort -u)
+    [ -z "$ports" ] && return 0
+
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qiE '^status: *active'; then
+        for p in $ports; do
+            ufw allow "${p}/tcp" >/dev/null 2>&1
+            ufw allow "${p}/udp" >/dev/null 2>&1
+            n=$((n + 1))
+        done
+        ufw reload >/dev/null 2>&1
+        ok "ufw 已放行 ${n} 个端口/区间 (tcp+udp)"
+        return 0
+    fi
+
+    if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+        for p in $ports; do
+            firewall-cmd --permanent --add-port="${p//:/-}/tcp" >/dev/null 2>&1
+            firewall-cmd --permanent --add-port="${p//:/-}/udp" >/dev/null 2>&1
+            n=$((n + 1))
+        done
+        firewall-cmd --reload >/dev/null 2>&1
+        ok "firewalld 已放行 ${n} 个端口/区间 (tcp+udp)"
+        return 0
+    fi
+
+    # 无 ufw/firewalld：只有当 INPUT 默认策略为 DROP/REJECT 时才需要插规则
+    local ipt
+    ipt=$(command -v iptables 2>/dev/null) || return 0
+    if "$ipt" -S INPUT 2>/dev/null | head -1 | grep -qE '^-P INPUT (DROP|REJECT)'; then
+        for p in $ports; do
+            for proto in tcp udp; do
+                "$ipt" -C INPUT -p "$proto" --dport "$p" -j ACCEPT >/dev/null 2>&1 ||
+                    "$ipt" -I INPUT -p "$proto" --dport "$p" -j ACCEPT >/dev/null 2>&1
+            done
+            n=$((n + 1))
+        done
+        ok "iptables 已放行 ${n} 个端口/区间"
+        warn "iptables 规则重启后可能失效，可执行 netfilter-persistent save 固化"
+    fi
+    return 0
+}
+
 # ================= config.json 生成 =================
 
 isp_summary() {
@@ -1005,11 +1076,20 @@ generate_config_json() {
     rm -f "$parts"
     [ -z "$inbounds" ] && inbounds="[]"
 
-    cfg=$(jq -n --argjson ib "$inbounds" '{
+    # 出站域名解析策略。默认 prefer_ipv4：很多 VPS 有 IPv6 地址但路由是黑洞，
+    # 若让 sing-box 优先走 AAAA，客户端「真连接测试」会全部超时(v2rayN 显示 -1)，
+    # 而在 VPS 本机 ping/curl 却看不出问题。
+    local ipstrat
+    ipstrat=$(nj '.opt.ip_strategy // ""')
+    [ -z "$ipstrat" ] && ipstrat="prefer_ipv4"
+
+    cfg=$(jq -n --argjson ib "$inbounds" --arg st "$ipstrat" '{
         log: {level:"info", timestamp:true},
+        dns: {servers: [{type:"local", tag:"local"}]},
         inbounds: $ib,
         outbounds: [{type:"direct", tag:"direct"}],
-        route: {rules: [], final:"direct"}
+        route: {rules: [], final:"direct",
+                default_domain_resolver: {server:"local", strategy:$st}}
     }')
 
     if [ -f "$ISP_FILE" ] && jq -e '.enabled == true' "$ISP_FILE" >/dev/null 2>&1; then
@@ -1097,6 +1177,7 @@ apply_config() {
     sleep 1
     if systemctl is-active --quiet sing-box 2>/dev/null; then
         ok "配置已生效 (节点 $(node_count) 个)"
+        open_firewall
         return 0
     fi
 
@@ -1119,6 +1200,749 @@ service_state() {
         echo -e "${RED}已安装但未运行${PLAIN}"
     fi
 }
+
+# ================= 自检 / 诊断 =================
+
+PROBE_URL="${PROBE_URL:-https://www.gstatic.com/generate_204}"
+PROBE_TIMEOUT="${PROBE_TIMEOUT:-8}"
+
+# 找一个空闲的本地端口用于探测
+probe_port() {
+    local p
+    for p in $(seq 42100 42199); do
+        port_in_use "$p" || {
+            echo "$p"
+            return 0
+        }
+    done
+    echo 42100
+}
+
+# 输入单个 node JSON，输出客户端出站数组 (tag=probe)。
+# 生成逻辑与分享链接一一对应，所以本机探测通 = 客户端拿链接也能通。
+client_outbound() {
+    local o="$1" key port sni path svc ver method obfs tlsmode transkind
+    local n_uuid n_pass n_ss tls trans base alpn
+    key=$(jq -r '.key' <<<"$o")
+    port=$(jq -r '.port' <<<"$o")
+    sni=$(jq -r '.sni // ""' <<<"$o")
+    path=$(jq -r '.path // ""' <<<"$o")
+    svc=$(jq -r '.service_name // ""' <<<"$o")
+    ver=$(jq -r '.version // 0' <<<"$o")
+    method=$(jq -r '.method // ""' <<<"$o")
+    obfs=$(jq -r '.obfs // ""' <<<"$o")
+
+    n_uuid=$(jq -r '.uuid // ""' <<<"$o")
+    [ -z "$n_uuid" ] && n_uuid="$CR_UUID"
+    n_pass=$(jq -r '.password // ""' <<<"$o")
+    [ -z "$n_pass" ] && n_pass="$CR_PASS"
+    n_ss=$(jq -r '.password // ""' <<<"$o")
+    if [ -z "$n_ss" ]; then
+        case "$key" in
+            ss-2022 | shadowtls) n_ss="$CR_SS2022" ;;
+            ss-aes) n_ss="$CR_SSPASS" ;;
+            snell) n_ss="$CR_PSK" ;;
+        esac
+    fi
+
+    tlsmode=$(proto_tls "$key")
+    transkind=$(proto_trans "$key")
+    alpn=""
+    case "$key" in
+        hysteria2 | hysteria | tuic) alpn="h3" ;;
+        naive) alpn="h2,http/1.1" ;;
+    esac
+    [ "$tlsmode" == "tls" ] && [ -z "$sni" ] && sni="${CERT_DOMAIN:-bing.com}"
+    [ "$tlsmode" == "reality" ] && [ -z "$sni" ] && sni="${R_DEST:-$DEFAULT_REALITY_DEST}"
+    # QUIC 系 (hysteria/hysteria2/tuic) 不支持 uTLS，其余 TLS 出站都带上 chrome 指纹
+    local utls="true"
+    case "$key" in
+        hysteria2 | hysteria | tuic) utls="false" ;;
+    esac
+    case "$tlsmode" in
+        reality)
+            tls=$(jq -n --arg sni "$sni" --arg pk "$R_PUB" --arg sid "$R_SID" \
+                '{enabled:true, server_name:$sni, utls:{enabled:true, fingerprint:"chrome"},
+                  reality:{enabled:true, public_key:$pk, short_id:$sid}}')
+            ;;
+        tls)
+            # insecure:true —— 自签证书时客户端必须跳过校验，等价于「允许不安全」
+            tls=$(jq -n --arg sni "$sni" --arg alpn "$alpn" --argjson u "$utls" \
+                '{enabled:true, server_name:$sni, insecure:true}
+                 + (if $u then {utls:{enabled:true, fingerprint:"chrome"}} else {} end)
+                 + (if $alpn == "" then {} else {alpn:($alpn|split(","))} end)')
+            ;;
+        *) tls="null" ;;
+    esac
+    trans=$(transport_block "$transkind" "$path" "$svc")
+    local S='127.0.0.1'
+    case "$key" in
+        vless-reality)
+            base=$(jq -n --arg s "$S" --arg p "$port" --arg u "$n_uuid" \
+                '{type:"vless", tag:"probe", server:$s, server_port:($p|tonumber),
+                  uuid:$u, flow:"xtls-rprx-vision"}')
+            ;;
+        vless-*)
+            base=$(jq -n --arg s "$S" --arg p "$port" --arg u "$n_uuid" \
+                '{type:"vless", tag:"probe", server:$s, server_port:($p|tonumber), uuid:$u}')
+            ;;
+        vmess-*)
+            base=$(jq -n --arg s "$S" --arg p "$port" --arg u "$n_uuid" \
+                '{type:"vmess", tag:"probe", server:$s, server_port:($p|tonumber),
+                  uuid:$u, security:"auto", alter_id:0}')
+            ;;
+        trojan-*)
+            base=$(jq -n --arg s "$S" --arg p "$port" --arg pw "$n_pass" \
+                '{type:"trojan", tag:"probe", server:$s, server_port:($p|tonumber), password:$pw}')
+            ;;
+        anytls | anytls-reality)
+            base=$(jq -n --arg s "$S" --arg p "$port" --arg pw "$n_pass" \
+                '{type:"anytls", tag:"probe", server:$s, server_port:($p|tonumber), password:$pw}')
+            ;;
+        hysteria2)
+            base=$(jq -n --arg s "$S" --arg p "$port" --arg pw "$n_pass" --arg ob "$obfs" --arg obpw "$CR_OBFS" \
+                '{type:"hysteria2", tag:"probe", server:$s, server_port:($p|tonumber), password:$pw}
+                 + (if $ob == "" then {} else {obfs:{type:$ob, password:$obpw}} end)')
+            ;;
+        hysteria)
+            base=$(jq -n --arg s "$S" --arg p "$port" --arg pw "$n_pass" \
+                '{type:"hysteria", tag:"probe", server:$s, server_port:($p|tonumber),
+                  auth_str:$pw, up_mbps:50, down_mbps:100}')
+            ;;
+        tuic)
+            base=$(jq -n --arg s "$S" --arg p "$port" --arg u "$n_uuid" --arg pw "$n_pass" \
+                '{type:"tuic", tag:"probe", server:$s, server_port:($p|tonumber), uuid:$u,
+                  password:$pw, congestion_control:"bbr", udp_relay_mode:"native"}')
+            ;;
+        ss-2022 | ss-aes)
+            base=$(jq -n --arg s "$S" --arg p "$port" --arg pw "$n_ss" \
+                --arg m "${method:-$([ "$key" == "ss-2022" ] && echo 2022-blake3-aes-128-gcm || echo aes-256-gcm)}" \
+                '{type:"shadowsocks", tag:"probe", server:$s, server_port:($p|tonumber), method:$m, password:$pw}')
+            ;;
+        shadowtls)
+            # 链式：shadowsocks 出站不写 server/port，靠 detour 指向 shadowtls 出站
+            jq -n --arg s "$S" --arg p "$port" --arg pw "$n_ss" --arg u "$CR_USER" \
+                --arg sni "${sni:-$DEFAULT_REALITY_DEST}" \
+                '[{type:"shadowsocks", tag:"probe", method:"2022-blake3-aes-128-gcm",
+                   password:$pw, detour:"probe-stls"},
+                  {type:"shadowtls", tag:"probe-stls", server:$s, server_port:($p|tonumber),
+                   version:3, password:$pw,
+                   tls:{enabled:true, server_name:$sni, utls:{enabled:true, fingerprint:"chrome"}}}]'
+            return 0
+            ;;
+        snell)
+            # 服务端 v5 的线路协议等同 v4，出站只支持 4/6
+            base=$(jq -n --arg s "$S" --arg p "$port" --arg psk "$n_ss" --arg v "${ver:-5}" \
+                '{type:"snell", tag:"probe", server:$s, server_port:($p|tonumber), psk:$psk,
+                  version:(if ($v|tonumber) == 6 then 6 else 4 end)}')
+            ;;
+        socks5 | mixed)
+            base=$(jq -n --arg s "$S" --arg p "$port" --arg u "$CR_USER" --arg pw "$n_pass" \
+                '{type:"socks", tag:"probe", server:$s, server_port:($p|tonumber),
+                  version:"5", username:$u, password:$pw}')
+            ;;
+        http)
+            base=$(jq -n --arg s "$S" --arg p "$port" --arg u "$CR_USER" --arg pw "$n_pass" \
+                '{type:"http", tag:"probe", server:$s, server_port:($p|tonumber),
+                  username:$u, password:$pw}')
+            ;;
+        naive)
+            # naive 出站依赖 cronet，sing-box 官方构建不含，无法自测
+            echo "[]"
+            return 2
+            ;;
+        *)
+            echo "[]"
+            return 2
+            ;;
+    esac
+
+    jq -n --argjson base "$base" --argjson tls "$tls" --argjson trans "$trans" \
+        '[$base
+          + (if $tls == null then {} else {tls:$tls} end)
+          + (if $trans == null then {} else {transport:$trans} end)]'
+}
+PROBE_MSG=""
+
+# 用 sing-box 自己当客户端，从回环连一个入站并真实访问 PROBE_URL。
+# 返回 0=通 1=不通 2=无法自测 3=配置非法 4=客户端启动失败
+probe_node() {
+    local o="$1" outs cfg log lport pid code rc
+    PROBE_MSG=""
+    outs=$(client_outbound "$o")
+    rc=$?
+    [ "$rc" != "0" ] && {
+        PROBE_MSG="该协议无法本机自测"
+        return 2
+    }
+
+    lport=$(probe_port)
+    cfg=$(mktemp)
+    log=$(mktemp)
+    jq -n --argjson o "$outs" --arg p "$lport" \
+        '{log:{level:"error"},
+          dns:{servers:[{type:"local", tag:"local"}]},
+          inbounds:[{type:"mixed", tag:"probe-in", listen:"127.0.0.1", listen_port:($p|tonumber)}],
+          outbounds:($o + [{type:"direct", tag:"direct"}]),
+          route:{rules:[], final:"probe",
+                 default_domain_resolver:{server:"local", strategy:"prefer_ipv4"}}}' >"$cfg"
+
+    if ! "$SING_BOX_BIN" check -c "$cfg" >"$log" 2>&1; then
+        PROBE_MSG=$(tail -1 "$log" | cut -c1-90)
+        rm -f "$cfg" "$log"
+        return 3
+    fi
+
+    "$SING_BOX_BIN" run -c "$cfg" >"$log" 2>&1 &
+    pid=$!
+    sleep 1
+    if ! kill -0 "$pid" 2>/dev/null; then
+        PROBE_MSG=$(tail -1 "$log" | cut -c1-90)
+        rm -f "$cfg" "$log"
+        return 4
+    fi
+    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time "$PROBE_TIMEOUT" \
+        -x "http://127.0.0.1:${lport}" "$PROBE_URL" 2>/dev/null)
+    kill "$pid" >/dev/null 2>&1
+    wait "$pid" 2>/dev/null
+    if [ "$code" == "204" ] || [ "$code" == "200" ]; then
+        rm -f "$cfg" "$log"
+        return 0
+    fi
+    PROBE_MSG=$(grep -m1 -iE 'error|fail|reject|timeout' "$log" 2>/dev/null | cut -c1-90)
+    [ -z "$PROBE_MSG" ] && PROBE_MSG="curl code=${code:-0}"
+    rm -f "$cfg" "$log"
+    return 1
+}
+probe_exit_ip() {
+    # probe_exit_ip <proxy>  依次试几个查 IP 的站，某一个被墙也还能拿到结果
+    local proxy="$1" u ip
+    for u in https://api.ipify.org https://ifconfig.me/ip https://ipinfo.io/ip https://api-ipv4.ip.sb/ip; do
+        ip=$(curl -s --max-time 6 -x "$proxy" "$u" 2>/dev/null | tr -dc '0-9a-fA-F:.' | cut -c1-45)
+        if [ -n "$ip" ]; then
+            echo "$ip"
+            return 0
+        fi
+    done
+    return 1
+}
+
+probe_isp() {
+    # 把流量真的灌进家宽/落地出站跑一次 (只探端口通不通是不够的：端口开着但握手不成的情况最常见)
+    # 0=通 1=不通 2=无法测；成功时 ISP_PROBE_IP 是经落地看到的出口 IP
+    local outs tag cfg log lport pid code
+    ISP_PROBE_IP=""
+    PROBE_MSG=""
+    if [ ! -f "$ISP_FILE" ]; then
+        PROBE_MSG="没有 isp.json"
+        return 2
+    fi
+    outs=$(jq -c '.outbounds // []' "$ISP_FILE" 2>/dev/null)
+    tag=$(jq -r '.tag // ""' "$ISP_FILE" 2>/dev/null)
+    if [ -z "$outs" ] || [ "$outs" == "[]" ] || [ -z "$tag" ]; then
+        PROBE_MSG="isp.json 里没有落地出站"
+        return 2
+    fi
+    lport=$(probe_port)
+    cfg=$(mktemp)
+    log=$(mktemp)
+    jq -n --argjson o "$outs" --arg t "$tag" --arg p "$lport" \
+        '{log:{level:"error"},
+          dns:{servers:[{type:"local", tag:"local"}]},
+          inbounds:[{type:"mixed", tag:"probe-in", listen:"127.0.0.1", listen_port:($p|tonumber)}],
+          outbounds:($o + [{type:"direct", tag:"direct"}]),
+          route:{rules:[], final:$t,
+                 default_domain_resolver:{server:"local", strategy:"prefer_ipv4"}}}' >"$cfg"
+    if ! "$SING_BOX_BIN" check -c "$cfg" >"$log" 2>&1; then
+        PROBE_MSG=$(tail -1 "$log" | cut -c1-90)
+        rm -f "$cfg" "$log"
+        return 2
+    fi
+    "$SING_BOX_BIN" run -c "$cfg" >"$log" 2>&1 &
+    pid=$!
+    sleep 1
+    if ! kill -0 "$pid" 2>/dev/null; then
+        PROBE_MSG=$(tail -1 "$log" | cut -c1-90)
+        rm -f "$cfg" "$log"
+        return 2
+    fi
+    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time "$PROBE_TIMEOUT" \
+        -x "http://127.0.0.1:${lport}" "$PROBE_URL" 2>/dev/null)
+    if [ "$code" == "204" ] || [ "$code" == "200" ]; then
+        ISP_PROBE_IP=$(probe_exit_ip "http://127.0.0.1:${lport}")
+    fi
+    kill "$pid" >/dev/null 2>&1
+    wait "$pid" 2>/dev/null
+    rm -f "$cfg" "$log"
+    if [ "$code" == "204" ] || [ "$code" == "200" ]; then
+        return 0
+    fi
+    PROBE_MSG="curl code=${code:-0}"
+    return 1
+}
+
+isp_landing_hint() {
+    # 落地不通时针对协议给一句具体的话
+    local typ sec
+    [ -f "$ISP_FILE" ] || return 0
+    typ=$(jq -r '.outbounds[0].type // ""' "$ISP_FILE" 2>/dev/null)
+    sec=$(jq -r 'if ((.outbounds[0].tls.enabled // false) == true) then "tls" else "none" end' \
+        "$ISP_FILE" 2>/dev/null)
+    if [ "$typ" == "vless" ] && [ "$sec" != "tls" ]; then
+        echo "落地是裸 VLESS (无 TLS / 无 REALITY)：Xray 25.9 起这种入站默认带 VLESS Encryption，而 sing-box 的 vless 出站没有 encryption 字段，握手会静默卡死；请让落地那台机器换一个 REALITY / VMess / Trojan / Shadowsocks / SOCKS5 端口给本机用"
+    fi
+}
+
+listening_on() {
+    if command -v ss >/dev/null 2>&1; then
+        ss -Hlntup 2>/dev/null | grep -qE "[:.]${1}[[:space:]]"
+    elif command -v netstat >/dev/null 2>&1; then
+        netstat -lntup 2>/dev/null | grep -qE "[:.]${1}[[:space:]]"
+    else
+        return 0
+    fi
+}
+
+firewall_summary() {
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qiE '^status: *active'; then
+        echo "ufw(启用)"
+    elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+        echo "firewalld(启用)"
+    elif command -v iptables >/dev/null 2>&1 &&
+        iptables -S INPUT 2>/dev/null | head -1 | grep -qE '^-P INPUT (DROP|REJECT)'; then
+        echo "iptables(INPUT 默认拒绝)"
+    else
+        echo "无(系统未启用防火墙)"
+    fi
+}
+
+cert_fingerprint() {
+    [ -f "$CERT_DIR/server.crt" ] || return 1
+    openssl x509 -in "$CERT_DIR/server.crt" -outform der 2>/dev/null |
+        openssl dgst -sha256 -hex 2>/dev/null | awk '{print $NF}' | tr -d ':'
+}
+
+# ---------- 外网回连探测：解决「VPS 里自测全通、客户端一律 -1」 ----------
+
+# 节点在四层用 TCP 还是 UDP：hysteria/tuic 走 QUIC，安全组只放 TCP 时必然连不上
+proto_l4() {
+    case "$1" in
+        hysteria2 | hysteria | tuic) echo "udp" ;;
+        *) echo "tcp" ;;
+    esac
+}
+
+nat_box_detect() {
+    # 公网 IP 不在本机网卡上、网卡又是内网地址 → NAT/端口映射机型 (KubeVirt/LXC 小鸡常见)
+    # 这种机器只有服务商映射过的端口能从外网进来，UDP 通常根本不映射
+    NAT_BOX=0
+    NAT_LOCAL_IP=""
+    command -v ip >/dev/null 2>&1 || return 1
+    local addrs
+    addrs=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1)
+    [ -z "$addrs" ] && return 1
+    NAT_LOCAL_IP=$(head -1 <<<"$addrs")
+    [ -z "$PUBLIC_IP" ] && return 1
+    grep -qx "$PUBLIC_IP" <<<"$addrs" && return 1
+    if grep -qE '^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.)' \
+        <<<"$NAT_LOCAL_IP"; then
+        NAT_BOX=1
+        return 0
+    fi
+    return 1
+}
+
+external_check() {
+    # 用法: external_check tcp:51500 udp:11578 ...
+    # 借 check-host.net 的海外探测点从「外网」回连本机端口 (脚本在 VPS 里怎么测都是通的，
+    # 客户端能不能连要看外网进不进来)。每行输出 "<proto> <port> <ok|blocked|unknown> <说明>"
+    local api="${SBA_EXT_API:-https://check-host.net}"
+    local spec proto port r rid res i t n_ok n_err n_to n_pend
+    local -a ids=() specs=()
+    command -v curl >/dev/null 2>&1 || return 2
+    command -v jq >/dev/null 2>&1 || return 2
+    [ -z "$PUBLIC_IP" ] && return 2
+    for spec in "$@"; do
+        proto=${spec%%:*}
+        port=${spec##*:}
+        [[ "$port" =~ ^[0-9]+$ ]] || continue
+        r=$(curl -s --max-time 12 -H 'Accept: application/json' \
+            "${api}/check-${proto}?host=${PUBLIC_IP}:${port}&max_nodes=3" 2>/dev/null)
+        rid=$(jq -r '.request_id // empty' <<<"$r" 2>/dev/null)
+        [ -z "$rid" ] && continue
+        ids+=("$rid")
+        specs+=("$spec")
+    done
+    [ ${#ids[@]} -eq 0 ] && return 1
+    sleep "${SBA_EXT_WAIT:-8}"
+    for i in "${!ids[@]}"; do
+        proto=${specs[$i]%%:*}
+        port=${specs[$i]##*:}
+        res=""
+        for t in 1 2 3; do
+            res=$(curl -s --max-time 12 -H 'Accept: application/json' \
+                "${api}/check-result/${ids[$i]}" 2>/dev/null)
+            n_pend=$(jq '[to_entries[] | select(.value == null)] | length' <<<"$res" 2>/dev/null)
+            [ "${n_pend:-1}" == "0" ] && break
+            sleep 3
+        done
+        n_ok=$(jq '[to_entries[] | (.value[0]? // {})
+                    | select((.error // null) == null and (.timeout // null) == null
+                             and (.address // null) != null)] | length' <<<"$res" 2>/dev/null)
+        n_err=$(jq '[to_entries[] | (.value[0]? // {}) | select((.error // null) != null)] | length' \
+            <<<"$res" 2>/dev/null)
+        n_to=$(jq '[to_entries[] | (.value[0]? // {}) | select((.timeout // null) != null)] | length' \
+            <<<"$res" 2>/dev/null)
+        if [ "${n_ok:-0}" -gt 0 ]; then
+            echo "$proto $port ok 外网 ${n_ok} 个探测点直接连上了"
+        elif [ "$proto" == "udp" ] && [ "${n_err:-0}" -eq 0 ]; then
+            echo "$proto $port unknown UDP 探测无回包 (端口正常也会这样)，无法判定"
+        elif [ "${n_err:-0}" -gt 0 ]; then
+            echo "$proto $port blocked 外网被拒 (RST/端口不可达)：端口没放通或没做映射"
+        elif [ "${n_to:-0}" -gt 0 ]; then
+            echo "$proto $port blocked 外网全部超时 (包被丢弃)：安全组/端口映射没放通"
+        else
+            echo "$proto $port unknown 探测点没给出结果"
+        fi
+    done
+    return 0
+}
+
+# 中文字符占两列，按显示宽度补空格，保证自检表格对齐
+pad_label() {
+    local s="$1" w=0 i c len=${#1}
+    for ((i = 0; i < len; i++)); do
+        c="${s:i:1}"
+        if [[ "$c" == [[:ascii:]] ]]; then w=$((w + 1)); else w=$((w + 2)); fi
+    done
+    local n=$((28 - w))
+    [ "$n" -lt 1 ] && n=1
+    printf '%s%*s' "$s" "$n" ""
+}
+diagnose() {
+    if [ ! -f "$NODES_FILE" ]; then
+        err "尚未安装，无法自检"
+        pause
+        return
+    fi
+    load_state
+    local fw_kind ip4 ip6 svc_ok=1 egress_ok=1 v6_bad=0 isp_bad=0 isp_hint="" ext_reported=0
+    local -a bad_port=() fail_node=() skip_node=() fail_tag=() ext_bad=() ext_unknown=()
+    local total=0 pass=0
+
+    clear
+    line
+    msg "${CYAN}         一键自检 (客户端连不上 / 延迟 -1)${PLAIN}"
+    line
+
+    # 1. 服务状态
+    msg "${CYAN}[1/7] 服务状态${PLAIN}"
+    if systemctl is-active --quiet sing-box 2>/dev/null; then
+        ok "sing-box 运行中 ($("$SING_BOX_BIN" version 2>/dev/null | head -1))"
+    else
+        svc_ok=0
+        err "sing-box 未运行"
+        "$SING_BOX_BIN" check -c "$CONFIG_FILE" 2>&1 | tail -3
+        journalctl -u sing-box -n 8 --no-pager 2>/dev/null | tail -8
+    fi
+
+    # 2. VPS 自身出网 (客户端真连接测试访问的就是这个地址)
+    msg ""
+    msg "${CYAN}[2/7] VPS 出网 (目标 ${PROBE_URL})${PLAIN}"
+    ip4=$(curl -4 -s -o /dev/null -w '%{http_code}' --max-time 8 "$PROBE_URL" 2>/dev/null)
+    if [ "$ip4" == "204" ] || [ "$ip4" == "200" ]; then
+        ok "IPv4 出网正常"
+    else
+        egress_ok=0
+        err "IPv4 出网失败 (code=${ip4:-0})：VPS 本身连不上目标站，客户端真连接测试必然 -1"
+    fi
+    if [ -n "$PUBLIC_IP6" ] || ip -6 addr show scope global 2>/dev/null | grep -q inet6; then
+        ip6=$(curl -6 -s -o /dev/null -w '%{http_code}' --max-time 8 "$PROBE_URL" 2>/dev/null)
+        if [ "$ip6" == "204" ] || [ "$ip6" == "200" ]; then
+            ok "IPv6 出网正常"
+        else
+            v6_bad=1
+            warn "有 IPv6 地址但出网失败 (code=${ip6:-0})；已按 prefer_ipv4 生成配置，不受影响"
+        fi
+    fi
+    # 3. 监听端口
+    msg ""
+    msg "${CYAN}[3/7] 端口监听${PLAIN}"
+    local p
+    while read -r p; do
+        [ -z "$p" ] && continue
+        [[ "$p" == *:* ]] && continue
+        listening_on "$p" || bad_port+=("$p")
+    done < <(node_ports)
+    if [ ${#bad_port[@]} -eq 0 ]; then
+        ok "所有节点端口均已监听"
+    else
+        err "以下端口没有监听：${bad_port[*]}"
+    fi
+    # 端口跳跃靠 nat REDIRECT，规则丢了客户端用跳跃端口会连不上
+    local hop
+    hop=$(jq -r '.nodes[]? | select((.hop // "") != "") | .hop' "$NODES_FILE" 2>/dev/null | head -1)
+    if [ -n "$hop" ] && command -v iptables >/dev/null 2>&1; then
+        if iptables -t nat -S PREROUTING 2>/dev/null | grep -q -- "--dport ${hop}"; then
+            ok "端口跳跃 ${hop} 的 nat REDIRECT 规则存在"
+        else
+            warn "端口跳跃 ${hop} 缺少 nat REDIRECT 规则，客户端用跳跃端口会连不上 (可选下面的 2 重新应用配置)"
+        fi
+    fi
+
+    # 4. 防火墙
+    msg ""
+    msg "${CYAN}[4/7] 防火墙${PLAIN}"
+    fw_kind=$(firewall_summary)
+    msg "  系统防火墙：${fw_kind}"
+    if [ "$fw_kind" == "无(系统未启用防火墙)" ]; then
+        ok "系统层没有拦截"
+    else
+        warn "检测到防火墙，稍后可在本菜单末尾一键放行全部节点端口"
+    fi
+    warn "云厂商安全组 (阿里云/腾讯云/AWS/GCP 等) 在系统之外，脚本无法检测和修改；"
+    msg "  ${YELLOW}若节点端口不在安全组放行范围内，v2rayN 真连接测试就会一直 -1。${PLAIN}"
+
+    # 5. 外网回连：在 VPS 里自测通不代表外网进得来 (云安全组 / NAT 端口映射)
+    msg ""
+    msg "${CYAN}[5/7] 外网能不能连进来${PLAIN}"
+    get_public_ip_quiet || true
+    nat_box_detect
+    if [ "${NAT_BOX:-0}" == "1" ]; then
+        warn "本机是 ${YELLOW}NAT/端口映射机型${PLAIN}：网卡上是内网 ${NAT_LOCAL_IP}，公网 ${PUBLIC_IP} 不在本机"
+        msg "  ${YELLOW}只有服务商后台映射过的端口能从外网进来；这类机器多数不映射 UDP，${PLAIN}"
+        msg "  ${YELLOW}hysteria2/tuic 走 UDP，没有 UDP 映射就永远连不上。${PLAIN}"
+    fi
+    local -a ext_spec=()
+    local nk np extout eproto eport ever edetail elabel ekey
+    while read -r nk np; do
+        [ -z "$np" ] && continue
+        ext_spec+=("$(proto_l4 "$nk"):${np}")
+    done < <(jq -r '.nodes[]? | select((.enabled // true) != false)
+                    | select((.listen_local // false) != true)
+                    | "\(.key) \(.port)"' "$NODES_FILE" 2>/dev/null)
+    if [ "${SBA_NO_EXTERNAL:-0}" == "1" ]; then
+        warn "已按 SBA_NO_EXTERNAL=1 跳过外网回连测试"
+    elif [ -z "$PUBLIC_IP" ]; then
+        warn "拿不到本机公网 IP，外网回连这一步跳过"
+    elif [ ${#ext_spec[@]} -eq 0 ]; then
+        warn "没有对外端口可测"
+    else
+        warn "正在借海外探测点从外网回连 ${#ext_spec[@]} 个端口 (约 15s，用的是 check-host.net) ..."
+        extout=$(external_check "${ext_spec[@]}")
+        if [ -z "$extout" ]; then
+            warn "外网探测服务不可用，这一步跳过 (可用 SBA_NO_EXTERNAL=1 关掉)"
+        else
+            while read -r eproto eport ever edetail; do
+                [ -z "$ever" ] && continue
+                ekey=$(jq -r --arg p "$eport" '.nodes[]? | select((.port|tostring) == $p) | .key' \
+                    "$NODES_FILE" 2>/dev/null | head -1)
+                elabel=$(proto_label "$ekey" 2>/dev/null) || elabel="${eproto}/${eport}"
+                case "$ever" in
+                    ok) msg "  $(pad_label "$elabel")${GREEN}外网可达${PLAIN} ${eproto}/${eport}" ;;
+                    blocked)
+                        ext_bad+=("${elabel} ${eproto}/${eport}")
+                        msg "  $(pad_label "$elabel")${RED}外网进不来${PLAIN} ${eproto}/${eport} ${edetail}"
+                        ;;
+                    *)
+                        ext_unknown+=("${elabel} ${eproto}/${eport}")
+                        msg "  $(pad_label "$elabel")${YELLOW}无法判定${PLAIN} ${eproto}/${eport} ${edetail}"
+                        ;;
+                esac
+            done <<<"$extout"
+            [ ${#ext_bad[@]} -eq 0 ] && [ ${#ext_unknown[@]} -eq 0 ] &&
+                ok "全部节点端口从外网都能连进来"
+        fi
+    fi
+
+    # 6. 家宽接管
+    msg ""
+    msg "${CYAN}[6/7] 家宽/落地接管${PLAIN}"
+    local isp_on="false" isp_mode="" isp_tag=""
+    if [ -f "$ISP_FILE" ]; then
+        isp_on=$(jq -r '.enabled // false' "$ISP_FILE" 2>/dev/null)
+        isp_mode=$(jq -r '.mode // ""' "$ISP_FILE" 2>/dev/null)
+        isp_tag=$(jq -r '.tag // ""' "$ISP_FILE" 2>/dev/null)
+    fi
+    if [ "$isp_on" == "true" ]; then
+        warn "已开启接管：mode=${isp_mode} 出口=${isp_tag}"
+        if [ "$isp_mode" == "all" ]; then
+            msg "  ${YELLOW}全部节点的流量都先绕到落地，落地不通则每个节点都会 -1。${PLAIN}"
+        else
+            msg "  ${YELLOW}以下节点的流量绕到落地：$(jq -r '(.targets.tags // []) | join(", ")' "$ISP_FILE" 2>/dev/null)${PLAIN}"
+        fi
+        warn "正在实测落地节点能不能出网 (不只是探端口) ..."
+        probe_isp
+        case "$?" in
+            0)
+                isp_bad=0
+                ok "落地可用，经落地看到的出口 IP：${ISP_PROBE_IP:-未知}"
+                ;;
+            2)
+                isp_bad=0
+                warn "无法实测落地 (${PROBE_MSG})"
+                ;;
+            *)
+                isp_bad=1
+                err "落地节点实测不通 (${PROBE_MSG}) —— 走家宽的节点必然全部 -1"
+                isp_hint=$(isp_landing_hint)
+                [ -n "$isp_hint" ] && msg "  ${YELLOW}${isp_hint}${PLAIN}"
+                ;;
+        esac
+    else
+        ok "未开启接管，流量直出 VPS"
+    fi
+    # 6. 逐节点回环真连接 (等价于客户端拿分享链接连一次)
+    msg ""
+    msg "${CYAN}[7/7] 逐节点真连接测试${PLAIN}"
+    if [ "$svc_ok" != "1" ]; then
+        warn "服务未运行，跳过节点测试"
+    else
+        local o key label rc tag
+        while read -r o; do
+            [ -z "$o" ] && continue
+            [ "$(jq -r '.enabled // true' <<<"$o")" == "false" ] && continue
+            key=$(jq -r '.key' <<<"$o")
+            tag=$(jq -r '.tag // ""' <<<"$o")
+            label=$(proto_label "$key" 2>/dev/null || echo "$key")
+            total=$((total + 1))
+            probe_node "$o"
+            rc=$?
+            case "$rc" in
+                0)
+                    pass=$((pass + 1))
+                    msg "  $(pad_label "$label")${GREEN}通${PLAIN}"
+                    ;;
+                2)
+                    skip_node+=("$label")
+                    msg "  $(pad_label "$label")${YELLOW}跳过 (${PROBE_MSG})${PLAIN}"
+                    ;;
+                *)
+                    fail_node+=("$label")
+                    fail_tag+=("$tag")
+                    msg "  $(pad_label "$label")${RED}不通${PLAIN} ${PROBE_MSG}"
+                    ;;
+            esac
+        done < <(jq -c '.nodes[]?' "$NODES_FILE" 2>/dev/null)
+        total=$((total - ${#skip_node[@]}))
+        msg "  ---- ${pass}/${total} 个节点在服务端可用 ----"
+    fi
+    # 失败的节点是不是「正好都走家宽」——是的话根因在落地，不在本机节点
+    local isp_blames=0 t
+    if [ "$isp_on" == "true" ] && [ "$isp_bad" == "1" ] && [ ${#fail_tag[@]} -ne 0 ]; then
+        isp_blames=1
+        if [ "$isp_mode" != "all" ]; then
+            for t in "${fail_tag[@]}"; do
+                jq -e --arg t "$t" '((.targets.tags // []) | index($t)) != null' \
+                    "$ISP_FILE" >/dev/null 2>&1 || isp_blames=0
+            done
+        fi
+    fi
+    # 结论
+    msg ""
+    line
+    msg "${CYAN}结论 / 建议${PLAIN}"
+    line
+    if [ "$svc_ok" != "1" ]; then
+        err "sing-box 没有运行 —— 先解决启动失败 (上面 check/日志已给出原因)"
+    elif [ "$egress_ok" != "1" ]; then
+        err "VPS 自己都访问不了测速地址 —— 排查 VPS 出网/DNS，而不是客户端"
+    elif [ ${#bad_port[@]} -ne 0 ]; then
+        err "有端口没监听 —— 端口被别的程序占用或配置未生效，重新应用配置试试"
+    elif [ "$isp_blames" == "1" ]; then
+        err "根因是${YELLOW}家宽/落地节点失效${PLAIN} —— 不通的节点正好就是被接管的那些，本机节点本身没问题"
+        msg "  不通：${fail_node[*]}"
+        msg "  · 最快恢复：菜单 ${GREEN}4${PLAIN} (家宽流量接管) → 关闭接管，客户端立刻能连"
+        msg "  · 要继续用家宽：核对落地的端口/UUID/密码/SNI/public_key，抄漏一项就会静默卡死"
+        [ -n "$isp_hint" ] && msg "  · ${YELLOW}${isp_hint}${PLAIN}"
+    elif [ "$total" -gt 0 ] && [ "$pass" -eq 0 ] && [ "$isp_on" == "true" ]; then
+        err "服务端全部不通且已开启家宽接管 —— 极可能是落地节点失效，先关掉接管再测"
+    elif [ "$total" -gt 0 ] && [ "$pass" -eq "$total" ] && [ ${#ext_bad[@]} -ne 0 ]; then
+        err "服务端 ${pass} 个节点全部正常，但${YELLOW}下面这些端口从外网根本进不来${PLAIN} —— 客户端只会 -1："
+        local eb
+        for eb in "${ext_bad[@]}"; do msg "    · ${eb}"; done
+        if [ "${NAT_BOX:-0}" == "1" ]; then
+            msg "  · 本机是 NAT 端口映射机型：先去服务商后台看${GREEN}分配给你的端口清单${PLAIN}，"
+            msg "    再用「节点管理」把节点端口改成清单里的端口 (脚本随机挑的端口一定进不来)"
+            msg "  · UDP 通常不给映射：${YELLOW}hysteria2 / tuic 这类 QUIC 节点建议直接删掉${PLAIN}"
+        else
+            msg "  · 去云厂商${YELLOW}安全组${PLAIN}放行上面的端口，${YELLOW}UDP 要单独放${PLAIN} (hy2/tuic 走 UDP)"
+            msg "  · 放行后再跑一次本自检，这一栏会变成「外网可达」"
+        fi
+        msg "  · 已确认外网可达的端口可以照常用，先拿那几个节点连"
+        ext_reported=1
+    elif [ "$total" -gt 0 ] && [ "$pass" -eq "$total" ]; then
+        ok "服务端 ${pass} 个节点全部实测可用，问题在「VPS 之外」，按下面顺序查："
+        [ ${#ext_bad[@]} -eq 0 ] && [ ${#ext_unknown[@]} -eq 0 ] &&
+            msg "  0) 外网回连${GREEN}已全部通过${PLAIN}，端口放行没问题，重点查客户端"
+        msg "  1) ${YELLOW}云厂商安全组${PLAIN}：放行节点端口的 TCP+UDP (hy2/tuic 是 UDP，别只放 TCP)"
+        msg "  2) ${YELLOW}客户端跳过证书验证${PLAIN}：见下面自签证书说明"
+        msg "  3) ${YELLOW}本地网络${PLAIN}：部分运营商会掉高位端口/QUIC，换个常用端口 (443/8443) 再试"
+        msg "  4) v2rayN 里确认「真连接测试」的测速地址能被节点访问，且没同时开另一个代理"
+    else
+        warn "部分节点不通：${fail_node[*]}"
+        msg "  这些协议的服务端就有问题，可在「节点管理」里删掉或改端口重建"
+    fi
+    # 外网回连的结论：本机自测通不通是一回事，外网进不进来是另一回事，两边都要报
+    local eb2
+    if [ "$ext_reported" != "1" ] && [ ${#ext_bad[@]} -ne 0 ]; then
+        msg ""
+        err "另外，下面这些端口${YELLOW}从外网根本进不来${PLAIN} (服务端再正常，客户端也只会 -1)："
+        for eb2 in "${ext_bad[@]}"; do msg "    · ${eb2}"; done
+        if [ "${NAT_BOX:-0}" == "1" ]; then
+            msg "  · NAT 机型：按服务商分配的端口清单改端口；UDP 一般没映射，hy2/tuic 建议删掉"
+        else
+            msg "  · 去云厂商安全组放行这些端口 (UDP 端口要单独放行)"
+        fi
+    fi
+    if [ ${#ext_unknown[@]} -ne 0 ] && [ "${NAT_BOX:-0}" == "1" ]; then
+        msg "  ${YELLOW}外网无法判定${PLAIN}：${ext_unknown[*]}"
+        msg "  ${YELLOW}NAT 机型基本不映射 UDP，hysteria2/tuic 大概率不可用${PLAIN}"
+    fi
+    [ ${#skip_node[@]} -ne 0 ] &&
+        msg "  ${YELLOW}跳过${PLAIN}：${skip_node[*]} (无法本机自测，需用对应客户端手动验证)"
+    # 自签证书 + 新版客户端内核的坑
+    local has_tls=0 k fp
+    while read -r k; do
+        [ "$(proto_tls "$k" 2>/dev/null)" == "tls" ] && has_tls=1
+    done < <(jq -r '.nodes[]? | select((.enabled // true) != false) | .key' "$NODES_FILE" 2>/dev/null)
+    if [ "$has_tls" == "1" ] && [ "${CERT_CHOICE_SAVED:-1}" == "1" ]; then
+        msg ""
+        warn "当前是自签证书，TLS 类节点 (vless/vmess/trojan + tls、hy2、tuic…) 必须让客户端跳过证书校验："
+        msg "  · v2rayN 4.x/5.x：节点设置里勾选 ${YELLOW}allowInsecure / 跳过证书验证${PLAIN}，或把「跳过证书验证」设为 true"
+        msg "  · ${YELLOW}Xray 26.x 起已删除 allowInsecure${PLAIN}，改用 pinnedPeerCertSha256，链接里带 allowInsecure 会直接启动失败；"
+        fp=$(cert_fingerprint)
+        [ -n "$fp" ] && msg "    本机证书指纹(hex)：${GREEN}${fp}${PLAIN}"
+        msg "  · 最省事的做法：${GREEN}优先用 REALITY 节点${PLAIN} (不需要证书，任何客户端都能直接连)，"
+        msg "    或在「证书管理」里用真实域名申请 Let's Encrypt 证书。"
+    fi
+
+    msg ""
+    line
+    msg " 1. 一键放行系统防火墙上的全部节点端口"
+    msg " 2. 重新应用配置并重启服务"
+    [ "$isp_on" == "true" ] && msg " 3. 打开家宽流量接管模块 (可在里面关闭接管)"
+    msg " 0. 返回"
+    line
+    local ans=""
+    read -rp "请选择 [0-3]: " ans || true
+    case "$ans" in
+        1)
+            open_firewall
+            ok "已尝试放行 (云安全组仍需自行放行)"
+            pause
+            ;;
+        2)
+            apply_config && ok "已重新应用"
+            pause
+            ;;
+        3)
+            [ "$isp_on" == "true" ] && run_module isp.sh
+            ;;
+        *) return 0 ;;
+    esac
+}
+
 
 # ================= 旧版 (v1 五协议) 迁移 =================
 
@@ -1314,6 +2138,15 @@ ask_reality_dest() {
 alloc_and_add_nodes() {
     local mode cur p k taken
     line
+    get_public_ip
+    nat_box_detect
+    if [ "${NAT_BOX:-0}" == "1" ]; then
+        warn "检测到本机是 ${YELLOW}NAT/端口映射机型${PLAIN}：网卡上是内网 ${NAT_LOCAL_IP}，公网 ${PUBLIC_IP} 不在本机"
+        msg "  ${YELLOW}这种机器只有服务商分配/映射给你的端口能从外网连进来，随机端口必然连不上。${PLAIN}"
+        msg "  ${YELLOW}建议选 3 逐个手动输入，填服务商给你的端口；${PLAIN}"
+        msg "  ${YELLOW}hysteria2 / tuic 走 UDP，NAT 机型一般不映射 UDP，装了也用不了。${PLAIN}"
+        msg ""
+    fi
     msg "端口分配方式："
     msg " 1. 全部随机 (推荐)"
     msg " 2. 从指定起始端口连续分配"
@@ -1653,6 +2486,10 @@ save_links_file() {
     local f="${CONFIG_DIR}/links.txt"
     {
         echo "# SBA ${SBA_VERSION} 节点分享链接  生成时间: $(date '+%F %T')"
+        if [ "$(nj '.cert.choice // "1"')" == "1" ]; then
+            echo "# 注意: 自签证书, TLS 类节点需在客户端开启 跳过证书验证/allowInsecure;"
+            echo "#       Xray 26+ 已删除 allowInsecure, 该内核请改用 REALITY 节点或真实域名证书。"
+        fi
         all_links
         echo ""
         echo "# 聚合订阅 (Base64)"
@@ -1691,7 +2528,11 @@ show_links() {
     echo -e "${YELLOW}聚合订阅 (Base64，可直接粘进客户端的「从剪贴板导入」)：${PLAIN}"
     b64_encode "$(uri_links)"
     echo ""
-    [ "${CERT_CHOICE_SAVED:-1}" == "1" ] && warn "当前使用自签证书，TLS 类节点需在客户端勾选「跳过证书验证 / allowInsecure」。"
+    if [ "${CERT_CHOICE_SAVED:-1}" == "1" ]; then
+        warn "当前使用自签证书，TLS 类节点必须在客户端勾选「跳过证书验证 / allowInsecure」。"
+        msg "  ${YELLOW}Xray 26.x 起删除了 allowInsecure${PLAIN}，v2rayN 用新内核连自签 TLS 节点会直接失败(延迟 -1)；"
+        msg "  建议优先用 ${GREEN}REALITY${PLAIN} 节点，或在「证书管理」用真实域名申请证书。菜单 ${GREEN}d${PLAIN} 可一键自检。"
+    fi
     ok "已保存到 $(save_links_file)"
     line
     local c
@@ -2500,6 +3341,7 @@ start_menu() {
     msg " 7. Realm 端口转发"
     msg " 8. 更新脚本"
     msg " 9. ${RED}卸载${PLAIN}"
+    msg " d. ${YELLOW}一键自检${PLAIN} (客户端连不上 / 真连接测试 -1 先跑这个)"
     msg " 0. 退出"
     line
 }
@@ -2533,7 +3375,7 @@ main() {
     while true; do
         start_menu
         local choice
-        read -r -p "请输入选项 [0-9]: " choice
+        read -r -p "请输入选项 [0-9/d]: " choice
         case "$choice" in
             1) fresh_install ;;
             2) manage_nodes ;;
@@ -2544,12 +3386,13 @@ main() {
             7) run_module "realm.sh" ;;
             8) update_script ;;
             9) uninstall_all ;;
+            d | D) diagnose ;;
             0)
                 echo ""
                 exit 0
                 ;;
             *)
-                err "请输入正确的数字 [0-9]"
+                err "请输入正确的选项 [0-9/d]"
                 sleep 1
                 ;;
         esac
